@@ -1,0 +1,22 @@
+media:
+  shows_path: /mnt/nas/Shows
+  movies_path: /mnt/nas/Movies
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  rpi_ip: 192.168.1.100    # Change to your Raspberry Pi's LAN IP
+  tmp_dir: /tmp/fakeiptv   # Where HLS segments are written
+
+metadata:
+  tmdb_api_key: ""          # Optional — leave empty to use NFO files only
+  cache_dir: ~/.fakeiptv/
+
+channels:
+  # Optional: disable auto-discovered channels by slug
+  # disabled:
+  #   - some-show-name
+  #
+  # Optional: rename a channel (slug: New Name)
+  # rename:
+  #   breaking-bad: Breaking Bad 24/7

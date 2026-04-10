@@ -1,0 +1,17 @@
+[Unit]
+Description=FakeIPTV — Fake Live IPTV Server
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/fakeiptv
+EnvironmentFile=/opt/fakeiptv/.env
+ExecStart=/opt/fakeiptv/venv/bin/python /opt/fakeiptv/run.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

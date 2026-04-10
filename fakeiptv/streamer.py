@@ -29,9 +29,10 @@ RESTART_DELAY = 2          # seconds to wait before restarting a dead process
 class ChannelStreamer:
     """Manages the ffmpeg process for a single channel."""
 
-    def __init__(self, channel: Channel, tmp_base: str):
+    def __init__(self, channel: Channel, tmp_base: str, subtitles: bool = True):
         self.channel = channel
         self._tmp_base = tmp_base
+        self._subtitles = subtitles
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -130,9 +131,14 @@ class ChannelStreamer:
                 "-f", "concat",
                 "-safe", "0",
                 "-i", self.concat_path,
-                "-c", "copy",
+                "-c:v", "copy",
+                "-c:a", "copy",
                 "-map", "0:v:0",
                 "-map", "0:a:0",
+                # Subtitles: convert embedded SRT/ASS to WebVTT in-stream.
+                # The '?' makes the map optional — no error if a file has no subs.
+                # PGS (Blu-ray bitmap subs) are skipped; only text-based tracks work.
+                *(["-map", "0:s:0?", "-c:s", "webvtt"] if self._subtitles else []),
                 "-f", "hls",
                 "-hls_time", str(HLS_SEGMENT_SECONDS),
                 "-hls_list_size", str(HLS_LIST_SIZE),
@@ -204,8 +210,9 @@ class ChannelStreamer:
 # ---------------------------------------------------------------------------
 
 class StreamManager:
-    def __init__(self, tmp_base: str = "/tmp/fakeiptv"):
+    def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True):
         self._tmp_base = tmp_base
+        self._subtitles = subtitles
         self._streamers: Dict[str, ChannelStreamer] = {}
         self._lock = threading.Lock()
 
@@ -244,7 +251,7 @@ class StreamManager:
                 del self._streamers[ch_id]
 
             for ch_id in new_ids - old_ids:
-                s = ChannelStreamer(channels[ch_id], self._tmp_base)
+                s = ChannelStreamer(channels[ch_id], self._tmp_base, self._subtitles)
                 s.start()
                 self._streamers[ch_id] = s
 
@@ -255,6 +262,6 @@ class StreamManager:
                 if old_paths != new_paths:
                     log.info("Entry list changed for %s — restarting", ch_id)
                     self._streamers[ch_id].stop()
-                    s = ChannelStreamer(channels[ch_id], self._tmp_base)
+                    s = ChannelStreamer(channels[ch_id], self._tmp_base, self._subtitles)
                     s.start()
                     self._streamers[ch_id] = s

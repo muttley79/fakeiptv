@@ -7,6 +7,7 @@ server:
   port: 8080
   rpi_ip: 192.168.1.100    # Change to your Raspberry Pi's LAN IP
   tmp_dir: /tmp/fakeiptv   # Where HLS segments are written
+  subtitles: true          # Include subtitle tracks (SRT/ASS→WebVTT). Set false to disable.
 
 metadata:
   tmdb_api_key: ""          # Optional — leave empty to use NFO files only

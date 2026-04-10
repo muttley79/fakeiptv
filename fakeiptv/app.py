@@ -30,7 +30,10 @@ class FakeIPTV:
         self._epg_cache: str = ""
         self._cache_lock = threading.Lock()
 
-        self.stream_manager = StreamManager(tmp_base=config.server.tmp_dir)
+        self.stream_manager = StreamManager(
+            tmp_base=config.server.tmp_dir,
+            subtitles=config.server.subtitles,
+        )
         self._refresh_timer: threading.Timer = None
 
     # ------------------------------------------------------------------

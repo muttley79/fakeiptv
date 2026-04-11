@@ -39,6 +39,7 @@ class FakeIPTV:
             subtitles=config.server.subtitles,
         )
         self._refresh_timer: threading.Timer = None
+        self._epg_timer: threading.Timer = None
 
     # ------------------------------------------------------------------
     # Startup
@@ -48,11 +49,14 @@ class FakeIPTV:
         log.info("FakeIPTV starting up...")
         self.refresh()
         self._schedule_midnight_refresh()
+        self._schedule_hourly_epg()
         log.info("FakeIPTV ready on http://%s:%d", self.config.server.rpi_ip, self.config.server.port)
 
     def stop(self):
         if self._refresh_timer:
             self._refresh_timer.cancel()
+        if self._epg_timer:
+            self._epg_timer.cancel()
         self.stream_manager.stop_all()
         self.catchup_manager.stop_all()
         log.info("FakeIPTV stopped.")
@@ -136,3 +140,17 @@ class FakeIPTV:
         log.info("Midnight auto-refresh triggered")
         self.refresh()
         self._schedule_midnight_refresh()
+
+    # ------------------------------------------------------------------
+    # Hourly EPG rolling window
+    # ------------------------------------------------------------------
+
+    def _schedule_hourly_epg(self):
+        self._epg_timer = threading.Timer(3600, self._hourly_epg)
+        self._epg_timer.daemon = True
+        self._epg_timer.start()
+
+    def _hourly_epg(self):
+        log.debug("Hourly EPG rebuild — rolling forward window")
+        self._rebuild_cache()
+        self._schedule_hourly_epg()

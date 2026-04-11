@@ -55,8 +55,13 @@ def build_xmltv(
                 "channel": ch_id,
             })
             ET.SubElement(prog, "title", lang="en").text = entry.title
-            if entry.subtitle and entry.subtitle != entry.title:
-                ET.SubElement(prog, "sub-title", lang="en").text = entry.subtitle
+            # For episodes: prefix subtitle with S##E## so season is visible in the guide
+            subtitle = entry.subtitle if entry.subtitle != entry.title else ""
+            if entry.season and entry.episode:
+                ep_tag = f"S{entry.season:02d}E{entry.episode:02d}"
+                subtitle = f"{ep_tag} · {subtitle}" if subtitle else ep_tag
+            if subtitle:
+                ET.SubElement(prog, "sub-title", lang="en").text = subtitle
             if entry.plot:
                 ET.SubElement(prog, "desc", lang="en").text = entry.plot
             if entry.year:

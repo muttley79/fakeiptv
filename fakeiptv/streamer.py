@@ -219,6 +219,14 @@ class ChannelStreamer:
                         "ffmpeg exited (code %d) for %s:\n%s",
                         ret, self.channel.id, stderr_output[:500]
                     )
+                    # Bitmap subtitles (PGS/VOBSUB) can't be converted to WebVTT.
+                    # Disable subtitle mapping for this channel and carry on.
+                    if self._subtitles and "bitmap to bitmap" in stderr_output:
+                        log.warning(
+                            "Channel %s has bitmap subtitles — disabling subtitle "
+                            "track for this channel", self.channel.id
+                        )
+                        self._subtitles = False
                 else:
                     log.info(
                         "ffmpeg exited (code %d) for %s — concat exhausted, restarting",

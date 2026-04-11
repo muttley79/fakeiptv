@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 _app_instance: "FakeIPTV" = None  # set by app.py before server starts
+_prewarm_done = False              # pre-warm all channels on first manifest request
 
 
 def set_app(instance: "FakeIPTV"):
@@ -56,8 +57,16 @@ def epg():
 
 @app.route("/hls/<channel_id>/stream.m3u8")
 def hls_manifest(channel_id: str):
+    global _prewarm_done
     if channel_id not in _app_instance.channels:
         abort(404)
+
+    # On the very first channel request, warm up all channels in the background
+    # so subsequent switches are fast. Triggered here (not at startup) so we
+    # only pay the cost when a user is actually watching.
+    if not _prewarm_done:
+        _prewarm_done = True
+        _app_instance.prewarm_channels()
 
     # Start ffmpeg lazily on first client request for this channel
     if not _app_instance.stream_manager.ensure_started(channel_id):

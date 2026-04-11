@@ -28,7 +28,7 @@ def build_m3u8(
         key=lambda c: (group_order.get(c.group, 9), c.name.lower()),
     )
 
-    for channel in sorted_channels:
+    for chno, channel in enumerate(sorted_channels, start=1):
         logo = channel.poster_url or ""
         stream_url = f"{base_url}/hls/{channel.id}/stream.m3u8"
 
@@ -43,6 +43,7 @@ def build_m3u8(
 
         lines.append(
             f'#EXTINF:-1 tvg-id="{channel.id}" tvg-name="{channel.name}" '
+            f'tvg-chno="{chno}" '
             f'tvg-logo="{logo}" group-title="{channel.group}"{catchup_attrs},{channel.name}\n'
         )
         lines.append(f"{stream_url}\n")

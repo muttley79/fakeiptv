@@ -128,6 +128,30 @@ class FakeIPTV:
         with self._cache_lock:
             return self._epg_cache
 
+    # ------------------------------------------------------------------
+    # Channel pre-warming
+    # ------------------------------------------------------------------
+
+    def prewarm_channels(self):
+        """Start ffmpeg for every channel in the background, staggered."""
+        channels = list(self.channels.keys())
+        if not channels:
+            return
+
+        def _warm():
+            log.info("Pre-warming %d channels...", len(channels))
+            started = 0
+            for ch_id in channels:
+                try:
+                    self.stream_manager.ensure_started(ch_id)
+                    started += 1
+                except Exception:
+                    log.exception("Pre-warm failed for channel %s", ch_id)
+                time.sleep(0.3)
+            log.info("Pre-warm complete: %d/%d channels started", started, len(channels))
+
+        threading.Thread(target=_warm, daemon=True, name="prewarm").start()
+
 
     # ------------------------------------------------------------------
     # Midnight refresh timer

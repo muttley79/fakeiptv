@@ -70,6 +70,7 @@ def hls_manifest(channel_id: str):
             abort(503)
         time.sleep(0.5)
 
+    _app_instance.stream_manager.touch(channel_id)
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
     resp = send_from_directory(hls_dir, "stream.m3u8")
     resp.headers["Cache-Control"] = "no-cache, no-store"
@@ -90,6 +91,7 @@ def hls_segment(channel_id: str, segment: str):
     if not os.path.exists(seg_path):
         abort(404)
 
+    _app_instance.stream_manager.touch(channel_id)
     resp = send_from_directory(hls_dir, segment)
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"

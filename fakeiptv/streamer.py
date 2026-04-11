@@ -28,6 +28,8 @@ HLS_SEGMENT_SECONDS = 5
 HLS_LIST_SIZE = 6          # sliding window — keep 6 segments (~30s of buffer)
 CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
 RESTART_DELAY = 2          # seconds to wait before restarting a dead process
+IDLE_TIMEOUT = 60          # stop ffmpeg after this many seconds with no client requests
+IDLE_CHECK_INTERVAL = 15   # how often the reaper checks for idle channels
 
 
 class ChannelStreamer:
@@ -41,6 +43,7 @@ class ChannelStreamer:
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
+        self._last_accessed: float = 0.0
         self.hls_dir = os.path.join(tmp_base, f"ch_{channel.id}")
         self.manifest_path = os.path.join(self.hls_dir, "stream.m3u8")
         self.concat_path = os.path.join(self.hls_dir, "concat.txt")
@@ -52,6 +55,7 @@ class ChannelStreamer:
     def start(self):
         os.makedirs(self.hls_dir, exist_ok=True)
         self._stop_event.clear()
+        self._last_accessed = time.time()
         self._launch()
         self._monitor_thread = threading.Thread(
             target=self._monitor, daemon=True, name=f"monitor-{self.channel.id}"
@@ -65,6 +69,13 @@ class ChannelStreamer:
         if os.path.isdir(self.hls_dir):
             shutil.rmtree(self.hls_dir, ignore_errors=True)
         log.info("Stopped streamer for channel: %s", self.channel.name)
+
+    def touch(self):
+        """Record that a client just fetched something — resets the idle clock."""
+        self._last_accessed = time.time()
+
+    def is_idle(self) -> bool:
+        return (time.time() - self._last_accessed) > IDLE_TIMEOUT
 
     def is_ready(self) -> bool:
         """True once the HLS manifest exists (ffmpeg has written at least one segment)."""
@@ -233,6 +244,10 @@ class StreamManager:
         # Only channels with an active ffmpeg process
         self._streamers: Dict[str, ChannelStreamer] = {}
         self._lock = threading.Lock()
+        self._reaper = threading.Thread(
+            target=self._reap_loop, daemon=True, name="stream-reaper"
+        )
+        self._reaper.start()
 
     def ensure_started(self, ch_id: str) -> bool:
         """
@@ -248,6 +263,12 @@ class StreamManager:
                 s.start()
                 self._streamers[ch_id] = s
             return True
+
+    def touch(self, ch_id: str):
+        """Signal that a client is actively fetching this channel."""
+        s = self._streamers.get(ch_id)
+        if s:
+            s.touch()
 
     def stop_all(self):
         with self._lock:
@@ -295,6 +316,19 @@ class StreamManager:
 
             # Replace channel registry (new channels are NOT started here)
             self._channels = dict(channels)
+
+    def _reap_loop(self):
+        """Background thread: stop ffmpeg for channels with no recent client activity."""
+        while True:
+            time.sleep(IDLE_CHECK_INTERVAL)
+            with self._lock:
+                idle = [ch_id for ch_id, s in self._streamers.items() if s.is_idle()]
+                for ch_id in idle:
+                    log.info(
+                        "Channel %s idle for >%ds — stopping ffmpeg", ch_id, IDLE_TIMEOUT
+                    )
+                    self._streamers[ch_id].stop()
+                    del self._streamers[ch_id]
 
 
 # ---------------------------------------------------------------------------

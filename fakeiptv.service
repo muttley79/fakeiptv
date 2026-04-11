@@ -11,6 +11,8 @@ EnvironmentFile=/opt/fakeiptv/.env
 # This is a tmpfs ramdisk on Raspberry Pi OS — no SD card writes for HLS segments.
 RuntimeDirectory=fakeiptv
 RuntimeDirectoryPreserve=no
+# Creates /var/cache/fakeiptv owned by User=pi — persists across restarts.
+CacheDirectory=fakeiptv
 ExecStart=/opt/fakeiptv/venv/bin/python /opt/fakeiptv/run.py
 Restart=always
 RestartSec=5

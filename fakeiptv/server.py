@@ -63,8 +63,10 @@ def hls_manifest(channel_id: str):
     if not _app_instance.stream_manager.ensure_started(channel_id):
         abort(404)
 
-    # Wait up to 15 seconds for ffmpeg to write the first manifest
-    deadline = time.time() + 15
+    # Wait up to 30 seconds for ffmpeg to write the first manifest.
+    # Cold start = ffmpeg startup + NAS seek + first 4s segment + optional
+    # one crash/restart cycle (e.g. DTS audio fallback).
+    deadline = time.time() + 30
     while not _app_instance.stream_manager.is_ready(channel_id):
         if time.time() > deadline:
             abort(503)

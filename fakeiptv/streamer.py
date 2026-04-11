@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 HLS_SEGMENT_SECONDS = 4
 HLS_LIST_SIZE = 8          # sliding window — keep 8 × 4s segments (~32s of buffer)
 CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
-RESTART_DELAY = 2          # seconds to wait before restarting a dead process
+RESTART_DELAY = 1          # seconds to wait before restarting a dead process
 IDLE_TIMEOUT = 600         # stop ffmpeg after 10 min with no client requests
 IDLE_CHECK_INTERVAL = 60   # how often the reaper checks for idle channels
 

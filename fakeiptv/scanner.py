@@ -385,13 +385,18 @@ class Scanner:
         plot = nfo.get("plot", "")
         tmdb_id = nfo.get("tmdb_id") or ""
         poster_url = nfo.get("poster", "")
+        meta_source = "nfo" if nfo else "filename"
 
         # --- Sonarr (middle tier: fills gaps left by NFO) ---
-        if self._sonarr and (not genres or not plot or not title or not poster_url):
+        if self._sonarr and (not genres or not plot or not poster_url):
             show_meta = self._sonarr.get_show_metadata(show_name)
             if show_meta:
-                genres = genres or show_meta.get("genres", [])
-                plot = plot or show_meta.get("plot", "")
+                if not genres and show_meta.get("genres"):
+                    genres = show_meta["genres"]
+                    meta_source = "sonarr"
+                if not plot and show_meta.get("plot"):
+                    plot = show_meta["plot"]
+                    meta_source = "sonarr"
                 poster_url = poster_url or show_meta.get("poster_url", "")
             ep_meta = self._sonarr.get_episode_metadata(show_name, season, episode_num)
             if ep_meta:
@@ -405,11 +410,16 @@ class Scanner:
             else:
                 show_data = self._tmdb.search_show(show_name)
             if show_data:
-                genres = genres or [g["name"] for g in show_data.get("genres", [])]
+                if not genres:
+                    genres = [g["name"] for g in show_data.get("genres", [])]
+                    meta_source = "tmdb"
                 poster_url = poster_url or (
                     TMDB_IMAGE_BASE + show_data["poster_path"]
                     if show_data.get("poster_path") else ""
                 )
+
+        log.debug("S%02dE%02d %s — metadata from: %s", season, episode_num,
+                  os.path.basename(path), meta_source)
 
         return Episode(
             path=path,
@@ -462,16 +472,20 @@ class Scanner:
         tmdb_id = nfo.get("tmdb_id") or ""
         poster_url = nfo.get("poster") or ""
         year = nfo.get("year", 0)
+        meta_source = "nfo" if nfo else "filename"
 
         # --- Radarr (middle tier) ---
         if self._radarr and (not genres or not plot or not poster_url):
             meta = self._radarr.get_movie_metadata(title, year)
             if meta:
-                genres = genres or meta.get("genres", [])
-                plot = plot or meta.get("plot", "")
+                if not genres and meta.get("genres"):
+                    genres = meta["genres"]
+                    meta_source = "radarr"
+                if not plot and meta.get("plot"):
+                    plot = meta["plot"]
+                    meta_source = "radarr"
                 poster_url = poster_url or meta.get("poster_url", "")
                 year = year or meta.get("year", 0)
-                # Use Radarr runtime if NFO had none and ffprobe hasn't run yet
                 if not nfo.get("runtime_sec") and meta.get("runtime_sec"):
                     nfo["runtime_sec"] = meta["runtime_sec"]
 
@@ -487,9 +501,13 @@ class Scanner:
             else:
                 data = self._tmdb.search_movie(title, year)
             if data:
-                genres = genres or [g["name"] for g in data.get("genres", [])]
+                if not genres:
+                    genres = [g["name"] for g in data.get("genres", [])]
+                    meta_source = "tmdb"
                 if not poster_url and data.get("poster_path"):
                     poster_url = TMDB_IMAGE_BASE + data["poster_path"]
+
+        log.debug("%s — metadata from: %s", os.path.basename(path), meta_source)
 
         return Movie(
             path=path,

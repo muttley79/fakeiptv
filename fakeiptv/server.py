@@ -56,11 +56,7 @@ def epg():
 def epg_gz():
     content = _app_instance.get_epg().encode("utf-8")
     compressed = gzip.compress(content)
-    return Response(
-        compressed,
-        mimetype="application/gzip",
-        headers={"Content-Encoding": "gzip"},
-    )
+    return Response(compressed, mimetype="application/x-gzip")
 
 
 # ---------------------------------------------------------------------------

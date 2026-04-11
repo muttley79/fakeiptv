@@ -248,12 +248,20 @@ class ChannelStreamer:
                         )
                         self._subtitles = False
 
-                    # Some audio codecs (e.g. eac3 from certain MKV containers)
-                    # lose their codec parameters when muxed into MPEG-TS with -c copy.
+                    # Some audio codecs can't remux cleanly into MPEG-TS with -c copy:
+                    #   - eac3: loses sample rate metadata
+                    #   - dts / dts-hd: too-large packets or unsupported in TS
                     # Fall back to AAC transcoding for this channel.
-                    if self._audio_copy and "unspecified sample rate" in stderr_output:
+                    _audio_errors = (
+                        "unspecified sample rate",
+                        "packet too large",
+                        "invalid data found when processing input",
+                        "dts-hd ma is not supported",
+                        "no core found",
+                    )
+                    if self._audio_copy and any(e in stderr_output.lower() for e in _audio_errors):
                         log.warning(
-                            "Channel %s has audio with unspecified sample rate — "
+                            "Channel %s has incompatible audio — "
                             "falling back to AAC transcoding", self.channel.id
                         )
                         self._audio_copy = False

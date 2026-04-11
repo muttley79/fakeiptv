@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
+import threading
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -79,27 +81,33 @@ def slugify(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared SQLite connection
+# ---------------------------------------------------------------------------
+
+def _open_db(db_path: str) -> sqlite3.Connection:
+    """Open (or create) the cache DB with WAL mode for safe concurrent access."""
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+# ---------------------------------------------------------------------------
 # Duration cache
 # ---------------------------------------------------------------------------
 
 class DurationCache:
-    def __init__(self, cache_path: str):
-        self._path = cache_path
-        self._data: Dict[str, float] = {}
-        self._load()
-
-    def _load(self):
-        if os.path.exists(self._path):
-            try:
-                with open(self._path) as f:
-                    self._data = json.load(f)
-            except Exception:
-                self._data = {}
-
-    def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
-            json.dump(self._data, f)
+    def __init__(self, db_path: str):
+        self._conn = _open_db(db_path)
+        self._lock = threading.Lock()
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS durations (
+                key  TEXT PRIMARY KEY,
+                duration REAL NOT NULL
+            )
+        """)
+        self._conn.commit()
 
     def _key(self, path: str) -> str:
         try:
@@ -109,11 +117,18 @@ class DurationCache:
         return f"{path}|{mtime}"
 
     def get(self, path: str) -> Optional[float]:
-        return self._data.get(self._key(path))
+        row = self._conn.execute(
+            "SELECT duration FROM durations WHERE key = ?", (self._key(path),)
+        ).fetchone()
+        return row[0] if row else None
 
     def set(self, path: str, duration: float):
-        self._data[self._key(path)] = duration
-        self._save()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO durations (key, duration) VALUES (?, ?)",
+                (self._key(path), duration),
+            )
+            self._conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -121,38 +136,40 @@ class DurationCache:
 # ---------------------------------------------------------------------------
 
 class TMDBCache:
-    def __init__(self, cache_path: str, api_key: str):
-        self._path = cache_path
+    def __init__(self, db_path: str, api_key: str):
+        self._conn = _open_db(db_path)
+        self._lock = threading.Lock()
         self._api_key = api_key
-        self._data: dict = {}
-        self._load()
-
-    def _load(self):
-        if os.path.exists(self._path):
-            try:
-                with open(self._path) as f:
-                    self._data = json.load(f)
-            except Exception:
-                self._data = {}
-
-    def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
-            json.dump(self._data, f)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tmdb (
+                key  TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            )
+        """)
+        self._conn.commit()
 
     def _get(self, url: str, params: dict) -> Optional[dict]:
         if not self._api_key:
             return None
         cache_key = url + json.dumps(params, sort_keys=True)
-        if cache_key in self._data:
-            return self._data[cache_key]
+
+        row = self._conn.execute(
+            "SELECT data FROM tmdb WHERE key = ?", (cache_key,)
+        ).fetchone()
+        if row:
+            return json.loads(row[0])
+
         try:
             params["api_key"] = self._api_key
             resp = requests.get(url, params=params, timeout=10)
             resp.raise_for_status()
             result = resp.json()
-            self._data[cache_key] = result
-            self._save()
+            with self._lock:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO tmdb (key, data) VALUES (?, ?)",
+                    (cache_key, json.dumps(result)),
+                )
+                self._conn.commit()
             return result
         except Exception as e:
             log.warning("TMDB request failed %s: %s", url, e)
@@ -267,9 +284,9 @@ class Scanner:
     def __init__(self, shows_path: str, movies_path: str, cache_dir: str, tmdb_api_key: str = ""):
         self.shows_path = shows_path
         self.movies_path = movies_path
-        os.makedirs(cache_dir, exist_ok=True)
-        self._dur_cache = DurationCache(os.path.join(cache_dir, "duration_cache.json"))
-        self._tmdb = TMDBCache(os.path.join(cache_dir, "tmdb_cache.json"), tmdb_api_key)
+        db_path = os.path.join(cache_dir, "cache.db")
+        self._dur_cache = DurationCache(db_path)
+        self._tmdb = TMDBCache(db_path, tmdb_api_key)
 
     def scan(self) -> MediaLibrary:
         library = MediaLibrary()

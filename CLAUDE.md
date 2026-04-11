@@ -66,7 +66,7 @@ ffmpeg -hide_banner -loglevel error \
 
 - Files with DTS or TrueHD audio won't remux cleanly to MPEG-TS with `-c copy`. ffmpeg stderr will report the error. If this comes up, add a fallback: `-c:v copy -c:a aac -b:a 192k`.
 - The `inpoint` directive in ffconcat handles the seek into the first file. Do not use `-ss` before `-i` with concat — it doesn't work as expected.
-- Duration cache is keyed by `path + mtime`. If a file is replaced in-place without changing mtime, the cached duration may be stale. Delete `duration_cache.json` to force re-probe.
+- Duration cache is keyed by `path + mtime`. If a file is replaced in-place without changing mtime, the cached duration may be stale. Delete `cache.db` (or the `durations` table rows) to force re-probe.
 - EPG times are in local device time. XMLTV timestamps use `+0000` offset but represent local time — this is a deliberate simplification for home LAN use.
 
 ## User preferences

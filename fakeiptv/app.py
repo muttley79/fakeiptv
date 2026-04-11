@@ -73,6 +73,10 @@ class FakeIPTV:
             cache_dir=self.config.metadata.cache_dir,
             tmdb_api_key=self.config.metadata.tmdb_api_key,
             ignore_patterns=self.config.media.ignore_patterns,
+            sonarr_url=self.config.metadata.sonarr_url,
+            sonarr_api_key=self.config.metadata.sonarr_api_key,
+            radarr_url=self.config.metadata.radarr_url,
+            radarr_api_key=self.config.metadata.radarr_api_key,
         )
         library = scanner.scan()
         channels = build_channels(

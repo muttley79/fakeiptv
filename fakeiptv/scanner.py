@@ -282,13 +282,18 @@ def probe_duration(path: str) -> float:
 
 class Scanner:
     def __init__(self, shows_path: str, movies_path: str, cache_dir: str,
-                 tmdb_api_key: str = "", ignore_patterns: List[str] = None):
+                 tmdb_api_key: str = "", ignore_patterns: List[str] = None,
+                 sonarr_url: str = "", sonarr_api_key: str = "",
+                 radarr_url: str = "", radarr_api_key: str = ""):
+        from .arrclient import SonarrClient, RadarrClient
         self.shows_path = shows_path
         self.movies_path = movies_path
         self._ignore = ignore_patterns or []
         db_path = os.path.join(cache_dir, "cache.db")
         self._dur_cache = DurationCache(db_path)
         self._tmdb = TMDBCache(db_path, tmdb_api_key)
+        self._sonarr = SonarrClient(sonarr_url, sonarr_api_key) if sonarr_url and sonarr_api_key else None
+        self._radarr = RadarrClient(radarr_url, radarr_api_key) if radarr_url and radarr_api_key else None
 
     def _is_ignored(self, path: str) -> bool:
         """Return True if the path should be skipped."""
@@ -377,24 +382,34 @@ class Scanner:
         season = nfo.get("season") or self._guess_season(path)
         episode_num = nfo.get("episode") or self._guess_episode(path)
         genres = nfo.get("genres") or []
+        plot = nfo.get("plot", "")
         tmdb_id = nfo.get("tmdb_id") or ""
-        poster_url = ""
+        poster_url = nfo.get("poster", "")
 
-        # TMDB fallback for missing metadata
-        if self._tmdb._api_key and tmdb_id and (not genres or not nfo.get("plot")):
-            ep_data = self._tmdb.fetch_episode(tmdb_id, season, episode_num)
-            show_data = self._tmdb.fetch_show(tmdb_id)
+        # --- Sonarr (middle tier: fills gaps left by NFO) ---
+        if self._sonarr and (not genres or not plot or not title or not poster_url):
+            show_meta = self._sonarr.get_show_metadata(show_name)
+            if show_meta:
+                genres = genres or show_meta.get("genres", [])
+                plot = plot or show_meta.get("plot", "")
+                poster_url = poster_url or show_meta.get("poster_url", "")
+            ep_meta = self._sonarr.get_episode_metadata(show_name, season, episode_num)
+            if ep_meta:
+                title = title or ep_meta.get("title", title)
+                plot = plot or ep_meta.get("plot", "")
+
+        # --- TMDB (last resort) ---
+        if self._tmdb._api_key and (not genres or not plot):
+            if tmdb_id:
+                show_data = self._tmdb.fetch_show(tmdb_id)
+            else:
+                show_data = self._tmdb.search_show(show_name)
             if show_data:
                 genres = genres or [g["name"] for g in show_data.get("genres", [])]
-                if show_data.get("poster_path"):
-                    poster_url = TMDB_IMAGE_BASE + show_data["poster_path"]
-        elif self._tmdb._api_key and not tmdb_id and not genres:
-            show_data = self._tmdb.search_show(show_name)
-            if show_data:
-                genres = [g["name"] for g in self._tmdb.fetch_show(
-                    str(show_data["id"])) .get("genres", [])] if show_data else []
-                if show_data.get("poster_path"):
-                    poster_url = TMDB_IMAGE_BASE + show_data["poster_path"]
+                poster_url = poster_url or (
+                    TMDB_IMAGE_BASE + show_data["poster_path"]
+                    if show_data.get("poster_path") else ""
+                )
 
         return Episode(
             path=path,
@@ -403,10 +418,10 @@ class Scanner:
             season=season,
             episode=episode_num,
             duration_sec=duration,
-            plot=nfo.get("plot", ""),
+            plot=plot,
             genres=genres,
             year=nfo.get("year", 0),
-            poster_url=nfo.get("poster") or poster_url,
+            poster_url=poster_url,
             tmdb_id=tmdb_id,
         )
 
@@ -441,23 +456,38 @@ class Scanner:
         nfo_path = os.path.splitext(path)[0] + ".nfo"
         nfo = parse_nfo(nfo_path) if os.path.exists(nfo_path) else {}
 
+        title = nfo.get("title") or os.path.splitext(os.path.basename(path))[0]
+        genres = nfo.get("genres") or []
+        plot = nfo.get("plot", "")
+        tmdb_id = nfo.get("tmdb_id") or ""
+        poster_url = nfo.get("poster") or ""
+        year = nfo.get("year", 0)
+
+        # --- Radarr (middle tier) ---
+        if self._radarr and (not genres or not plot or not poster_url):
+            meta = self._radarr.get_movie_metadata(title, year)
+            if meta:
+                genres = genres or meta.get("genres", [])
+                plot = plot or meta.get("plot", "")
+                poster_url = poster_url or meta.get("poster_url", "")
+                year = year or meta.get("year", 0)
+                # Use Radarr runtime if NFO had none and ffprobe hasn't run yet
+                if not nfo.get("runtime_sec") and meta.get("runtime_sec"):
+                    nfo["runtime_sec"] = meta["runtime_sec"]
+
         duration = nfo.get("runtime_sec") or self._get_duration(path)
         if not duration:
             log.warning("Could not determine duration for %s, skipping", path)
             return None
 
-        title = nfo.get("title") or os.path.splitext(os.path.basename(path))[0]
-        genres = nfo.get("genres") or []
-        tmdb_id = nfo.get("tmdb_id") or ""
-        poster_url = nfo.get("poster") or ""
-
-        if self._tmdb._api_key and not genres:
+        # --- TMDB (last resort) ---
+        if self._tmdb._api_key and (not genres or not plot):
             if tmdb_id:
                 data = self._tmdb.fetch_movie(tmdb_id)
             else:
-                data = self._tmdb.search_movie(title, nfo.get("year", 0))
+                data = self._tmdb.search_movie(title, year)
             if data:
-                genres = [g["name"] for g in data.get("genres", [])]
+                genres = genres or [g["name"] for g in data.get("genres", [])]
                 if not poster_url and data.get("poster_path"):
                     poster_url = TMDB_IMAGE_BASE + data["poster_path"]
 
@@ -465,9 +495,9 @@ class Scanner:
             path=path,
             title=title,
             duration_sec=duration,
-            plot=nfo.get("plot", ""),
+            plot=plot,
             genres=genres,
-            year=nfo.get("year", 0),
+            year=year,
             poster_url=poster_url,
             tmdb_id=tmdb_id,
         )

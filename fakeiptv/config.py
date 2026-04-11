@@ -31,6 +31,10 @@ class ServerConfig:
 class MetadataConfig:
     tmdb_api_key: str = ""
     cache_dir: str = "~/.fakeiptv/"
+    sonarr_url: str = ""
+    sonarr_api_key: str = ""
+    radarr_url: str = ""
+    radarr_api_key: str = ""
 
 
 @dataclass
@@ -97,6 +101,10 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         cache_dir=os.path.expanduser(
             _env("FAKEIPTV_CACHE_DIR", meta_raw.get("cache_dir", "~/.fakeiptv/"))
         ),
+        sonarr_url=_env("FAKEIPTV_SONARR_URL", meta_raw.get("sonarr_url", "")),
+        sonarr_api_key=_env("FAKEIPTV_SONARR_API_KEY", meta_raw.get("sonarr_api_key", "")),
+        radarr_url=_env("FAKEIPTV_RADARR_URL", meta_raw.get("radarr_url", "")),
+        radarr_api_key=_env("FAKEIPTV_RADARR_API_KEY", meta_raw.get("radarr_api_key", "")),
     )
     channels = ChannelsConfig(
         disabled=ch_raw.get("disabled") or [],

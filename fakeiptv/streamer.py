@@ -31,7 +31,6 @@ CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
 RESTART_DELAY = 2          # seconds to wait before restarting a dead process
 IDLE_TIMEOUT = 60          # stop ffmpeg after this many seconds with no client requests
 IDLE_CHECK_INTERVAL = 15   # how often the reaper checks for idle channels
-NEW_CLIENT_RESTART_MIN = 15  # restart ffmpeg for a "new" client only if running longer than this
 
 
 class ChannelStreamer:
@@ -295,44 +294,17 @@ class StreamManager:
 
     def ensure_started(self, ch_id: str) -> bool:
         """
-        Start (or restart) the ffmpeg streamer for ch_id.
-
-        - First call: starts ffmpeg from the current schedule position, cleaning
-          any stale segments first.
-        - Subsequent calls from a new client (channel running >NEW_CLIENT_RESTART_MIN s):
-          restarts ffmpeg so the new client gets fresh segments from the correct
-          live position rather than inheriting the old sliding window.
-          The _subtitles and _audio_copy flags are preserved across restarts.
-
+        Start the ffmpeg streamer for ch_id if it isn't already running.
         Returns False if the channel is unknown, True otherwise.
+        Call this before waiting for is_ready().
         """
         with self._lock:
             if ch_id not in self._channels:
                 return False
-            existing = self._streamers.get(ch_id)
-            if existing is None:
+            if ch_id not in self._streamers:
                 s = ChannelStreamer(self._channels[ch_id], self._tmp_base, self._subtitles)
                 s.start()
                 self._streamers[ch_id] = s
-            else:
-                age = time.time() - existing._started_at
-                if existing._started_at > 0 and age > NEW_CLIENT_RESTART_MIN:
-                    # New client connecting to a long-running channel — restart so
-                    # they get a clean segment sequence from the current live position.
-                    log.info(
-                        "New client for %s (running %.0fs) — restarting for clean start",
-                        ch_id, age
-                    )
-                    # Preserve per-channel codec flags discovered during the run
-                    kept_subs = existing._subtitles
-                    kept_audio = existing._audio_copy
-                    existing.stop()
-                    s = ChannelStreamer(
-                        self._channels[ch_id], self._tmp_base,
-                        subtitles=kept_subs, audio_copy=kept_audio,
-                    )
-                    s.start()
-                    self._streamers[ch_id] = s
             return True
 
     def touch(self, ch_id: str):

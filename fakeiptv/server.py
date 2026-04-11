@@ -2,19 +2,23 @@
 server.py — Flask HTTP server.
 
 Endpoints:
-  GET /playlist.m3u8                    IPTV channel list
-  GET /epg.xml                          XMLTV EPG (24h window)
-  GET /hls/<channel_id>/stream.m3u8     Live HLS manifest
-  GET /hls/<channel_id>/<segment>.ts    HLS TS segment
-  GET /refresh                          Trigger library rescan
-  GET /status                           JSON status
+  GET /playlist.m3u8                        IPTV channel list
+  GET /epg.xml                              XMLTV EPG (past + future window)
+  GET /hls/<channel_id>/stream.m3u8         Live HLS manifest
+  GET /hls/<channel_id>/<segment>           HLS TS segment / subtitle file
+  GET /catchup/<channel_id>                 Catchup VOD manifest (returns redirect)
+  GET /catchup/<channel_id>/<session_id>/stream.m3u8    Catchup VOD manifest
+  GET /catchup/<channel_id>/<session_id>/<segment>      Catchup VOD segment
+  GET /refresh                              Trigger library rescan
+  GET /status                               JSON status
 """
 import logging
 import os
 import time
+from datetime import datetime
 from typing import TYPE_CHECKING
 
-from flask import Flask, Response, abort, jsonify, send_from_directory
+from flask import Flask, Response, abort, jsonify, redirect, request, send_from_directory
 
 if TYPE_CHECKING:
     from .app import FakeIPTV
@@ -94,6 +98,72 @@ def hls_segment(channel_id: str, segment: str):
 # ---------------------------------------------------------------------------
 # Control endpoints
 # ---------------------------------------------------------------------------
+
+@app.route("/catchup/<channel_id>")
+def catchup_start(channel_id: str):
+    """
+    Televizo calls this with ?utc=<unix_ts>&utcend=<unix_ts>.
+    We create (or reuse) a catchup session and redirect to its manifest.
+    """
+    if channel_id not in _app_instance.channels:
+        abort(404)
+
+    utc_str = request.args.get("utc") or request.args.get("start")
+    if not utc_str:
+        abort(400)
+
+    try:
+        at = datetime.utcfromtimestamp(int(utc_str))
+        # Convert to local time to match our EPOCH-based schedule
+        import time as _time
+        local_offset = _time.timezone if (_time.daylight == 0) else _time.altzone
+        at = datetime.fromtimestamp(int(utc_str) - local_offset)
+    except (ValueError, TypeError):
+        abort(400)
+
+    channel = _app_instance.channels[channel_id]
+    session = _app_instance.catchup_manager.get_or_create(channel, at)
+    if session is None:
+        abort(404)
+
+    # Wait up to 15s for the first segment
+    deadline = time.time() + 15
+    while not session.is_ready():
+        if time.time() > deadline:
+            abort(503)
+        time.sleep(0.5)
+
+    manifest_url = f"/catchup/{channel_id}/{session.session_id}/stream.m3u8"
+    return redirect(manifest_url)
+
+
+@app.route("/catchup/<channel_id>/<session_id>/stream.m3u8")
+def catchup_manifest(channel_id: str, session_id: str):
+    session = _app_instance.catchup_manager.get_session(session_id)
+    if session is None or not session.is_ready():
+        abort(404)
+
+    resp = send_from_directory(session.session_dir, "stream.m3u8")
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+@app.route("/catchup/<channel_id>/<session_id>/<path:segment>")
+def catchup_segment(channel_id: str, session_id: str, segment: str):
+    session = _app_instance.catchup_manager.get_session(session_id)
+    if session is None:
+        abort(404)
+
+    seg_path = os.path.join(session.session_dir, segment)
+    if not os.path.exists(seg_path):
+        abort(404)
+
+    resp = send_from_directory(session.session_dir, segment)
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 
 @app.route("/refresh")
 def refresh():

@@ -1,7 +1,7 @@
 """
 playlist.py — Generates the M3U8 channel list that IPTV clients import.
 This is NOT an HLS manifest — it's the Kodi/Televizo-style playlist that
-lists all channels with their stream URLs and EPG IDs.
+lists all channels with their stream URLs, EPG IDs, and catchup metadata.
 """
 from typing import Dict
 
@@ -12,10 +12,12 @@ def build_m3u8(
     channels: Dict[str, Channel],
     base_url: str,
     epg_url: str,
+    catchup_days: int = 0,
 ) -> str:
     """
-    base_url: e.g. "http://192.168.1.100:8080"
-    epg_url:  e.g. "http://192.168.1.100:8080/epg.xml"
+    base_url:     e.g. "http://192.168.1.100:8080"
+    epg_url:      e.g. "http://192.168.1.100:8080/epg.xml"
+    catchup_days: if > 0, adds catchup attributes to each channel entry
     """
     lines = [f'#EXTM3U x-tvg-url="{epg_url}"\n']
 
@@ -29,9 +31,19 @@ def build_m3u8(
     for channel in sorted_channels:
         logo = channel.poster_url or ""
         stream_url = f"{base_url}/hls/{channel.id}/stream.m3u8"
+
+        catchup_attrs = ""
+        if catchup_days > 0:
+            catchup_url = f"{base_url}/catchup/{channel.id}?utc={{utc}}&utcend={{utcend}}"
+            catchup_attrs = (
+                f' catchup="default"'
+                f' catchup-days="{catchup_days}"'
+                f' catchup-source="{catchup_url}"'
+            )
+
         lines.append(
             f'#EXTINF:-1 tvg-id="{channel.id}" tvg-name="{channel.name}" '
-            f'tvg-logo="{logo}" group-title="{channel.group}",{channel.name}\n'
+            f'tvg-logo="{logo}" group-title="{channel.group}"{catchup_attrs},{channel.name}\n'
         )
         lines.append(f"{stream_url}\n")
 

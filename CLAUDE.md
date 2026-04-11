@@ -14,7 +14,8 @@ Runs on: **Raspberry Pi** (Python 3.9.2), deployed as a **systemd service**.
 - **One ffmpeg process per channel.** Each writes HLS segments to `{tmp_dir}/ch_{id}/`. A monitor thread restarts ffmpeg automatically when the concat window is exhausted (~4h).
 - **Concat demuxer + inpoint.** Seeking into the current file at startup uses the `ffconcat` `inpoint` directive, not `-ss` (which doesn't work with concat).
 - **Flask serves segments directly** from `/tmp` via `send_from_directory`. No proxying.
-- **EPG is a 24-hour window only.** No catch-up. EPG regenerates at each refresh.
+- **EPG covers 7 days back + 1 day forward.** Regenerates at each refresh.
+- **Catch-up**: Since the schedule is deterministic, past programmes can always be reconstructed. `GET /catchup/{channel_id}?utc={ts}` spins up a temporary VOD ffmpeg process (seeked to the right file/offset, no `-re`), outputs HLS with `#EXT-X-ENDLIST`. Sessions expire after 2h of inactivity. Catch-up sessions live in `{tmp_dir}/catchup/`.
 - **Daily refresh at midnight (local device time).** Uses `threading.Timer`. Also callable via `GET /refresh`.
 
 ## Module map
@@ -36,7 +37,7 @@ Runs on: **Raspberry Pi** (Python 3.9.2), deployed as a **systemd service**.
 `.env` overrides `config.yaml` overrides defaults.
 All path-like config values are in `.env` / `config.yaml` — nothing is hardcoded in source.
 
-Key env vars: `FAKEIPTV_SHOWS_PATH`, `FAKEIPTV_MOVIES_PATH`, `FAKEIPTV_RPI_IP`, `FAKEIPTV_TMP_DIR`, `FAKEIPTV_CACHE_DIR`, `FAKEIPTV_TMDB_API_KEY`, `FAKEIPTV_PORT`.
+Key env vars: `FAKEIPTV_SHOWS_PATH`, `FAKEIPTV_MOVIES_PATH`, `FAKEIPTV_RPI_IP`, `FAKEIPTV_TMP_DIR`, `FAKEIPTV_CACHE_DIR`, `FAKEIPTV_TMDB_API_KEY`, `FAKEIPTV_PORT`, `FAKEIPTV_SUBTITLES`, `FAKEIPTV_CATCHUP_DAYS`.
 
 ## Channel auto-discovery rules
 

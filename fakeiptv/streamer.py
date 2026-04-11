@@ -7,6 +7,8 @@ segments + manifest to {tmp_dir}/ch_{id}/.
 
 The concat file covers ~4 hours ahead. When ffmpeg finishes that window
 it is automatically restarted with a freshly calculated concat file.
+
+CatchupManager handles on-demand VOD sessions for past programmes.
 """
 import logging
 import os
@@ -14,9 +16,11 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Dict, Optional
+import uuid
+from datetime import datetime
+from typing import Dict, Optional, Tuple
 
-from .scheduler import Channel, NowPlaying, get_now_playing
+from .scheduler import Channel, NowPlaying, ScheduleEntry, get_now_playing, get_playing_at
 
 log = logging.getLogger(__name__)
 
@@ -265,3 +269,168 @@ class StreamManager:
                     s = ChannelStreamer(channels[ch_id], self._tmp_base, self._subtitles)
                     s.start()
                     self._streamers[ch_id] = s
+
+
+# ---------------------------------------------------------------------------
+# CatchupManager — on-demand VOD sessions for past programmes
+# ---------------------------------------------------------------------------
+
+# How long (seconds) to keep a catchup session alive after last manifest request.
+CATCHUP_SESSION_TTL = 7200   # 2 hours
+
+
+class CatchupSession:
+    """
+    One temporary ffmpeg VOD process for a single catchup request.
+    Serves HLS with #EXT-X-ENDLIST (seekable, not live).
+    """
+
+    def __init__(self, session_id: str, entry: ScheduleEntry, offset_sec: float,
+                 duration_sec: float, session_dir: str, subtitles: bool):
+        self.session_id = session_id
+        self.entry = entry
+        self.offset_sec = offset_sec
+        self.duration_sec = duration_sec   # how much to serve (programme length - offset)
+        self.session_dir = session_dir
+        self.subtitles = subtitles
+        self.manifest_path = os.path.join(session_dir, "stream.m3u8")
+        self._process: Optional[subprocess.Popen] = None
+        self._last_accessed = time.time()
+
+    def touch(self):
+        self._last_accessed = time.time()
+
+    def is_expired(self) -> bool:
+        return (time.time() - self._last_accessed) > CATCHUP_SESSION_TTL
+
+    def start(self):
+        os.makedirs(self.session_dir, exist_ok=True)
+        seg_pattern = os.path.join(self.session_dir, "seg%d.ts")
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            # Seek within the source file to the programme start offset
+            "-ss", str(self.offset_sec),
+            # Limit output to the programme's remaining duration
+            "-t", str(self.duration_sec),
+            "-i", self.entry.path,
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-map", "0:v:0",
+            "-map", "0:a:0",
+            *(["-map", "0:s:0?", "-c:s", "webvtt"] if self.subtitles else []),
+            "-f", "hls",
+            "-hls_time", str(HLS_SEGMENT_SECONDS),
+            # No list_size limit — serve all segments (VOD)
+            "-hls_list_size", "0",
+            # No delete_segments, no omit_endlist — write #EXT-X-ENDLIST when done
+            "-hls_segment_filename", seg_pattern,
+            self.manifest_path,
+        ]
+        log.debug("Catchup ffmpeg: %s", " ".join(cmd))
+        self._process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    def stop(self):
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+        self._process = None
+        if os.path.isdir(self.session_dir):
+            shutil.rmtree(self.session_dir, ignore_errors=True)
+
+    def is_ready(self) -> bool:
+        return os.path.exists(self.manifest_path)
+
+
+class CatchupManager:
+    """
+    Creates and manages CatchupSession instances.
+    A background thread evicts expired sessions.
+    """
+
+    def __init__(self, tmp_base: str, subtitles: bool = True):
+        self._tmp_base = tmp_base
+        self._subtitles = subtitles
+        self._sessions: Dict[str, CatchupSession] = {}
+        self._lock = threading.Lock()
+        self._reaper = threading.Thread(
+            target=self._reap_loop, daemon=True, name="catchup-reaper"
+        )
+        self._reaper.start()
+
+    def get_or_create(
+        self,
+        channel: Channel,
+        at: datetime,
+    ) -> Optional[CatchupSession]:
+        """
+        Find or create a catchup session for `channel` at datetime `at`.
+        Returns None if the channel has no content at that time.
+        """
+        result = get_playing_at(channel, at)
+        if result is None:
+            return None
+
+        entry, offset_sec = result
+        # Duration = remainder of the programme from the requested start
+        duration_sec = entry.duration_sec - offset_sec
+
+        # Session key: channel + unix timestamp rounded to nearest second
+        ts = int(at.timestamp())
+        session_id = f"{channel.id}_{ts}"
+
+        with self._lock:
+            if session_id in self._sessions:
+                self._sessions[session_id].touch()
+                return self._sessions[session_id]
+
+            session_dir = os.path.join(self._tmp_base, "catchup", session_id)
+            session = CatchupSession(
+                session_id=session_id,
+                entry=entry,
+                offset_sec=offset_sec,
+                duration_sec=duration_sec,
+                session_dir=session_dir,
+                subtitles=self._subtitles,
+            )
+            session.start()
+            self._sessions[session_id] = session
+            log.info(
+                "Catchup session started: %s | %s @ %.0fs",
+                session_id, entry.title, offset_sec
+            )
+            return session
+
+    def get_session(self, session_id: str) -> Optional[CatchupSession]:
+        with self._lock:
+            s = self._sessions.get(session_id)
+            if s:
+                s.touch()
+            return s
+
+    def stop_all(self):
+        with self._lock:
+            for s in self._sessions.values():
+                s.stop()
+            self._sessions.clear()
+
+    def _reap_loop(self):
+        while True:
+            time.sleep(300)  # check every 5 minutes
+            with self._lock:
+                expired = [sid for sid, s in self._sessions.items() if s.is_expired()]
+                for sid in expired:
+                    log.info("Expiring catchup session: %s", sid)
+                    self._sessions[sid].stop()
+                    del self._sessions[sid]

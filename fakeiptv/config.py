@@ -21,8 +21,9 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8080
     rpi_ip: str = "127.0.0.1"
-    tmp_dir: str = "/tmp/fakeiptv"
+    tmp_dir: str = "/run/fakeiptv"
     subtitles: bool = True
+    catchup_days: int = 7
 
 
 @dataclass
@@ -87,6 +88,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         rpi_ip=_env("FAKEIPTV_RPI_IP", server_raw.get("rpi_ip", "127.0.0.1")),
         tmp_dir=_env("FAKEIPTV_TMP_DIR", server_raw.get("tmp_dir", "/tmp/fakeiptv")),
         subtitles=_env_bool("FAKEIPTV_SUBTITLES", server_raw.get("subtitles", True)),
+        catchup_days=_env_int("FAKEIPTV_CATCHUP_DAYS", int(server_raw.get("catchup_days", 7))),
     )
     metadata = MetadataConfig(
         tmdb_api_key=_env("FAKEIPTV_TMDB_API_KEY", meta_raw.get("tmdb_api_key", "")),

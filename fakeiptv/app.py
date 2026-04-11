@@ -14,7 +14,7 @@ from .epg import build_xmltv
 from .playlist import build_m3u8
 from .scanner import MediaLibrary, Scanner
 from .scheduler import Channel, build_channels, build_epg_window
-from .streamer import StreamManager
+from .streamer import CatchupManager, StreamManager
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +34,10 @@ class FakeIPTV:
             tmp_base=config.server.tmp_dir,
             subtitles=config.server.subtitles,
         )
+        self.catchup_manager = CatchupManager(
+            tmp_base=config.server.tmp_dir,
+            subtitles=config.server.subtitles,
+        )
         self._refresh_timer: threading.Timer = None
 
     # ------------------------------------------------------------------
@@ -50,6 +54,7 @@ class FakeIPTV:
         if self._refresh_timer:
             self._refresh_timer.cancel()
         self.stream_manager.stop_all()
+        self.catchup_manager.stop_all()
         log.info("FakeIPTV stopped.")
 
     # ------------------------------------------------------------------
@@ -86,10 +91,15 @@ class FakeIPTV:
     def _rebuild_cache(self):
         base_url = f"http://{self.config.server.rpi_ip}:{self.config.server.port}"
         epg_url = f"{base_url}/epg.xml"
+        catchup_days = self.config.server.catchup_days
 
-        schedule = build_epg_window(self.channels, hours=24)
+        schedule = build_epg_window(
+            self.channels,
+            hours_back=catchup_days * 24,
+            hours_forward=24,
+        )
         epg_xml = build_xmltv(self.channels, schedule)
-        playlist = build_m3u8(self.channels, base_url, epg_url)
+        playlist = build_m3u8(self.channels, base_url, epg_url, catchup_days=catchup_days)
 
         with self._cache_lock:
             self._epg_cache = epg_xml

@@ -1,7 +1,7 @@
 """
 scheduler.py — Builds deterministic per-channel schedules anchored to a
 fixed local-time epoch, calculates the current playback position, and
-generates XMLTV EPG data for a 24-hour window.
+generates XMLTV EPG data for a configurable window (past + future).
 """
 import logging
 import re
@@ -188,93 +188,96 @@ def _interleave_shows(shows: List[Show]) -> List[ScheduleEntry]:
 
 
 # ---------------------------------------------------------------------------
-# Schedule position
+# Core schedule position logic
+# ---------------------------------------------------------------------------
+
+def _position_at(channel: Channel, at: datetime) -> Tuple[int, float]:
+    """
+    Return (entry_index, offset_sec) for what is playing on `channel` at
+    the given datetime. Pure calculation — no side effects.
+    """
+    elapsed = (at - EPOCH).total_seconds()
+    pos = elapsed % channel.total_duration
+    for i, entry in enumerate(channel.entries):
+        if pos < entry.duration_sec:
+            return i, pos
+        pos -= entry.duration_sec
+    return 0, 0.0  # fallback (shouldn't happen with valid inputs)
+
+
+# ---------------------------------------------------------------------------
+# Live position
 # ---------------------------------------------------------------------------
 
 def get_now_playing(channel: Channel) -> Optional[NowPlaying]:
-    """
-    Given the current wall-clock time and the fixed EPOCH, determine which
-    entry in the channel is currently 'airing' and at what offset.
-    """
+    """Return what is currently airing on the channel."""
     if not channel.entries or channel.total_duration == 0:
         return None
-
-    elapsed = (datetime.now() - EPOCH).total_seconds()
-    pos = elapsed % channel.total_duration
-
-    for i, entry in enumerate(channel.entries):
-        if pos < entry.duration_sec:
-            return NowPlaying(
-                channel_id=channel.id,
-                entry=entry,
-                offset_sec=pos,
-                entry_index=i,
-            )
-        pos -= entry.duration_sec
-
-    # Fallback (shouldn't happen)
+    idx, offset = _position_at(channel, datetime.now())
     return NowPlaying(
         channel_id=channel.id,
-        entry=channel.entries[0],
-        offset_sec=0.0,
-        entry_index=0,
+        entry=channel.entries[idx],
+        offset_sec=offset,
+        entry_index=idx,
     )
 
 
+def get_playing_at(channel: Channel, at: datetime) -> Optional[Tuple[ScheduleEntry, float]]:
+    """
+    Return (entry, offset_sec) for what was/will be playing at `at`.
+    Used by the catchup endpoint to locate the right file and seek position.
+    Returns None if the channel has no entries.
+    """
+    if not channel.entries or channel.total_duration == 0:
+        return None
+    idx, offset = _position_at(channel, at)
+    return channel.entries[idx], offset
+
+
 # ---------------------------------------------------------------------------
-# EPG — build a 24-hour window starting from now
+# EPG — build a window: hours_back in the past + hours_forward into future
 # ---------------------------------------------------------------------------
 
 def build_epg_window(
     channels: Dict[str, Channel],
-    hours: int = 24,
+    hours_back: int = 0,
+    hours_forward: int = 24,
 ) -> Dict[str, List[Tuple[datetime, datetime, ScheduleEntry]]]:
     """
-    Returns {channel_id: [(start, end, entry), ...]} for the next `hours` hours.
+    Returns {channel_id: [(start, end, entry), ...]} covering
+    [now - hours_back ... now + hours_forward].
+
+    Past entries are complete programme slots (full duration even if they
+    started before the window start — clipped to window_start for the
+    returned start time, but the actual air time is used for EPG so
+    catch-up clients can match by timestamp).
     """
+    now = datetime.now()
+    window_start = now - timedelta(hours=hours_back)
+    window_end = now + timedelta(hours=hours_forward)
+
     result: Dict[str, List[Tuple[datetime, datetime, ScheduleEntry]]] = {}
-    window_end = datetime.now() + timedelta(hours=hours)
 
     for ch_id, channel in channels.items():
         if not channel.entries or channel.total_duration == 0:
             continue
 
         slots = []
-        elapsed = (datetime.now() - EPOCH).total_seconds()
-        total = channel.total_duration
 
-        # Position at start of window (now)
-        cycle_pos = elapsed % total
+        # Find the entry playing at window_start
+        idx, offset = _position_at(channel, window_start)
 
-        # Find which entry is at cycle_pos
-        entry_idx = 0
-        offset = cycle_pos
-        for i, entry in enumerate(channel.entries):
-            if offset < entry.duration_sec:
-                entry_idx = i
-                break
-            offset -= entry.duration_sec
-        else:
-            entry_idx = 0
-            offset = 0.0
+        # The programme that straddles window_start began before it
+        programme_start = window_start - timedelta(seconds=offset)
+        programme_end = programme_start + timedelta(seconds=channel.entries[idx].duration_sec)
 
-        current_time = datetime.now()
-        # First entry plays from offset seconds in
-        remaining = channel.entries[entry_idx].duration_sec - offset
-        end_time = current_time + timedelta(seconds=remaining)
-        slots.append((current_time, end_time, channel.entries[entry_idx]))
-
-        idx = (entry_idx + 1) % len(channel.entries)
-        current_time = end_time
-
-        while current_time < window_end:
+        # Walk forward until we pass window_end
+        while programme_start < window_end:
             entry = channel.entries[idx]
-            end_time = current_time + timedelta(seconds=entry.duration_sec)
-            if current_time >= window_end:
-                break
-            slots.append((current_time, min(end_time, window_end), entry))
-            current_time = end_time
+            slots.append((programme_start, programme_end, entry))
             idx = (idx + 1) % len(channel.entries)
+            programme_start = programme_end
+            programme_end = programme_start + timedelta(seconds=channel.entries[idx].duration_sec)
 
         result[ch_id] = slots
 

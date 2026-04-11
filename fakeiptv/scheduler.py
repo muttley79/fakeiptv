@@ -79,105 +79,103 @@ def build_channels(
     """
     Auto-discover channels from the media library.
 
-    Channel types created:
-      - "Primetime"      — all shows, round-robin interleaved
-      - "{Genre}"        — per-genre show mix (≥ SHOW_GENRE_MIN shows share genre)
-      - "Goldies"        — shows with a known year < goldies_before (≥ GOLDIES_MIN shows)
-      - "Hits"           — shows with rating ≥ hits_rating (from Sonarr/Radarr/TMDB/NFO)
-      - "Movies"         — all movies
-      - "{Genre} Movies" — genre-specific movies (≥ MOVIE_GENRE_MIN movies share genre)
+    Each show and movie is assigned to exactly ONE channel so the same
+    content never plays simultaneously on two channels.
 
-    Per-show channels are intentionally NOT created — every channel is a mix.
+    Show assignment priority (first match wins):
+      1. "Hits"      — shows with rating ≥ hits_rating
+      2. "Goldies"   — shows with known year < goldies_before
+      3. "{Genre}"   — dominant genre channel (≥ SHOW_GENRE_MIN shows)
+      4. "Primetime" — all remaining unclaimed shows
+
+    Movie assignment priority:
+      1. "{Genre} Movies" — primary genre channel (≥ MOVIE_GENRE_MIN movies)
+      2. "Movies"         — all remaining unclaimed movies
     """
     disabled = disabled or []
     rename = rename or {}
     channels: Dict[str, Channel] = {}
 
     all_shows = [s for s in library.shows.values() if s.episodes]
+    claimed: set = set()   # show names already assigned to a channel
 
-    # --- Primetime — every show interleaved ---
-    if all_shows:
-        ch_id = "primetime"
-        if ch_id not in disabled:
-            ch_name = rename.get(ch_id, "Primetime")
-            entries = _interleave_shows(all_shows)
-            if entries:
-                channels[ch_id] = Channel(
-                    id=ch_id, name=ch_name, group="Shows", entries=entries
-                )
-
-    # --- Genre channels (TV shows) ---
-    genre_shows: Dict[str, List[Show]] = {}
-    for show in all_shows:
-        for g in show.genres:
-            genre_shows.setdefault(g, []).append(show)
-
-    for genre, shows in sorted(genre_shows.items()):
-        if len(shows) < SHOW_GENRE_MIN:
-            continue
-        ch_id = slugify(genre)
-        if ch_id in disabled:
-            continue
-        ch_name = rename.get(ch_id, genre)
+    def _make_show_channel(ch_id: str, default_name: str, shows: List[Show],
+                           group: str = "Shows") -> None:
+        if ch_id in disabled or not shows:
+            return
+        ch_name = rename.get(ch_id, default_name)
         entries = _interleave_shows(shows)
-        if not entries:
-            continue
-        channels[ch_id] = Channel(id=ch_id, name=ch_name, group="Shows", entries=entries)
+        if entries:
+            channels[ch_id] = Channel(id=ch_id, name=ch_name, group=group, entries=entries)
+            claimed.update(s.name for s in shows)
 
-    # --- Goldies — shows with a known year before goldies_before ---
-    goldies_shows = [s for s in all_shows if _show_year(s) and _show_year(s) < goldies_before]
-    if len(goldies_shows) >= GOLDIES_MIN:
-        ch_id = "goldies"
-        if ch_id not in disabled:
-            ch_name = rename.get(ch_id, "Goldies")
-            entries = _interleave_shows(goldies_shows)
-            if entries:
-                channels[ch_id] = Channel(
-                    id=ch_id, name=ch_name, group="Shows", entries=entries
-                )
-
-    # --- Hits — shows with a rating at or above the threshold ---
+    # --- Pass 1: Hits ---
     hits_shows = [s for s in all_shows if s.rating >= hits_rating]
     if len(hits_shows) >= GOLDIES_MIN:
-        ch_id = "hits"
-        if ch_id not in disabled:
-            ch_name = rename.get(ch_id, "Hits")
-            entries = _interleave_shows(hits_shows)
-            if entries:
-                channels[ch_id] = Channel(
-                    id=ch_id, name=ch_name, group="Shows", entries=entries
-                )
-                log.info(
-                    "Hits channel: %d shows with rating ≥ %.1f",
-                    len(hits_shows), hits_rating
-                )
+        _make_show_channel("hits", "Hits", hits_shows)
+        log.info("Hits channel: %d shows with rating ≥ %.1f", len(hits_shows), hits_rating)
 
-    # --- Movie channels ---
+    # --- Pass 2: Goldies ---
+    goldies_shows = [s for s in all_shows
+                     if s.name not in claimed and _show_year(s) and _show_year(s) < goldies_before]
+    if len(goldies_shows) >= GOLDIES_MIN:
+        _make_show_channel("goldies", "Goldies", goldies_shows)
+
+    # --- Pass 3: Genre channels ---
+    # Build genre→shows map from unclaimed shows only.
+    # Each show is assigned to its dominant genre (first genre in its list).
+    dominant_genre: Dict[str, str] = {}   # show_name → genre
+    genre_shows: Dict[str, List[Show]] = {}
+    for show in all_shows:
+        if show.name in claimed or not show.genres:
+            continue
+        g = show.genres[0]   # dominant genre (sorted by frequency in scanner)
+        dominant_genre[show.name] = g
+        genre_shows.setdefault(g, []).append(show)
+
+    for genre, shows in sorted(genre_shows.items()):
+        # Filter again — some shows may have been claimed by an earlier genre pass
+        unclaimed_shows = [s for s in shows if s.name not in claimed]
+        if len(unclaimed_shows) < SHOW_GENRE_MIN:
+            continue
+        ch_id = slugify(genre)
+        _make_show_channel(ch_id, genre, unclaimed_shows)
+
+    # --- Pass 4: Primetime — all remaining unclaimed shows ---
+    remaining_shows = [s for s in all_shows if s.name not in claimed]
+    if remaining_shows:
+        _make_show_channel("primetime", "Primetime", remaining_shows)
+
+    # --- Movies: genre-first, then remainder ---
+    claimed_movies: set = set()
+
+    def _make_movie_channel(ch_id: str, default_name: str, movies: List[Movie],
+                             group: str = "Movies") -> None:
+        if ch_id in disabled or not movies:
+            return
+        ch_name = rename.get(ch_id, default_name)
+        entries = [_movie_to_entry(m) for m in movies]
+        channels[ch_id] = Channel(id=ch_id, name=ch_name, group=group, entries=entries)
+        claimed_movies.update(m.title for m in movies)
+
     if library.movies:
-        all_movies_id = "movies"
-        if all_movies_id not in disabled:
-            ch_name = rename.get(all_movies_id, "Movies")
-            entries = [_movie_to_entry(m) for m in library.movies]
-            channels[all_movies_id] = Channel(
-                id=all_movies_id, name=ch_name, group="Movies", entries=entries
-            )
-
-        genre_movies: Dict[str, List[Movie]] = {}
+        # Primary genre per movie (first genre)
+        movie_genre: Dict[str, List[Movie]] = {}
         for movie in library.movies:
-            for g in movie.genres:
-                genre_movies.setdefault(g, []).append(movie)
+            if movie.genres:
+                movie_genre.setdefault(movie.genres[0], []).append(movie)
 
-        for genre, movies in sorted(genre_movies.items()):
-            if len(movies) < MOVIE_GENRE_MIN:
+        for genre, movies in sorted(movie_genre.items()):
+            unclaimed = [m for m in movies if m.title not in claimed_movies]
+            if len(unclaimed) < MOVIE_GENRE_MIN:
                 continue
             ch_id = slugify(genre + "-movies")
-            if ch_id in disabled:
-                continue
-            ch_name = rename.get(ch_id, genre + " Movies")
-            entries = [_movie_to_entry(m) for m in movies]
-            channels[ch_id] = Channel(
-                id=ch_id, name=ch_name, group="Movies", entries=entries
-            )
+            _make_movie_channel(ch_id, genre + " Movies", unclaimed)
+
+        # Remaining movies → "Movies"
+        remaining_movies = [m for m in library.movies if m.title not in claimed_movies]
+        if remaining_movies:
+            _make_movie_channel("movies", "Movies", remaining_movies)
 
     log.info("Built %d channels", len(channels))
     return channels

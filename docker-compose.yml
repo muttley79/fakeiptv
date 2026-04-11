@@ -27,4 +27,5 @@ services:
       # Timezone — must match the host so the schedule epoch and EPG times are correct.
       # Set TZ in .env (e.g. TZ=Asia/Jerusalem) or hardcode here.
       TZ: ${TZ:-Asia/Jerusalem}
+      FAKEIPTV_PREWARM: ${FAKEIPTV_PREWARM:-false}
 

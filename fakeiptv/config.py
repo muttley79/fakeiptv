@@ -25,6 +25,7 @@ class ServerConfig:
     tmp_dir: str = "/dev/shm/fakeiptv"
     subtitles: bool = True
     catchup_days: int = 7
+    prewarm: bool = False
 
 
 @dataclass
@@ -97,6 +98,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         tmp_dir=_env("FAKEIPTV_TMP_DIR", server_raw.get("tmp_dir", "/tmp/fakeiptv")),
         subtitles=_env_bool("FAKEIPTV_SUBTITLES", server_raw.get("subtitles", True)),
         catchup_days=_env_int("FAKEIPTV_CATCHUP_DAYS", int(server_raw.get("catchup_days", 7))),
+        prewarm=_env_bool("FAKEIPTV_PREWARM", server_raw.get("prewarm", False)),
     )
     metadata = MetadataConfig(
         tmdb_api_key=_env("FAKEIPTV_TMDB_API_KEY", meta_raw.get("tmdb_api_key", "")),

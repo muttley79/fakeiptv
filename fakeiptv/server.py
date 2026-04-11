@@ -87,16 +87,14 @@ def hls_manifest(channel_id: str):
             time.sleep(0.5)
         return redirect(f"/catchup/{channel_id}/{session.session_id}/stream.m3u8")
 
-    # Pre-warm all channels on first request of each "session".
-    # _prewarm_done resets when all channels have gone idle (nobody watching),
-    # so the next viewer triggers a fresh pre-warm.
-    global _prewarm_done
-    if not _prewarm_done:
-        _prewarm_done = True
-        _app_instance.prewarm_channels()
-    elif not _app_instance.stream_manager.has_active_streamers():
-        # All channels went idle since last pre-warm — reset so next session warms up
-        _prewarm_done = False
+    # Pre-warm disabled — too CPU-intensive on startup; channels start lazily on first request.
+    # global _prewarm_done
+    # if not _prewarm_done:
+    #     _prewarm_done = True
+    #     _app_instance.prewarm_channels()
+    # elif not _app_instance.stream_manager.has_active_streamers():
+    #     # All channels went idle since last pre-warm — reset so next session warms up
+    #     _prewarm_done = False
 
     # Start ffmpeg lazily on first client request for this channel
     if not _app_instance.stream_manager.ensure_started(channel_id):

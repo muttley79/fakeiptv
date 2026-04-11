@@ -48,6 +48,7 @@ class FakeIPTV:
     def start(self):
         log.info("FakeIPTV starting up...")
         self.refresh()
+        self.prewarm_channels()
         self._schedule_midnight_refresh()
         self._schedule_hourly_epg()
         log.info("FakeIPTV ready on http://%s:%d", self.config.server.rpi_ip, self.config.server.port)
@@ -146,11 +147,18 @@ class FakeIPTV:
             return
 
         def _warm():
+            log.info("Pre-warming %d channels...", len(channels))
+            started = 0
             for ch_id in channels:
-                self.stream_manager.ensure_started(ch_id)
+                try:
+                    self.stream_manager.ensure_started(ch_id)
+                    started += 1
+                except Exception:
+                    log.exception("Pre-warm failed for channel %s", ch_id)
                 # Small stagger so 40 ffmpeg processes don't all spawn in the
                 # same instant and spike CPU/disk on the Pi.
                 time.sleep(0.3)
+            log.info("Pre-warm complete: %d/%d channels started", started, len(channels))
 
         t = threading.Thread(target=_warm, daemon=True, name="prewarm")
         t.start()

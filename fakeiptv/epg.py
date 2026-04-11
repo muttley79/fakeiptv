@@ -2,84 +2,92 @@
 epg.py — Generates XMLTV-format EPG XML from a 24-hour schedule window.
 """
 import time as _time
-import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Tuple
 
 from .scheduler import Channel, ScheduleEntry
 
 
-def _local_tz_str() -> str:
-    """
-    Return the local UTC offset as an XMLTV-format string, e.g. '+0200' or '-0500'.
-    Works on Python 3.9 without zoneinfo.
-    """
+def _local_offset_sec() -> int:
+    """Return local UTC offset in seconds (positive = east of UTC)."""
     if _time.daylight and _time.localtime().tm_isdst:
-        offset_sec = -_time.altzone
-    else:
-        offset_sec = -_time.timezone
-    sign = "+" if offset_sec >= 0 else "-"
-    hours, remainder = divmod(abs(offset_sec), 3600)
-    minutes = remainder // 60
-    return f"{sign}{hours:02d}{minutes:02d}"
+        return -_time.altzone
+    return -_time.timezone
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Convert a naive local datetime to UTC."""
+    return dt - timedelta(seconds=_local_offset_sec())
 
 
 def _fmt_xmltv_time(dt: datetime) -> str:
-    """Format datetime as XMLTV timestamp in local time with correct UTC offset."""
-    return dt.strftime("%Y%m%d%H%M%S") + " " + _local_tz_str()
+    """Format a local datetime as XMLTV UTC timestamp."""
+    return _to_utc(dt).strftime("%Y%m%d%H%M%S") + " +0000"
+
+
+def _esc(text: str) -> str:
+    """Escape XML special characters."""
+    return (
+        text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def build_xmltv(
     channels: Dict[str, Channel],
     schedule: Dict[str, List[Tuple[datetime, datetime, ScheduleEntry]]],
 ) -> str:
-    """Return XMLTV XML string."""
-    root = ET.Element("tv", attrib={
-        "generator-info-name": "fakeiptv",
-        "source-info-name": "fakeiptv",
-    })
+    """Return XMLTV XML string compatible with Televizo and other IPTV clients."""
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<!DOCTYPE tv SYSTEM "https://raw.githubusercontent.com/XMLTV/xmltv/master/xmltv.dtd">',
+        "<tv>",
+    ]
 
     # --- Channel definitions ---
     for ch_id, channel in channels.items():
-        ch_el = ET.SubElement(root, "channel", id=ch_id)
-        ET.SubElement(ch_el, "display-name").text = channel.name
+        lines.append(f'  <channel id="{_esc(ch_id)}">')
+        lines.append(f"    <display-name>{_esc(channel.name)}</display-name>")
         if channel.poster_url:
-            ET.SubElement(ch_el, "icon", src=channel.poster_url)
+            lines.append(f'    <icon src="{_esc(channel.poster_url)}" />')
+        lines.append("  </channel>")
 
     # --- Programme entries ---
     for ch_id, slots in schedule.items():
         for start, end, entry in slots:
-            prog = ET.SubElement(root, "programme", attrib={
-                "start": _fmt_xmltv_time(start),
-                "stop": _fmt_xmltv_time(end),
-                "channel": ch_id,
-            })
-            ET.SubElement(prog, "title", lang="en").text = entry.title
-            # For episodes: prefix subtitle with S##E## so season is visible in the guide
+            start_s = _fmt_xmltv_time(start)
+            stop_s = _fmt_xmltv_time(end)
+            lines.append(
+                f'  <programme channel="{_esc(ch_id)}" start="{start_s}" stop="{stop_s}">'
+            )
+            lines.append(f"    <title>{_esc(entry.title)}</title>")
+
             subtitle = entry.subtitle if entry.subtitle != entry.title else ""
             if entry.season and entry.episode:
                 ep_tag = f"S{entry.season:02d}E{entry.episode:02d}"
-                subtitle = f"{ep_tag} · {subtitle}" if subtitle else ep_tag
+                subtitle = f"{ep_tag} - {subtitle}" if subtitle else ep_tag
             if subtitle:
-                ET.SubElement(prog, "sub-title", lang="en").text = subtitle
+                lines.append(f"    <sub-title>{_esc(subtitle)}</sub-title>")
+
             if entry.plot:
-                ET.SubElement(prog, "desc", lang="en").text = entry.plot
+                lines.append(f"    <desc>{_esc(entry.plot)}</desc>")
             if entry.year:
-                ET.SubElement(prog, "date").text = str(entry.year)
+                lines.append(f"    <date>{entry.year}</date>")
             for genre in entry.genres:
-                ET.SubElement(prog, "category", lang="en").text = genre
+                lines.append(f"    <category>{_esc(genre)}</category>")
             if entry.season and entry.episode:
-                # XMLTV episode-num system="onscreen": S01 E03
-                ET.SubElement(prog, "episode-num", system="onscreen").text = (
-                    f"S{entry.season:02d} E{entry.episode:02d}"
+                lines.append(
+                    f'    <episode-num system="onscreen">S{entry.season:02d} E{entry.episode:02d}</episode-num>'
                 )
-                # XMLTV episode-num system="xmltv_ns": season.episode.part (0-indexed)
-                ET.SubElement(prog, "episode-num", system="xmltv_ns").text = (
-                    f"{entry.season - 1}.{entry.episode - 1}.0/1"
+                lines.append(
+                    f'    <episode-num system="xmltv_ns">{entry.season - 1}.{entry.episode - 1}.0/1</episode-num>'
                 )
             if entry.poster_url:
-                ET.SubElement(prog, "icon", src=entry.poster_url)
+                lines.append(f'    <icon src="{_esc(entry.poster_url)}" />')
+            lines.append("  </programme>")
 
-    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
-        root, encoding="unicode", xml_declaration=False
-    )
+    lines.append("</tv>")
+    return "\n".join(lines) + "\n"

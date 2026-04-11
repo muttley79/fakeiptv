@@ -132,17 +132,24 @@ def catchup_start(channel_id: str):
     if channel_id not in _app_instance.channels:
         abort(404)
 
-    utc_str = request.args.get("utc") or request.args.get("start")
-    if not utc_str:
+    # Accept any common timestamp parameter name
+    utc_str = (request.args.get("utc") or request.args.get("start")
+               or request.args.get("t") or request.args.get("timestamp")
+               or request.args.get("begin"))
+    log.debug("Catchup request for %s — args: %s", channel_id, dict(request.args))
+
+    # If the player sent the literal template (substitution failed), log it clearly
+    if not utc_str or "{" in str(utc_str):
+        log.warning(
+            "Catchup for %s received unsubstituted URL — player did not fill in timestamp. "
+            "Full args: %s", channel_id, dict(request.args)
+        )
         abort(400)
 
     try:
-        at = datetime.utcfromtimestamp(int(utc_str))
-        # Convert to local time to match our EPOCH-based schedule
-        import time as _time
-        local_offset = _time.timezone if (_time.daylight == 0) else _time.altzone
-        at = datetime.fromtimestamp(int(utc_str) - local_offset)
+        at = datetime.fromtimestamp(int(utc_str))
     except (ValueError, TypeError):
+        log.warning("Catchup for %s — bad utc value: %r", channel_id, utc_str)
         abort(400)
 
     channel = _app_instance.channels[channel_id]

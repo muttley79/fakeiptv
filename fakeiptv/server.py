@@ -61,12 +61,16 @@ def hls_manifest(channel_id: str):
     if channel_id not in _app_instance.channels:
         abort(404)
 
-    # On the very first channel request, warm up all channels in the background
-    # so subsequent switches are fast. Triggered here (not at startup) so we
-    # only pay the cost when a user is actually watching.
+    # Pre-warm all channels on first request of each "session".
+    # _prewarm_done resets when all channels have gone idle (nobody watching),
+    # so the next viewer triggers a fresh pre-warm.
+    global _prewarm_done
     if not _prewarm_done:
         _prewarm_done = True
         _app_instance.prewarm_channels()
+    elif not _app_instance.stream_manager.has_active_streamers():
+        # All channels went idle since last pre-warm — reset so next session warms up
+        _prewarm_done = False
 
     # Start ffmpeg lazily on first client request for this channel
     if not _app_instance.stream_manager.ensure_started(channel_id):

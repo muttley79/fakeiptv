@@ -29,8 +29,9 @@ HLS_SEGMENT_SECONDS = 2
 HLS_LIST_SIZE = 15         # sliding window — keep 15 × 2s segments (~30s of buffer)
 CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
 RESTART_DELAY = 1          # seconds to wait before restarting a dead process
-IDLE_TIMEOUT = 600         # stop ffmpeg after 10 min with no client requests
-IDLE_CHECK_INTERVAL = 60   # how often the reaper checks for idle channels
+IDLE_TIMEOUT = 600         # stop ffmpeg after 10 min with no client requests (watched)
+IDLE_TIMEOUT_PREWARM = 120 # stop after 2 min if pre-warmed but never directly watched
+IDLE_CHECK_INTERVAL = 30   # how often the reaper checks for idle channels
 
 
 class ChannelStreamer:
@@ -49,6 +50,7 @@ class ChannelStreamer:
         self._monitor_thread: Optional[threading.Thread] = None
         self._last_accessed: float = 0.0
         self._started_at: float = 0.0
+        self._ever_watched: bool = False  # True once a client touches this channel
         self.hls_dir = os.path.join(tmp_base, f"ch_{channel.id}")
         self.manifest_path = os.path.join(self.hls_dir, "stream.m3u8")
         self.concat_path = os.path.join(self.hls_dir, "concat.txt")
@@ -79,9 +81,11 @@ class ChannelStreamer:
     def touch(self):
         """Record that a client just fetched something — resets the idle clock."""
         self._last_accessed = time.time()
+        self._ever_watched = True
 
     def is_idle(self) -> bool:
-        return (time.time() - self._last_accessed) > IDLE_TIMEOUT
+        timeout = IDLE_TIMEOUT if self._ever_watched else IDLE_TIMEOUT_PREWARM
+        return (time.time() - self._last_accessed) > timeout
 
     def is_ready(self) -> bool:
         """True once the HLS manifest exists (ffmpeg has written at least one segment)."""
@@ -183,6 +187,7 @@ class ChannelStreamer:
             seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
             audio_opts = ["-c:a", "copy"] if self._audio_copy else ["-c:a", "aac", "-b:a", "192k"]
             cmd = [
+                "nice", "-n", "10",   # lower CPU priority — yields to other processes
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel", "error",
@@ -400,6 +405,10 @@ class StreamManager:
             # Replace channel registry (new channels are NOT started here)
             self._channels = dict(channels)
 
+    def has_active_streamers(self) -> bool:
+        """True if any channel is currently running."""
+        return bool(self._streamers)
+
     def _reap_loop(self):
         """Background thread: stop ffmpeg for channels with no recent client activity."""
         while True:
@@ -407,8 +416,9 @@ class StreamManager:
             with self._lock:
                 idle = [ch_id for ch_id, s in self._streamers.items() if s.is_idle()]
                 for ch_id in idle:
+                    timeout = IDLE_TIMEOUT if self._streamers[ch_id]._ever_watched else IDLE_TIMEOUT_PREWARM
                     log.info(
-                        "Channel %s idle for >%ds — stopping ffmpeg", ch_id, IDLE_TIMEOUT
+                        "Channel %s idle for >%ds — stopping ffmpeg", ch_id, timeout
                     )
                     self._streamers[ch_id].stop()
                     del self._streamers[ch_id]

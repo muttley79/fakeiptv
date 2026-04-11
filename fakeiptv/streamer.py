@@ -25,8 +25,8 @@ from .scheduler import Channel, NowPlaying, ScheduleEntry, get_now_playing, get_
 
 log = logging.getLogger(__name__)
 
-HLS_SEGMENT_SECONDS = 2    # smaller = faster channel switch (client needs ~3 segments to start)
-HLS_LIST_SIZE = 10         # keep 10 × 2s = 20s of buffer — same wall-clock as before
+HLS_SEGMENT_SECONDS = 5
+HLS_LIST_SIZE = 6          # sliding window — keep 6 segments (~30s of buffer)
 CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
 RESTART_DELAY = 2          # seconds to wait before restarting a dead process
 IDLE_TIMEOUT = 60          # stop ffmpeg after this many seconds with no client requests

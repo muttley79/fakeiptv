@@ -72,6 +72,7 @@ class FakeIPTV:
             movies_path=self.config.media.movies_path,
             cache_dir=self.config.metadata.cache_dir,
             tmdb_api_key=self.config.metadata.tmdb_api_key,
+            ignore_patterns=self.config.media.ignore_patterns,
         )
         library = scanner.scan()
         channels = build_channels(

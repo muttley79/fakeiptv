@@ -281,12 +281,27 @@ def probe_duration(path: str) -> float:
 # ---------------------------------------------------------------------------
 
 class Scanner:
-    def __init__(self, shows_path: str, movies_path: str, cache_dir: str, tmdb_api_key: str = ""):
+    def __init__(self, shows_path: str, movies_path: str, cache_dir: str,
+                 tmdb_api_key: str = "", ignore_patterns: List[str] = None):
         self.shows_path = shows_path
         self.movies_path = movies_path
+        self._ignore = ignore_patterns or []
         db_path = os.path.join(cache_dir, "cache.db")
         self._dur_cache = DurationCache(db_path)
         self._tmdb = TMDBCache(db_path, tmdb_api_key)
+
+    def _is_ignored(self, path: str) -> bool:
+        """Return True if the path should be skipped."""
+        import fnmatch
+        # Always skip hidden directories/files (e.g. .@__thumb, .DS_Store)
+        parts = path.replace("\\", "/").split("/")
+        if any(p.startswith(".") for p in parts):
+            return True
+        # User-defined patterns matched against the full path
+        for pattern in self._ignore:
+            if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(os.path.basename(path), pattern):
+                return True
+        return False
 
     def scan(self) -> MediaLibrary:
         library = MediaLibrary()
@@ -316,12 +331,15 @@ class Scanner:
             episodes = []
 
             for root_dir, dirs, files in os.walk(show_dir):
-                dirs.sort()
+                # Prune ignored dirs in-place so os.walk won't descend into them
+                dirs[:] = sorted(d for d in dirs if not self._is_ignored(os.path.join(root_dir, d)))
                 for fname in sorted(files):
                     ext = os.path.splitext(fname)[1].lower()
                     if ext not in VIDEO_EXTS:
                         continue
                     fpath = os.path.join(root_dir, fname)
+                    if self._is_ignored(fpath):
+                        continue
                     ep = self._make_episode(fpath, show_name)
                     if ep:
                         episodes.append(ep)
@@ -399,6 +417,8 @@ class Scanner:
     def _scan_movies(self, library: MediaLibrary):
         for entry in sorted(os.listdir(self.movies_path)):
             movie_dir = os.path.join(self.movies_path, entry)
+            if self._is_ignored(movie_dir):
+                continue
 
             # Support both flat files and one-folder-per-movie layouts
             if os.path.isfile(movie_dir):
@@ -408,6 +428,7 @@ class Scanner:
                     os.path.join(movie_dir, f)
                     for f in sorted(os.listdir(movie_dir))
                     if os.path.splitext(f)[1].lower() in VIDEO_EXTS
+                    and not self._is_ignored(os.path.join(movie_dir, f))
                 ]
 
             for path in candidates:

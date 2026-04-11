@@ -1,6 +1,12 @@
 media:
   shows_path: /mnt/nas/Shows
   movies_path: /mnt/nas/Movies
+  # Glob patterns for files/dirs to skip during scanning.
+  # Hidden dirs (starting with .) are always skipped automatically.
+  # Patterns are matched against the full path and the filename.
+  ignore_patterns:
+    - "*.sample.*"
+    - "*-sample.*"
 
 server:
   host: 0.0.0.0

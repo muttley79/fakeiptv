@@ -14,6 +14,7 @@ from typing import List
 class MediaConfig:
     shows_path: str = "/mnt/nas/Shows"
     movies_path: str = "/mnt/nas/Movies"
+    ignore_patterns: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -81,6 +82,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     media = MediaConfig(
         shows_path=_env("FAKEIPTV_SHOWS_PATH", media_raw.get("shows_path", "/mnt/nas/Shows")),
         movies_path=_env("FAKEIPTV_MOVIES_PATH", media_raw.get("movies_path", "/mnt/nas/Movies")),
+        ignore_patterns=media_raw.get("ignore_patterns") or [],
     )
     server = ServerConfig(
         host=_env("FAKEIPTV_HOST", server_raw.get("host", "0.0.0.0")),

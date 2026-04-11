@@ -20,9 +20,10 @@ TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
 
 
 def _normalise(title: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace — for fuzzy matching."""
+    """Lowercase, treat dots/underscores as spaces, strip punctuation — for fuzzy matching."""
     title = title.lower()
-    title = re.sub(r"[^\w\s]", "", title)
+    title = title.replace(".", " ").replace("_", " ")  # filename separators → spaces
+    title = re.sub(r"[^\w\s]", "", title)              # strip remaining punctuation
     title = re.sub(r"\s+", " ", title).strip()
     return title
 
@@ -105,6 +106,7 @@ class SonarrClient:
                 poster_url = series.get("remotePoster", "") or img.get("remoteUrl", "")
                 break
         return {
+            "title": series.get("title", ""),
             "genres": series.get("genres", []),
             "poster_url": poster_url,
             "year": series.get("year", 0),
@@ -188,6 +190,7 @@ class RadarrClient:
         poster_url = movie.get("remotePoster", "")
         runtime_min = movie.get("runtime", 0)
         return {
+            "title": movie.get("title", ""),
             "genres": movie.get("genres", []),
             "poster_url": poster_url,
             "year": movie.get("year", 0),

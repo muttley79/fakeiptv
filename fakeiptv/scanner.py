@@ -378,7 +378,7 @@ class Scanner:
             log.warning("Could not determine duration for %s, skipping", path)
             return None
 
-        title = nfo.get("title") or os.path.splitext(os.path.basename(path))[0]
+        title = nfo.get("title") or self._clean_filename_title(os.path.basename(path))
         season = nfo.get("season") or self._guess_season(path)
         episode_num = nfo.get("episode") or self._guess_episode(path)
         genres = nfo.get("genres") or []
@@ -400,7 +400,9 @@ class Scanner:
                 poster_url = poster_url or show_meta.get("poster_url", "")
             ep_meta = self._sonarr.get_episode_metadata(show_name, season, episode_num)
             if ep_meta:
-                title = title or ep_meta.get("title", title)
+                # Prefer Sonarr's episode title over the filename-derived one
+                if not nfo.get("title") and ep_meta.get("title"):
+                    title = ep_meta["title"]
                 plot = plot or ep_meta.get("plot", "")
 
         # --- TMDB (last resort) ---
@@ -466,7 +468,11 @@ class Scanner:
         nfo_path = os.path.splitext(path)[0] + ".nfo"
         nfo = parse_nfo(nfo_path) if os.path.exists(nfo_path) else {}
 
-        title = nfo.get("title") or os.path.splitext(os.path.basename(path))[0]
+        # For the lookup title: use NFO title if available, otherwise clean the filename.
+        # The cleaned filename (dots→spaces, quality markers stripped) improves Radarr matching.
+        raw_filename_title = self._clean_filename_title(os.path.basename(path))
+        title = nfo.get("title") or raw_filename_title
+        lookup_title = title  # what we actually send to Radarr/TMDB
         genres = nfo.get("genres") or []
         plot = nfo.get("plot", "")
         tmdb_id = nfo.get("tmdb_id") or ""
@@ -476,8 +482,11 @@ class Scanner:
 
         # --- Radarr (middle tier) ---
         if self._radarr and (not genres or not plot or not poster_url):
-            meta = self._radarr.get_movie_metadata(title, year)
+            meta = self._radarr.get_movie_metadata(lookup_title, year)
             if meta:
+                # Use Radarr's canonical title (clean, properly capitalised)
+                if not nfo.get("title") and meta.get("title"):
+                    title = meta["title"]
                 if not genres and meta.get("genres"):
                     genres = meta["genres"]
                     meta_source = "radarr"
@@ -533,6 +542,36 @@ class Scanner:
         if dur:
             self._dur_cache.set(path, dur)
         return dur
+
+    @staticmethod
+    def _clean_filename_title(filename: str) -> str:
+        """
+        Turn a raw filename into a human-readable title for Radarr/Sonarr lookup.
+        Strips extension, dots/underscores, year, and common quality/codec markers.
+        e.g. "Harry.Potter.and.the.Chamber.of.Secrets.2002.Bluray-1080p.mkv"
+             → "Harry Potter and the Chamber of Secrets"
+        """
+        # Remove extension
+        name = os.path.splitext(filename)[0]
+        # Replace dots and underscores with spaces
+        name = name.replace(".", " ").replace("_", " ")
+        # Truncate at year (4-digit number 1900-2099) or quality markers
+        quality_re = re.compile(
+            r"\s*\b("
+            r"(19|20)\d{2}"           # year
+            r"|[0-9]{3,4}p"           # resolution: 720p, 1080p, 2160p
+            r"|(?:blu.?ray|bluray|bdrip|brrip|dvdrip|webrip|web.?dl|hdtv|hdrip|uhd)"
+            r"|(?:x264|x265|h264|h265|xvid|divx|hevc|avc)"
+            r"|(?:aac|ac3|dts|truehd|atmos|eac3|dd5?(?:\.1)?)"
+            r"|(?:hdr|hdr10|dv|dolby)"
+            r"|(?:extended|theatrical|remastered|proper|repack)"
+            r")\b.*$",
+            re.IGNORECASE,
+        )
+        name = quality_re.sub("", name).strip()
+        # Collapse multiple spaces
+        name = re.sub(r"\s+", " ", name).strip()
+        return name
 
     @staticmethod
     def _guess_season(path: str) -> int:

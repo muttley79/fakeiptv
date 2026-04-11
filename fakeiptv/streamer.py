@@ -12,6 +12,7 @@ CatchupManager handles on-demand VOD sessions for past programmes.
 """
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -114,10 +115,14 @@ class ChannelStreamer:
             entry = entries[idx % n]
             # Forward slashes required by ffconcat; escape single quotes so
             # paths like "It's Always Sunny.mkv" don't break the format.
-            # Use double-quoted paths — single-quoted ffconcat strings have no
-            # escape mechanism, so apostrophes in filenames (e.g. "Paul's") break them.
-            path = entry.path.replace("\\", "/").replace('"', '\\"')
-            lines.append(f'file "{path}"\n')
+            # Use unquoted paths with backslash escaping.
+            # Single-quoted ffconcat strings have no escape for ' itself.
+            # Double-quoted paths aren't supported by all ffmpeg builds.
+            # In unquoted mode, av_get_token() treats \ as an escape for the
+            # next char, so \<space> and \' both work reliably.
+            path = entry.path.replace("\\", "/")
+            path = re.sub(r"([ \t'\"])", r"\\\1", path)
+            lines.append(f"file {path}\n")
             if first and offset > 0:
                 lines.append(f"inpoint {offset:.3f}\n")
                 accumulated += entry.duration_sec - offset

@@ -22,7 +22,15 @@ EPOCH = datetime(2024, 1, 1, 0, 0, 0)
 MOVIE_GENRE_MIN = 3
 
 # Minimum number of shows sharing a genre to create a genre channel
-SHOW_GENRE_MIN = 2
+SHOW_GENRE_MIN = 3
+
+# Maximum fraction of a genre channel's episodes one show may contribute.
+# If a single show would own more than this share, the channel is skipped.
+SHOW_GENRE_MAX_DOMINANCE = 0.6
+
+# Each show's episode contribution is capped at this multiple of the
+# smallest show's episode count, so no show runs away in the mix.
+SHOW_GENRE_EPISODE_CAP_FACTOR = 3
 
 # Minimum number of qualifying shows to create a "Goldies" channel
 GOLDIES_MIN = 2
@@ -123,6 +131,15 @@ def build_channels(
     for genre, shows in sorted(genre_shows.items()):
         if len(shows) < SHOW_GENRE_MIN:
             continue
+        # Skip if one show would dominate the channel (too few other shows
+        # to provide real variety even though the threshold was met).
+        total_eps = sum(len(s.episodes) for s in shows)
+        if total_eps == 0:
+            continue
+        top_share = max(len(s.episodes) for s in shows) / total_eps
+        if top_share > SHOW_GENRE_MAX_DOMINANCE:
+            log.debug("Skipping genre '%s' — one show owns %.0f%% of episodes", genre, top_share * 100)
+            continue
         _add_show_channel(slugify(genre), genre, shows)
 
     # --- Goldies ---
@@ -208,8 +225,22 @@ def _movie_to_entry(movie: Movie) -> ScheduleEntry:
 
 
 def _interleave_shows(shows: List[Show]) -> List[ScheduleEntry]:
-    """Round-robin episodes across shows so the mix alternates between them."""
-    iterators = [iter(show.episodes) for show in shows]
+    """
+    Round-robin episodes across shows so the mix alternates between them.
+
+    Each show's contribution is capped at SHOW_GENRE_EPISODE_CAP_FACTOR ×
+    the smallest show's episode count so that a show with many seasons
+    doesn't run uninterrupted after shorter shows are exhausted.
+    """
+    if not shows:
+        return []
+    episode_counts = [len(s.episodes) for s in shows if s.episodes]
+    if not episode_counts:
+        return []
+    min_eps = min(episode_counts)
+    cap = min_eps * SHOW_GENRE_EPISODE_CAP_FACTOR
+
+    iterators = [iter(show.episodes[:cap]) for show in shows]
     entries = []
     while True:
         added = False

@@ -7,127 +7,140 @@ No transcoding — just fast remux via `ffmpeg -c copy`.
 ## How it works
 
 - The NAS is scanned for shows and movies at startup and once a day at midnight (local time).
-- Each show gets its own channel that plays episodes in order, looping forever.
-- Genre mix channels (e.g. "Drama Mix") interleave episodes from multiple shows.
-- A "Movies" channel rotates through all movies; genre-specific movie channels are created if there are ≥ 5 movies in a genre.
-- Every channel's schedule is **deterministic** — anchored to a fixed epoch. If you restart the server, channels resume exactly where they would have been.
-- One `ffmpeg -re -c copy` process per channel outputs HLS segments to a temp directory.
-- Flask serves the segments and the XMLTV EPG.
+- Channels are auto-discovered from your library — no per-show channels, only curated mixes:
+  - **Primetime** — all shows interleaved
+  - **{Genre}** — per-genre mix (e.g. Drama, Comedy) if ≥ 2 shows share the genre
+  - **Goldies** — shows older than a configurable year
+  - **Hits** — shows with a rating above a configurable threshold (from Sonarr/Radarr/TMDB/NFO)
+  - **Movies** — all movies; genre-specific movie channels if ≥ 3 movies share a genre
+- Every channel's schedule is **deterministic** — anchored to a fixed epoch. Restarting the server picks up exactly where it would have been.
+- One `ffmpeg -re -c copy` process per channel outputs 2-second HLS segments to a tmpfs directory.
+- All channels are **pre-warmed at startup** so channel switching is near-instant.
+- Flask serves the segments and the XMLTV EPG directly from tmpfs.
 
 ---
 
-## Requirements
+## Deployment — Docker (recommended)
 
-**Raspberry Pi (or any Linux machine):**
-- Python 3.9+
-- `ffmpeg` and `ffprobe` (system packages)
-- NAS mounted (e.g. via SMB/CIFS at `/mnt/nas`)
+### Requirements
+
+- Docker + Docker Compose on the host (Raspberry Pi or any Linux machine)
+- NAS mounted on the host (e.g. via SMB/CIFS at `/mnt/nas`)
+
+### Setup
 
 ```bash
-sudo apt install ffmpeg
+# 1. Clone the repo
+git clone <repo> /opt/fakeiptv
+cd /opt/fakeiptv
+
+# 2. Configure
+cp .env.example .env
+nano .env          # set FAKEIPTV_RPI_IP, paths, API keys
+
+# 3. Build and start
+docker compose up -d
+
+# 4. Watch logs
+docker compose logs -f
+```
+
+### Updating
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+No `down` needed — compose stops, rebuilds, and restarts in one step.
+
+### Useful commands
+
+```bash
+docker logs fakeiptv          # view logs
+docker exec -it fakeiptv bash # shell into container
+docker compose restart        # restart without rebuild
 ```
 
 ---
 
-## Installation
+## Deployment — systemd (alternative)
 
 ```bash
-# 1. Clone / copy to the Pi
-git clone <repo> /opt/fakeiptv
-cd /opt/fakeiptv
+# Install system deps
+sudo apt install ffmpeg python3-venv
 
-# 2. Create virtualenv
+# Set up virtualenv
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
 
-# 3. Configure
-cp .env.example .env
-nano .env          # set FAKEIPTV_RPI_IP and paths
+cp .env.example .env && nano .env
 
-# 4. Run (dev mode)
-venv/bin/python run.py
+# Install and start the service
+sudo cp fakeiptv.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now fakeiptv
+journalctl -u fakeiptv -f
 ```
 
 ---
 
 ## Configuration
 
-All settings can be set in **`.env`** (preferred) or **`config.yaml`**.
+All settings live in **`.env`** (preferred) or **`config.yaml`**.
 Environment variables always take precedence over `config.yaml`.
-
-### `.env` (copy from `.env.example`)
 
 | Variable | Default | Description |
 |---|---|---|
-| `FAKEIPTV_SHOWS_PATH` | `/mnt/nas/Shows` | Path to TV shows on the NAS |
-| `FAKEIPTV_MOVIES_PATH` | `/mnt/nas/Movies` | Path to movies on the NAS |
-| `FAKEIPTV_RPI_IP` | `127.0.0.1` | **LAN IP of this machine** (used in stream URLs) |
-| `FAKEIPTV_PORT` | `8080` | HTTP port to listen on |
-| `FAKEIPTV_TMP_DIR` | `/tmp/fakeiptv` | Where HLS segments are written |
-| `FAKEIPTV_TMDB_API_KEY` | _(empty)_ | Optional TMDB API key for metadata fallback |
-| `FAKEIPTV_CACHE_DIR` | `~/.fakeiptv/` | Duration + TMDB cache directory |
+| `FAKEIPTV_RPI_IP` | `127.0.0.1` | **LAN IP of this machine** — used in stream/EPG URLs |
+| `FAKEIPTV_PORT` | `8080` | HTTP port |
+| `FAKEIPTV_SHOWS_PATH` | `/mnt/nas/Shows` | Host path to TV shows |
+| `FAKEIPTV_MOVIES_PATH` | `/mnt/nas/Movies` | Host path to movies |
+| `FAKEIPTV_TMP_DIR` | `/tmp/fakeiptv` | Where HLS segments are written (use tmpfs) |
+| `FAKEIPTV_CACHE_DIR` | `~/.fakeiptv/` | SQLite cache for durations + TMDB metadata |
+| `FAKEIPTV_SUBTITLES` | `true` | Include subtitle tracks (SRT/ASS→WebVTT) |
+| `FAKEIPTV_CATCHUP_DAYS` | `7` | Days of past programming available for catch-up |
+| `FAKEIPTV_TMDB_API_KEY` | _(empty)_ | Optional — TMDB metadata fallback |
+| `FAKEIPTV_SONARR_URL` | _(empty)_ | Optional — Sonarr integration for ratings/metadata |
+| `FAKEIPTV_SONARR_API_KEY` | _(empty)_ | |
+| `FAKEIPTV_RADARR_URL` | _(empty)_ | Optional — Radarr integration for ratings/metadata |
+| `FAKEIPTV_RADARR_API_KEY` | _(empty)_ | |
+| `FAKEIPTV_TMPFS_SIZE` | `1073741824` | tmpfs size in bytes for HLS segments (Docker only) |
 
 ### NAS layout expected
 
 ```
-/mnt/nas/
-├── Shows/
-│   ├── Breaking Bad/
-│   │   ├── Season 01/
-│   │   │   ├── Breaking.Bad.S01E01.mkv
-│   │   │   └── Breaking.Bad.S01E01.nfo   ← optional sidecar
-│   │   └── ...
-│   └── ...
-└── Movies/
-    ├── Inception (2010)/
-    │   ├── Inception.mkv
-    │   └── Inception.nfo
-    └── ...
-```
+Shows/
+└── Breaking Bad/
+    └── Season 01/
+        ├── Breaking.Bad.S01E01.mkv
+        └── Breaking.Bad.S01E01.nfo   ← optional Kodi/Jellyfin sidecar
 
-NFO files follow the **Kodi / Jellyfin XML format**.
-If an NFO is missing or incomplete, metadata is fetched from TMDB (requires API key).
+Movies/
+└── Inception (2010)/
+    ├── Inception.mkv
+    └── Inception.nfo
+```
 
 ### Disabling or renaming channels (`config.yaml`)
 
 ```yaml
 channels:
+  goldies_before: 2010     # shows older than this go into "Goldies"
+  hits_rating: 8.0         # minimum rating (0–10) for "Hits"
   disabled:
-    - some-show-slug    # auto-derived: lowercase, spaces → hyphens
+    - goldies
   rename:
-    breaking-bad: Breaking Bad 24/7
-```
-
----
-
-## Running as a systemd service
-
-```bash
-# Copy unit file
-sudo cp /opt/fakeiptv/fakeiptv.service /etc/systemd/system/
-
-# Enable + start
-sudo systemctl daemon-reload
-sudo systemctl enable fakeiptv
-sudo systemctl start fakeiptv
-
-# Check logs
-journalctl -u fakeiptv -f
+    primetime: Prime Time
 ```
 
 ---
 
 ## Adding to Televizo
 
-1. Open Televizo → **Add Playlist** → enter:
-   ```
-   http://<rpi-ip>:8080/playlist.m3u8
-   ```
-2. **Add EPG source** → enter:
-   ```
-   http://<rpi-ip>:8080/epg.xml
-   ```
-3. Select any channel — it will start mid-show, just like real TV.
+1. **Add Playlist** → `http://<rpi-ip>:<port>/playlist.m3u8`
+2. **Add EPG** → `http://<rpi-ip>:<port>/epg.xml`
+3. Select any channel — it starts mid-show, just like real TV.
 
 ---
 
@@ -135,30 +148,32 @@ journalctl -u fakeiptv -f
 
 | Endpoint | Description |
 |---|---|
-| `GET /playlist.m3u8` | IPTV channel list (import into Televizo) |
-| `GET /epg.xml` | XMLTV EPG, 24-hour window |
-| `GET /hls/<channel_id>/stream.m3u8` | Live HLS manifest for a channel |
+| `GET /playlist.m3u8` | IPTV channel list |
+| `GET /epg.xml` | XMLTV EPG (7 days back + 1 day forward) |
+| `GET /hls/<channel_id>/stream.m3u8` | Live HLS manifest |
 | `GET /hls/<channel_id>/<seg>.ts` | HLS MPEG-TS segment |
+| `GET /catchup/<channel_id>?utc=<ts>` | Catch-up VOD session |
 | `GET /refresh` | Trigger immediate library rescan |
-| `GET /status` | JSON: channels, now-playing, uptime |
+| `GET /status` | JSON: channels, now-playing, ready state, uptime |
 
 ---
 
 ## Troubleshooting
 
-**Channel shows "loading" forever in Televizo**
-- Check `journalctl -u fakeiptv` for ffmpeg errors.
-- Make sure the NAS is mounted and files are readable.
-- Some MKV files with exotic audio (DTS, TrueHD) may fail to remux. ffmpeg stderr will say so.
+**Channel shows "loading" forever**
+- Check `docker logs fakeiptv` for ffmpeg errors.
+- Verify the NAS is mounted and paths in `.env` are correct.
+- Check `/status` — `"ready": false` means ffmpeg hasn't produced its first segment yet.
+
+**Bitmap subtitle crash loop (PGS/VOBSUB)**
+- The monitor thread detects "bitmap to bitmap" in ffmpeg stderr and automatically disables subtitles for that channel. It self-heals after one restart.
+
+**eac3 / unspecified sample rate error**
+- Some MKV files lose eac3 codec parameters when muxed into MPEG-TS with `-c copy`. The monitor detects this and automatically falls back to `-c:a aac -b:a 192k` for that channel.
 
 **Wrong episode playing / schedule seems off**
-- The schedule epoch is `2024-01-01 00:00:00` local time. All offsets are computed from that.
-- To "reset" a channel's schedule, edit `EPOCH` in `fakeiptv/scheduler.py`.
+- The schedule epoch is `2024-01-01 00:00:00` local time. All offsets are computed from that. Consistent across restarts and container rebuilds.
 
-**TMDB metadata not loading**
-- Set `FAKEIPTV_TMDB_API_KEY` in `.env`.
-- TMDB results are cached in `FAKEIPTV_CACHE_DIR/tmdb_cache.json` — delete this file to force a re-fetch.
-
-**Duration shows as 0 / episode skipped**
-- ffprobe couldn't read the file. Check the file isn't corrupt and ffprobe is installed (`ffprobe -version`).
-- Duration results are cached in `FAKEIPTV_CACHE_DIR/duration_cache.json`.
+**Cache re-probing everything after Docker setup**
+- The SQLite cache is keyed by file path. If the in-container path (`/shows/...`) differs from the original path (`/mnt/nas/Shows/...`), all files are re-probed once. This is normal on first Docker run.
+- Mount `~/.fakeiptv` as the cache volume to persist across rebuilds.

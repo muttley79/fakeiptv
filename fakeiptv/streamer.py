@@ -31,20 +31,24 @@ CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
 RESTART_DELAY = 2          # seconds to wait before restarting a dead process
 IDLE_TIMEOUT = 60          # stop ffmpeg after this many seconds with no client requests
 IDLE_CHECK_INTERVAL = 15   # how often the reaper checks for idle channels
+NEW_CLIENT_RESTART_MIN = 15  # restart ffmpeg for a "new" client only if running longer than this
 
 
 class ChannelStreamer:
     """Manages the ffmpeg process for a single channel."""
 
-    def __init__(self, channel: Channel, tmp_base: str, subtitles: bool = True):
+    def __init__(self, channel: Channel, tmp_base: str, subtitles: bool = True,
+                 audio_copy: bool = True):
         self.channel = channel
         self._tmp_base = tmp_base
         self._subtitles = subtitles
+        self._audio_copy = audio_copy   # False → transcode audio to AAC
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._last_accessed: float = 0.0
+        self._started_at: float = 0.0
         self.hls_dir = os.path.join(tmp_base, f"ch_{channel.id}")
         self.manifest_path = os.path.join(self.hls_dir, "stream.m3u8")
         self.concat_path = os.path.join(self.hls_dir, "concat.txt")
@@ -57,6 +61,7 @@ class ChannelStreamer:
         os.makedirs(self.hls_dir, exist_ok=True)
         self._stop_event.clear()
         self._last_accessed = time.time()
+        self._started_at = time.time()
         self._launch()
         self._monitor_thread = threading.Thread(
             target=self._monitor, daemon=True, name=f"monitor-{self.channel.id}"
@@ -156,16 +161,23 @@ class ChannelStreamer:
                 return
 
             seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
+            audio_opts = ["-c:a", "copy"] if self._audio_copy else ["-c:a", "aac", "-b:a", "192k"]
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel", "error",
+                # Regenerate PTS from scratch so inpoint-based seeks don't produce
+                # non-monotonic timestamps across segment boundaries.
+                "-fflags", "+genpts",
+                # Shift timestamps so the stream always starts at t=0, preventing
+                # players from seeing a large initial PTS value.
+                "-avoid_negative_ts", "make_zero",
                 "-re",
                 "-f", "concat",
                 "-safe", "0",
                 "-i", self.concat_path,
                 "-c:v", "copy",
-                "-c:a", "copy",
+                *audio_opts,
                 "-map", "0:v:0",
                 "-map", "0:a:0",
                 # Subtitles: convert embedded SRT/ASS to WebVTT in-stream.
@@ -236,6 +248,16 @@ class ChannelStreamer:
                             "track for this channel", self.channel.id
                         )
                         self._subtitles = False
+
+                    # Some audio codecs (e.g. eac3 from certain MKV containers)
+                    # lose their codec parameters when muxed into MPEG-TS with -c copy.
+                    # Fall back to AAC transcoding for this channel.
+                    if self._audio_copy and "unspecified sample rate" in stderr_output:
+                        log.warning(
+                            "Channel %s has audio with unspecified sample rate — "
+                            "falling back to AAC transcoding", self.channel.id
+                        )
+                        self._audio_copy = False
                 else:
                     log.info(
                         "ffmpeg exited (code %d) for %s — concat exhausted, restarting",
@@ -273,17 +295,44 @@ class StreamManager:
 
     def ensure_started(self, ch_id: str) -> bool:
         """
-        Start the ffmpeg streamer for ch_id if it isn't already running.
+        Start (or restart) the ffmpeg streamer for ch_id.
+
+        - First call: starts ffmpeg from the current schedule position, cleaning
+          any stale segments first.
+        - Subsequent calls from a new client (channel running >NEW_CLIENT_RESTART_MIN s):
+          restarts ffmpeg so the new client gets fresh segments from the correct
+          live position rather than inheriting the old sliding window.
+          The _subtitles and _audio_copy flags are preserved across restarts.
+
         Returns False if the channel is unknown, True otherwise.
-        Call this before waiting for is_ready().
         """
         with self._lock:
             if ch_id not in self._channels:
                 return False
-            if ch_id not in self._streamers:
+            existing = self._streamers.get(ch_id)
+            if existing is None:
                 s = ChannelStreamer(self._channels[ch_id], self._tmp_base, self._subtitles)
                 s.start()
                 self._streamers[ch_id] = s
+            else:
+                age = time.time() - existing._started_at
+                if existing._started_at > 0 and age > NEW_CLIENT_RESTART_MIN:
+                    # New client connecting to a long-running channel — restart so
+                    # they get a clean segment sequence from the current live position.
+                    log.info(
+                        "New client for %s (running %.0fs) — restarting for clean start",
+                        ch_id, age
+                    )
+                    # Preserve per-channel codec flags discovered during the run
+                    kept_subs = existing._subtitles
+                    kept_audio = existing._audio_copy
+                    existing.stop()
+                    s = ChannelStreamer(
+                        self._channels[ch_id], self._tmp_base,
+                        subtitles=kept_subs, audio_copy=kept_audio,
+                    )
+                    s.start()
+                    self._streamers[ch_id] = s
             return True
 
     def touch(self, ch_id: str):
@@ -331,8 +380,14 @@ class StreamManager:
                 new_paths = [e.path for e in channels[ch_id].entries]
                 if old_paths != new_paths:
                     log.info("Entry list changed for %s — restarting", ch_id)
-                    self._streamers[ch_id].stop()
-                    s = ChannelStreamer(channels[ch_id], self._tmp_base, self._subtitles)
+                    old_s = self._streamers[ch_id]
+                    kept_subs = old_s._subtitles
+                    kept_audio = old_s._audio_copy
+                    old_s.stop()
+                    s = ChannelStreamer(
+                        channels[ch_id], self._tmp_base,
+                        subtitles=kept_subs, audio_copy=kept_audio,
+                    )
                     s.start()
                     self._streamers[ch_id] = s
 

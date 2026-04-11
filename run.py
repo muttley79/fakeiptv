@@ -50,6 +50,12 @@ def main():
     def _shutdown(sig, frame):
         log.info("Shutting down...")
         fake_iptv.stop()
+        # Reset terminal — ffmpeg can leave it in a broken state on exit
+        try:
+            import subprocess as _sp
+            _sp.run(["stty", "sane"], check=False)
+        except Exception:
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _shutdown)

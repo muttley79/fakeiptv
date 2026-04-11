@@ -166,11 +166,9 @@ class ChannelStreamer:
             log.debug("ffmpeg cmd: %s", " ".join(cmd))
             self._process = subprocess.Popen(
                 cmd,
+                stdin=subprocess.DEVNULL,   # no terminal stdin — prevents tty state corruption
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                # Isolate ffmpeg from the terminal's process group so that
-                # Ctrl+C in the shell only signals Python, not ffmpeg.
-                # We send terminate() explicitly from _kill().
                 start_new_session=True,
             )
 
@@ -391,6 +389,7 @@ class CatchupSession:
         log.debug("Catchup ffmpeg: %s", " ".join(cmd))
         self._process = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             start_new_session=True,

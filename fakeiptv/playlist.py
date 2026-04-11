@@ -36,15 +36,9 @@ def build_m3u8(
 
         catchup_attrs = ""
         if catchup_days > 0:
-            # Use multiple placeholder formats: {utc}/{utcend} (standard) and
-            # {start}/{end} (alternative) so we can detect which one Televizo substitutes.
-            catchup_url = (
-                f"{base_url}/catchup/{channel.id}"
-                f"?utc={{utc}}&utcend={{utcend}}"
-                f"&start={{start}}&end={{end}}"
-            )
+            catchup_url = f"{base_url}/catchup/{channel.id}?utc={{utc}}&utcend={{utcend}}"
             catchup_attrs = (
-                f' catchup="default"'
+                f' catchup="shift"'
                 f' catchup-days="{catchup_days}"'
                 f' catchup-source="{catchup_url}"'
             )

@@ -69,6 +69,24 @@ def hls_manifest(channel_id: str):
     if channel_id not in _app_instance.channels:
         abort(404)
 
+    # catchup="shift" — Televizo appends ?utc=TIMESTAMP to the stream URL
+    utc_str = request.args.get("utc") or request.args.get("start")
+    if utc_str and "{" not in utc_str:
+        try:
+            at = datetime.fromtimestamp(int(utc_str))
+        except (ValueError, TypeError):
+            abort(400)
+        channel = _app_instance.channels[channel_id]
+        session = _app_instance.catchup_manager.get_or_create(channel, at)
+        if session is None:
+            abort(404)
+        deadline = time.time() + 15
+        while not session.is_ready():
+            if time.time() > deadline:
+                abort(503)
+            time.sleep(0.5)
+        return redirect(f"/catchup/{channel_id}/{session.session_id}/stream.m3u8")
+
     # Pre-warm all channels on first request of each "session".
     # _prewarm_done resets when all channels have gone idle (nobody watching),
     # so the next viewer triggers a fresh pre-warm.

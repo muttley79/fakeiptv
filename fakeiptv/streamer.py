@@ -101,7 +101,9 @@ class ChannelStreamer:
 
         while accumulated < total_seconds:
             entry = entries[idx % n]
-            path = entry.path.replace("\\", "/")
+            # Forward slashes required by ffconcat; escape single quotes so
+            # paths like "It's Always Sunny.mkv" don't break the format.
+            path = entry.path.replace("\\", "/").replace("'", "\\'")
             lines.append(f"file '{path}'\n")
             if first and offset > 0:
                 lines.append(f"inpoint {offset:.3f}\n")

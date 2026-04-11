@@ -65,29 +65,11 @@ def hls_manifest(channel_id: str):
 
     _app_instance.stream_manager.touch(channel_id)
 
-    # Brief wait (up to 3s) to give ffmpeg a head start before responding.
-    # Kept short to avoid exhausting Flask threads when many channels are cold.
-    deadline = time.time() + 3
-    while not _app_instance.stream_manager.is_ready(channel_id):
-        if time.time() > deadline:
-            break
-        time.sleep(0.25)
-
-    if not _app_instance.stream_manager.is_ready(channel_id):
-        # ffmpeg not ready yet — return a valid empty live manifest instead of
-        # 503.  Per the HLS spec, players must re-request after EXT-X-TARGETDURATION
-        # seconds, so they poll silently rather than showing an error to the user.
-        from .streamer import HLS_SEGMENT_SECONDS
-        empty = (
-            "#EXTM3U\n"
-            "#EXT-X-VERSION:3\n"
-            f"#EXT-X-TARGETDURATION:{HLS_SEGMENT_SECONDS}\n"
-            "#EXT-X-MEDIA-SEQUENCE:0\n"
-        )
-        resp = Response(empty, mimetype="application/x-mpegurl")
-        resp.headers["Cache-Control"] = "no-cache, no-store"
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        return resp
+    # Wait (up to 20s) for ffmpeg to produce its first segment.
+    # Uses threading.Event — all concurrent requests for the same channel share
+    # one event, so this does not create one thread per request.
+    if not _app_instance.stream_manager.wait_ready(channel_id, timeout=20):
+        abort(503)
 
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
     resp = send_from_directory(hls_dir, "stream.m3u8")

@@ -45,6 +45,7 @@ class ChannelStreamer:
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+        self._ready_event = threading.Event()   # set when manifest first appears
         self._monitor_thread: Optional[threading.Thread] = None
         self._last_accessed: float = 0.0
         self._started_at: float = 0.0
@@ -84,7 +85,23 @@ class ChannelStreamer:
 
     def is_ready(self) -> bool:
         """True once the HLS manifest exists (ffmpeg has written at least one segment)."""
-        return os.path.exists(self.manifest_path)
+        return self._ready_event.is_set()
+
+    def wait_ready(self, timeout: float = 20.0) -> bool:
+        """
+        Block until the manifest is ready or timeout expires.
+        Efficient: all concurrent callers wait on the same Event — no spinning,
+        no per-request polling loops.  Returns True if ready within timeout.
+        """
+        return self._ready_event.wait(timeout=timeout)
+
+    def _watch_ready(self):
+        """Background thread: set _ready_event the instant the manifest appears."""
+        while not self._stop_event.is_set():
+            if os.path.exists(self.manifest_path):
+                self._ready_event.set()
+                return
+            time.sleep(0.2)
 
     # ------------------------------------------------------------------
     # Concat file
@@ -145,6 +162,10 @@ class ChannelStreamer:
     # ------------------------------------------------------------------
 
     def _launch(self):
+        self._ready_event.clear()
+        threading.Thread(
+            target=self._watch_ready, daemon=True, name=f"ready-{self.channel.id}"
+        ).start()
         with self._lock:
             # Remove stale HLS segments and manifest from any previous run so the
             # player doesn't get confused by timestamp mismatches on restart.
@@ -335,6 +356,11 @@ class StreamManager:
     def is_ready(self, ch_id: str) -> bool:
         s = self._streamers.get(ch_id)
         return s.is_ready() if s else False
+
+    def wait_ready(self, ch_id: str, timeout: float = 20.0) -> bool:
+        """Block until the channel manifest is ready or timeout expires."""
+        s = self._streamers.get(ch_id)
+        return s.wait_ready(timeout) if s else False
 
     def reload(self, channels: Dict[str, Channel]):
         """

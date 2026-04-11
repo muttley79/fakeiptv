@@ -41,6 +41,8 @@ class MetadataConfig:
 class ChannelsConfig:
     disabled: List[str] = field(default_factory=list)
     rename: dict = field(default_factory=dict)
+    goldies_before: int = 2010   # shows with year < this go into "Goldies"
+    hits_rating: float = 8.0     # minimum rating (0–10) for "Hits" channel
 
 
 @dataclass
@@ -109,6 +111,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     channels = ChannelsConfig(
         disabled=ch_raw.get("disabled") or [],
         rename=ch_raw.get("rename") or {},
+        goldies_before=int(ch_raw.get("goldies_before", 2010)),
+        hits_rating=float(ch_raw.get("hits_rating", 8.0)),
     )
 
     return AppConfig(media=media, server=server, metadata=metadata, channels=channels)

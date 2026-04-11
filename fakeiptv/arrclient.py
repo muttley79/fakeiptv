@@ -105,12 +105,16 @@ class SonarrClient:
                 # Sonarr returns a local /MediaCover URL — use remotePoster instead
                 poster_url = series.get("remotePoster", "") or img.get("remoteUrl", "")
                 break
+        # Sonarr v3: ratings = {"votes": N, "value": 8.5}
+        sonarr_ratings = series.get("ratings", {})
+        rating = float(sonarr_ratings.get("value", 0) or 0)
         return {
             "title": series.get("title", ""),
             "genres": series.get("genres", []),
             "poster_url": poster_url,
             "year": series.get("year", 0),
             "plot": series.get("overview", ""),
+            "rating": rating,
         }
 
     def get_episode_metadata(self, show_name: str, season: int, episode: int) -> Optional[dict]:
@@ -189,6 +193,14 @@ class RadarrClient:
 
         poster_url = movie.get("remotePoster", "")
         runtime_min = movie.get("runtime", 0)
+        # Radarr v3: ratings = {"imdb": {"votes": N, "value": 7.5}, "tmdb": {...}}
+        # Prefer IMDb, fall back to TMDB, then Rotten Tomatoes (scale differs — skip RT)
+        radarr_ratings = movie.get("ratings", {})
+        rating = float(
+            (radarr_ratings.get("imdb") or {}).get("value")
+            or (radarr_ratings.get("tmdb") or {}).get("value")
+            or 0
+        )
         return {
             "title": movie.get("title", ""),
             "genres": movie.get("genres", []),
@@ -196,6 +208,7 @@ class RadarrClient:
             "year": movie.get("year", 0),
             "plot": movie.get("overview", ""),
             "runtime_sec": runtime_min * 60 if runtime_min else 0,
+            "rating": rating,
         }
 
     def reload(self):

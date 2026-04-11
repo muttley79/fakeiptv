@@ -29,10 +29,23 @@ metadata:
   radarr_api_key: ""
 
 channels:
-  # Optional: disable auto-discovered channels by slug
+  # Channels auto-discovered (no per-show channels — every channel is a curated mix):
+  #   primetime       — all shows interleaved
+  #   {genre}         — per-genre mix (e.g. drama, comedy) if ≥ 2 shows share the genre
+  #   goldies         — shows with year < goldies_before
+  #   hits            — shows with rating ≥ hits_rating (from Sonarr/Radarr/TMDB/NFO)
+  #   movies          — all movies
+  #   {genre}-movies  — genre movie mix if ≥ 3 movies share the genre
+
+  goldies_before: 2010   # shows older than this year appear in "Goldies"
+  hits_rating: 8.0       # minimum rating (0–10 scale) for "Hits"
+
+  # Optional: disable channels by slug
   # disabled:
-  #   - some-show-name
+  #   - drama
+  #   - goldies
   #
   # Optional: rename a channel (slug: New Name)
   # rename:
-  #   breaking-bad: Breaking Bad 24/7
+  #   primetime: Prime Time
+  #   hits: Hall of Fame

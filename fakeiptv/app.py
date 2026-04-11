@@ -83,6 +83,8 @@ class FakeIPTV:
             library,
             disabled=self.config.channels.disabled,
             rename=self.config.channels.rename,
+            goldies_before=self.config.channels.goldies_before,
+            hits_rating=self.config.channels.hits_rating,
         )
 
         self.library = library

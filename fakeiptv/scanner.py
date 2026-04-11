@@ -40,6 +40,7 @@ class Episode:
     year: int = 0
     poster_url: str = ""
     tmdb_id: str = ""
+    rating: float = 0.0   # show-level rating (0–10), propagated to all episodes
 
 
 @dataclass
@@ -52,6 +53,7 @@ class Movie:
     year: int = 0
     poster_url: str = ""
     tmdb_id: str = ""
+    rating: float = 0.0   # 0–10 scale
 
 
 @dataclass
@@ -60,6 +62,7 @@ class Show:
     episodes: List[Episode] = field(default_factory=list)
     genres: List[str] = field(default_factory=list)
     poster_url: str = ""
+    rating: float = 0.0   # 0–10 scale, from Sonarr/TMDB/NFO
 
 
 @dataclass
@@ -238,6 +241,21 @@ def parse_nfo(nfo_path: str) -> dict:
 
     runtime_min = _nfo_int(root, "runtime")
 
+    # Rating: try <rating>, then <ratings><rating><value>, then <userrating>
+    rating = 0.0
+    rating_str = _nfo_text(root, "rating")
+    if not rating_str:
+        # Kodi nested format: <ratings><rating name="imdb"><value>8.5</value></rating></ratings>
+        ratings_el = root.find("ratings")
+        if ratings_el is not None:
+            val_el = ratings_el.find(".//value")
+            if val_el is not None:
+                rating_str = (val_el.text or "").strip()
+    try:
+        rating = float(rating_str) if rating_str else 0.0
+    except ValueError:
+        rating = 0.0
+
     return {
         "title": _nfo_text(root, "title"),
         "plot": _nfo_text(root, "plot"),
@@ -248,6 +266,7 @@ def parse_nfo(nfo_path: str) -> dict:
         "genres": genres,
         "tmdb_id": tmdb_id,
         "poster": _nfo_text(root, "thumb") or _nfo_text(root, "poster"),
+        "rating": rating,
     }
 
 
@@ -356,18 +375,23 @@ class Scanner:
             episodes.sort(key=lambda e: (e.season, e.episode))
             show.episodes = episodes
 
-            # Aggregate genres from episodes
+            # Aggregate genres and rating from episodes
             genre_counts: Dict[str, int] = {}
             for ep in episodes:
                 for g in ep.genres:
                     genre_counts[g] = genre_counts.get(g, 0) + 1
             show.genres = sorted(genre_counts, key=lambda g: -genre_counts[g])
 
+            # All episodes share the same show-level rating; take the first non-zero value
+            ratings = [ep.rating for ep in episodes if ep.rating]
+            show.rating = ratings[0] if ratings else 0.0
+
             if episodes and episodes[0].poster_url:
                 show.poster_url = episodes[0].poster_url
 
             library.shows[show_name] = show
-            log.info("Scanned show: %s (%d episodes)", show_name, len(episodes))
+            log.info("Scanned show: %s (%d episodes, rating: %.1f)",
+                     show_name, len(episodes), show.rating)
 
     def _make_episode(self, path: str, show_name: str) -> Optional[Episode]:
         nfo_path = os.path.splitext(path)[0] + ".nfo"
@@ -385,10 +409,11 @@ class Scanner:
         plot = nfo.get("plot", "")
         tmdb_id = nfo.get("tmdb_id") or ""
         poster_url = nfo.get("poster", "")
+        rating = float(nfo.get("rating") or 0)
         meta_source = "nfo" if nfo else "filename"
 
         # --- Sonarr (middle tier: fills gaps left by NFO) ---
-        if self._sonarr and (not genres or not plot or not poster_url):
+        if self._sonarr and (not genres or not plot or not poster_url or not rating):
             show_meta = self._sonarr.get_show_metadata(show_name)
             if show_meta:
                 if not genres and show_meta.get("genres"):
@@ -398,6 +423,7 @@ class Scanner:
                     plot = show_meta["plot"]
                     meta_source = "sonarr"
                 poster_url = poster_url or show_meta.get("poster_url", "")
+                rating = rating or float(show_meta.get("rating") or 0)
             ep_meta = self._sonarr.get_episode_metadata(show_name, season, episode_num)
             if ep_meta:
                 # Prefer Sonarr's episode title over the filename-derived one
@@ -406,7 +432,7 @@ class Scanner:
                 plot = plot or ep_meta.get("plot", "")
 
         # --- TMDB (last resort) ---
-        if self._tmdb._api_key and (not genres or not plot):
+        if self._tmdb._api_key and (not genres or not plot or not rating):
             if tmdb_id:
                 show_data = self._tmdb.fetch_show(tmdb_id)
             else:
@@ -419,9 +445,10 @@ class Scanner:
                     TMDB_IMAGE_BASE + show_data["poster_path"]
                     if show_data.get("poster_path") else ""
                 )
+                rating = rating or float(show_data.get("vote_average") or 0)
 
-        log.debug("S%02dE%02d %s — metadata from: %s", season, episode_num,
-                  os.path.basename(path), meta_source)
+        log.debug("S%02dE%02d %s — metadata from: %s (rating: %.1f)",
+                  season, episode_num, os.path.basename(path), meta_source, rating)
 
         return Episode(
             path=path,
@@ -435,6 +462,7 @@ class Scanner:
             year=nfo.get("year", 0),
             poster_url=poster_url,
             tmdb_id=tmdb_id,
+            rating=rating,
         )
 
     # ------------------------------------------------------------------
@@ -478,10 +506,11 @@ class Scanner:
         tmdb_id = nfo.get("tmdb_id") or ""
         poster_url = nfo.get("poster") or ""
         year = nfo.get("year", 0)
+        rating = float(nfo.get("rating") or 0)
         meta_source = "nfo" if nfo else "filename"
 
         # --- Radarr (middle tier) ---
-        if self._radarr and (not genres or not plot or not poster_url):
+        if self._radarr and (not genres or not plot or not poster_url or not rating):
             meta = self._radarr.get_movie_metadata(lookup_title, year)
             if meta:
                 # Use Radarr's canonical title (clean, properly capitalised)
@@ -495,6 +524,7 @@ class Scanner:
                     meta_source = "radarr"
                 poster_url = poster_url or meta.get("poster_url", "")
                 year = year or meta.get("year", 0)
+                rating = rating or float(meta.get("rating") or 0)
                 if not nfo.get("runtime_sec") and meta.get("runtime_sec"):
                     nfo["runtime_sec"] = meta["runtime_sec"]
 
@@ -504,7 +534,7 @@ class Scanner:
             return None
 
         # --- TMDB (last resort) ---
-        if self._tmdb._api_key and (not genres or not plot):
+        if self._tmdb._api_key and (not genres or not plot or not rating):
             if tmdb_id:
                 data = self._tmdb.fetch_movie(tmdb_id)
             else:
@@ -515,8 +545,10 @@ class Scanner:
                     meta_source = "tmdb"
                 if not poster_url and data.get("poster_path"):
                     poster_url = TMDB_IMAGE_BASE + data["poster_path"]
+                rating = rating or float(data.get("vote_average") or 0)
 
-        log.debug("%s — metadata from: %s", os.path.basename(path), meta_source)
+        log.debug("%s — metadata from: %s (rating: %.1f)",
+                  os.path.basename(path), meta_source, rating)
 
         return Movie(
             path=path,
@@ -527,6 +559,7 @@ class Scanner:
             year=year,
             poster_url=poster_url,
             tmdb_id=tmdb_id,
+            rating=rating,
         )
 
     # ------------------------------------------------------------------

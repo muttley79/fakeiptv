@@ -18,10 +18,13 @@ log = logging.getLogger(__name__)
 EPOCH = datetime(2024, 1, 1, 0, 0, 0)
 
 # Minimum number of movies of a genre to create a dedicated movie channel
-MOVIE_GENRE_MIN = 5
+MOVIE_GENRE_MIN = 3
 
-# Minimum number of shows in a genre to create a genre mix channel
-SHOW_GENRE_MIN = 3
+# Minimum number of shows sharing a genre to create a genre channel
+SHOW_GENRE_MIN = 2
+
+# Minimum number of qualifying shows to create a "Goldies" channel
+GOLDIES_MIN = 2
 
 
 # ---------------------------------------------------------------------------
@@ -70,52 +73,88 @@ def build_channels(
     library: MediaLibrary,
     disabled: List[str] = None,
     rename: Dict[str, str] = None,
+    goldies_before: int = 2010,
+    hits_rating: float = 8.0,
 ) -> Dict[str, Channel]:
+    """
+    Auto-discover channels from the media library.
+
+    Channel types created:
+      - "Primetime"      — all shows, round-robin interleaved
+      - "{Genre}"        — per-genre show mix (≥ SHOW_GENRE_MIN shows share genre)
+      - "Goldies"        — shows with a known year < goldies_before (≥ GOLDIES_MIN shows)
+      - "Hits"           — shows with rating ≥ hits_rating (from Sonarr/Radarr/TMDB/NFO)
+      - "Movies"         — all movies
+      - "{Genre} Movies" — genre-specific movies (≥ MOVIE_GENRE_MIN movies share genre)
+
+    Per-show channels are intentionally NOT created — every channel is a mix.
+    """
     disabled = disabled or []
     rename = rename or {}
     channels: Dict[str, Channel] = {}
 
-    # --- Per-show channels ---
-    for show_name, show in library.shows.items():
-        if not show.episodes:
-            continue
-        ch_id = slugify(show_name)
-        if ch_id in disabled:
-            continue
-        ch_name = rename.get(ch_id, show_name)
-        entries = [_episode_to_entry(ep) for ep in show.episodes]
-        ch = Channel(
-            id=ch_id,
-            name=ch_name,
-            group="Shows",
-            entries=entries,
-            poster_url=show.poster_url,
-        )
-        channels[ch_id] = ch
+    all_shows = [s for s in library.shows.values() if s.episodes]
 
-    # --- Genre mix channels (TV shows) ---
+    # --- Primetime — every show interleaved ---
+    if all_shows:
+        ch_id = "primetime"
+        if ch_id not in disabled:
+            ch_name = rename.get(ch_id, "Primetime")
+            entries = _interleave_shows(all_shows)
+            if entries:
+                channels[ch_id] = Channel(
+                    id=ch_id, name=ch_name, group="Shows", entries=entries
+                )
+
+    # --- Genre channels (TV shows) ---
     genre_shows: Dict[str, List[Show]] = {}
-    for show in library.shows.values():
+    for show in all_shows:
         for g in show.genres:
             genre_shows.setdefault(g, []).append(show)
 
-    for genre, shows in genre_shows.items():
+    for genre, shows in sorted(genre_shows.items()):
         if len(shows) < SHOW_GENRE_MIN:
             continue
-        ch_id = slugify(genre + "-mix")
+        ch_id = slugify(genre)
         if ch_id in disabled:
             continue
-        ch_name = rename.get(ch_id, genre + " Mix")
-        # Round-robin interleave episodes from all shows in genre
+        ch_name = rename.get(ch_id, genre)
         entries = _interleave_shows(shows)
         if not entries:
             continue
-        ch = Channel(id=ch_id, name=ch_name, group="Genre Mix", entries=entries)
-        channels[ch_id] = ch
+        channels[ch_id] = Channel(id=ch_id, name=ch_name, group="Shows", entries=entries)
+
+    # --- Goldies — shows with a known year before goldies_before ---
+    goldies_shows = [s for s in all_shows if _show_year(s) and _show_year(s) < goldies_before]
+    if len(goldies_shows) >= GOLDIES_MIN:
+        ch_id = "goldies"
+        if ch_id not in disabled:
+            ch_name = rename.get(ch_id, "Goldies")
+            entries = _interleave_shows(goldies_shows)
+            if entries:
+                channels[ch_id] = Channel(
+                    id=ch_id, name=ch_name, group="Shows", entries=entries
+                )
+
+    # --- Hits — shows with a rating at or above the threshold ---
+    hits_shows = [s for s in all_shows if s.rating >= hits_rating]
+    if len(hits_shows) >= GOLDIES_MIN:
+        ch_id = "hits"
+        if ch_id not in disabled:
+            ch_name = rename.get(ch_id, "Hits")
+            entries = _interleave_shows(hits_shows)
+            if entries:
+                channels[ch_id] = Channel(
+                    id=ch_id, name=ch_name, group="Shows", entries=entries
+                )
+                log.info(
+                    "Hits channel: %d shows with rating ≥ %.1f",
+                    len(hits_shows), hits_rating
+                )
 
     # --- Movie channels ---
     if library.movies:
-        all_movies_id = slugify("movies")
+        all_movies_id = "movies"
         if all_movies_id not in disabled:
             ch_name = rename.get(all_movies_id, "Movies")
             entries = [_movie_to_entry(m) for m in library.movies]
@@ -123,13 +162,12 @@ def build_channels(
                 id=all_movies_id, name=ch_name, group="Movies", entries=entries
             )
 
-        # Genre-specific movie channels
         genre_movies: Dict[str, List[Movie]] = {}
         for movie in library.movies:
             for g in movie.genres:
                 genre_movies.setdefault(g, []).append(movie)
 
-        for genre, movies in genre_movies.items():
+        for genre, movies in sorted(genre_movies.items()):
             if len(movies) < MOVIE_GENRE_MIN:
                 continue
             ch_id = slugify(genre + "-movies")
@@ -137,11 +175,20 @@ def build_channels(
                 continue
             ch_name = rename.get(ch_id, genre + " Movies")
             entries = [_movie_to_entry(m) for m in movies]
-            ch = Channel(id=ch_id, name=ch_name, group="Movies", entries=entries)
-            channels[ch_id] = ch
+            channels[ch_id] = Channel(
+                id=ch_id, name=ch_name, group="Movies", entries=entries
+            )
 
     log.info("Built %d channels", len(channels))
     return channels
+
+
+def _show_year(show: Show) -> int:
+    """Return the first known year from the show's episodes, or 0."""
+    for ep in show.episodes:
+        if ep.year:
+            return ep.year
+    return 0
 
 
 def _episode_to_entry(ep: Episode) -> ScheduleEntry:

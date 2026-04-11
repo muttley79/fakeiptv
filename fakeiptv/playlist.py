@@ -3,6 +3,7 @@ playlist.py — Generates the M3U8 channel list that IPTV clients import.
 This is NOT an HLS manifest — it's the Kodi/Televizo-style playlist that
 lists all channels with their stream URLs, EPG IDs, and catchup metadata.
 """
+from datetime import datetime
 from typing import Dict
 
 from .scheduler import Channel
@@ -19,7 +20,8 @@ def build_m3u8(
     epg_url:      e.g. "http://192.168.1.100:8080/epg.xml"
     catchup_days: if > 0, adds catchup attributes to each channel entry
     """
-    lines = [f'#EXTM3U x-tvg-url="{epg_url}"\n']
+    generation_date = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+    lines = [f'#EXTM3U url-tvg="{epg_url}" x-tvg-url="{epg_url}" generation-date="{generation_date}"\n']
 
     # Sort: Shows first, then Genre Mix, then Movies
     group_order = {"Shows": 0, "Genre Mix": 1, "Movies": 2}

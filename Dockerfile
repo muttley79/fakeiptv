@@ -18,6 +18,5 @@ COPY run.py config.yaml ./
 ENV FAKEIPTV_TMP_DIR=/tmp/fakeiptv \
     FAKEIPTV_CACHE_DIR=/cache
 
-EXPOSE 8080
-
+# Port is set at runtime via FAKEIPTV_PORT — declared in docker-compose.yml
 CMD ["python", "run.py"]

@@ -1,6 +1,7 @@
 """
 epg.py — Generates XMLTV-format EPG XML from a 24-hour schedule window.
 """
+import time as _time
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Dict, List, Tuple
@@ -8,9 +9,24 @@ from typing import Dict, List, Tuple
 from .scheduler import Channel, ScheduleEntry
 
 
+def _local_tz_str() -> str:
+    """
+    Return the local UTC offset as an XMLTV-format string, e.g. '+0200' or '-0500'.
+    Works on Python 3.9 without zoneinfo.
+    """
+    if _time.daylight and _time.localtime().tm_isdst:
+        offset_sec = -_time.altzone
+    else:
+        offset_sec = -_time.timezone
+    sign = "+" if offset_sec >= 0 else "-"
+    hours, remainder = divmod(abs(offset_sec), 3600)
+    minutes = remainder // 60
+    return f"{sign}{hours:02d}{minutes:02d}"
+
+
 def _fmt_xmltv_time(dt: datetime) -> str:
-    """Format datetime as XMLTV timestamp: 20260410222615 +0000"""
-    return dt.strftime("%Y%m%d%H%M%S") + " +0000"
+    """Format datetime as XMLTV timestamp in local time with correct UTC offset."""
+    return dt.strftime("%Y%m%d%H%M%S") + " " + _local_tz_str()
 
 
 def build_xmltv(

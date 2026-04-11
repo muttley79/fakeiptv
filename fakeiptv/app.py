@@ -101,7 +101,7 @@ class FakeIPTV:
 
     def _rebuild_cache(self):
         base_url = f"http://{self.config.server.rpi_ip}:{self.config.server.port}"
-        epg_url = f"{base_url}/epg.xml"
+        epg_url = f"{base_url}/epg.xml.gz"
         catchup_days = self.config.server.catchup_days
 
         schedule = build_epg_window(

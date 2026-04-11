@@ -12,6 +12,7 @@ Endpoints:
   GET /refresh                              Trigger library rescan
   GET /status                               JSON status
 """
+import gzip
 import logging
 import os
 import time
@@ -49,6 +50,17 @@ def playlist():
 def epg():
     content = _app_instance.get_epg()
     return Response(content, mimetype="application/xml")
+
+
+@app.route("/epg.xml.gz")
+def epg_gz():
+    content = _app_instance.get_epg().encode("utf-8")
+    compressed = gzip.compress(content)
+    return Response(
+        compressed,
+        mimetype="application/gzip",
+        headers={"Content-Encoding": "gzip"},
+    )
 
 
 # ---------------------------------------------------------------------------

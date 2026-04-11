@@ -538,18 +538,26 @@ class CatchupManager:
             return None
 
         entry, offset_sec = result
-        # Duration = remainder of the programme from the requested start
         duration_sec = entry.duration_sec - offset_sec
-
-        # Session key: channel + unix timestamp rounded to nearest second
         ts = int(at.timestamp())
-        session_id = f"{channel.id}_{ts}"
 
         with self._lock:
-            if session_id in self._sessions:
-                self._sessions[session_id].touch()
-                return self._sessions[session_id]
+            # Reuse an existing session for the same channel within 60s tolerance.
+            # Televizo (shift mode) increments utc by a few seconds each manifest poll,
+            # which would otherwise spawn a new ffmpeg process on every request.
+            REUSE_TOLERANCE = 60
+            prefix = channel.id + "_"
+            for sid, s in self._sessions.items():
+                if sid.startswith(prefix):
+                    try:
+                        existing_ts = int(sid.rsplit("_", 1)[1])
+                    except (ValueError, IndexError):
+                        continue
+                    if abs(existing_ts - ts) <= REUSE_TOLERANCE:
+                        s.touch()
+                        return s
 
+            session_id = f"{channel.id}_{ts}"
             session_dir = os.path.join(self._tmp_base, "catchup", session_id)
             session = CatchupSession(
                 session_id=session_id,

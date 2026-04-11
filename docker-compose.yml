@@ -1,0 +1,28 @@
+services:
+  fakeiptv:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${FAKEIPTV_PORT:-8080}:8080"
+    env_file:
+      - .env
+    volumes:
+      # Media library — point these at your actual NAS mount paths on the host
+      - ${FAKEIPTV_SHOWS_PATH}:/shows:ro
+      - ${FAKEIPTV_MOVIES_PATH}:/movies:ro
+      # Persistent metadata cache (SQLite durations + TMDB responses)
+      - cache:/cache
+      # HLS segments — tmpfs so segments live in RAM, not on disk
+      - type: tmpfs
+        target: /tmp/fakeiptv
+        tmpfs:
+          size: ${FAKEIPTV_TMPFS_SIZE:-1073741824}   # 1 GB default; raise if you have many channels
+    environment:
+      # Override paths to the in-container mount points
+      FAKEIPTV_SHOWS_PATH: /shows
+      FAKEIPTV_MOVIES_PATH: /movies
+      FAKEIPTV_TMP_DIR: /tmp/fakeiptv
+      FAKEIPTV_CACHE_DIR: /cache
+
+volumes:
+  cache:

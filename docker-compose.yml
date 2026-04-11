@@ -12,7 +12,7 @@ services:
       - ${FAKEIPTV_SHOWS_PATH}:/shows:ro
       - ${FAKEIPTV_MOVIES_PATH}:/movies:ro
       # Persistent metadata cache (SQLite durations + TMDB responses)
-      - cache:/cache
+      - ~/.fakeiptv:/cache
       # HLS segments — tmpfs so segments live in RAM, not on disk
       - type: tmpfs
         target: /tmp/fakeiptv
@@ -28,5 +28,3 @@ services:
       # Set TZ in .env (e.g. TZ=Asia/Jerusalem) or hardcode here.
       TZ: ${TZ:-Asia/Jerusalem}
 
-volumes:
-  cache:

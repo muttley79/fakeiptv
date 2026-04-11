@@ -63,16 +63,32 @@ def hls_manifest(channel_id: str):
     if not _app_instance.stream_manager.ensure_started(channel_id):
         abort(404)
 
-    # Wait up to 10 seconds for ffmpeg to write the first manifest.
-    # Keeping this short prevents thread exhaustion when many cold channels
-    # are requested simultaneously. The player will retry on 503.
-    deadline = time.time() + 10
+    _app_instance.stream_manager.touch(channel_id)
+
+    # Brief wait (up to 3s) to give ffmpeg a head start before responding.
+    # Kept short to avoid exhausting Flask threads when many channels are cold.
+    deadline = time.time() + 3
     while not _app_instance.stream_manager.is_ready(channel_id):
         if time.time() > deadline:
-            abort(503)
-        time.sleep(0.5)
+            break
+        time.sleep(0.25)
 
-    _app_instance.stream_manager.touch(channel_id)
+    if not _app_instance.stream_manager.is_ready(channel_id):
+        # ffmpeg not ready yet — return a valid empty live manifest instead of
+        # 503.  Per the HLS spec, players must re-request after EXT-X-TARGETDURATION
+        # seconds, so they poll silently rather than showing an error to the user.
+        from .streamer import HLS_SEGMENT_SECONDS
+        empty = (
+            "#EXTM3U\n"
+            "#EXT-X-VERSION:3\n"
+            f"#EXT-X-TARGETDURATION:{HLS_SEGMENT_SECONDS}\n"
+            "#EXT-X-MEDIA-SEQUENCE:0\n"
+        )
+        resp = Response(empty, mimetype="application/x-mpegurl")
+        resp.headers["Cache-Control"] = "no-cache, no-store"
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        return resp
+
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
     resp = send_from_directory(hls_dir, "stream.m3u8")
     resp.headers["Cache-Control"] = "no-cache, no-store"

@@ -3,6 +3,7 @@ scheduler.py — Builds deterministic per-channel schedules anchored to a
 fixed local-time epoch, calculates the current playback position, and
 generates XMLTV EPG data for a configurable window (past + future).
 """
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -79,103 +80,90 @@ def build_channels(
     """
     Auto-discover channels from the media library.
 
-    Each show and movie is assigned to exactly ONE channel so the same
-    content never plays simultaneously on two channels.
+    A show may appear in multiple channels (e.g. Friends in both Comedy and
+    Hits). Simultaneous airing is prevented by _channel_offset_sec(), which
+    gives each channel a unique time offset so their loops are staggered.
 
-    Show assignment priority (first match wins):
-      1. "Hits"      — shows with rating ≥ hits_rating
-      2. "Goldies"   — shows with known year < goldies_before
-      3. "{Genre}"   — dominant genre channel (≥ SHOW_GENRE_MIN shows)
-      4. "Primetime" — all remaining unclaimed shows
-
-    Movie assignment priority:
-      1. "{Genre} Movies" — primary genre channel (≥ MOVIE_GENRE_MIN movies)
-      2. "Movies"         — all remaining unclaimed movies
+    Channel types:
+      - "Primetime"      — all shows interleaved
+      - "{Genre}"        — per-genre mix (≥ SHOW_GENRE_MIN shows)
+      - "Goldies"        — shows with known year < goldies_before
+      - "Hits"           — shows with rating ≥ hits_rating
+      - "{Genre} Movies" — genre movie mix (≥ MOVIE_GENRE_MIN); movies are exclusive
+      - "Movies"         — remaining movies not in any genre channel
     """
     disabled = disabled or []
     rename = rename or {}
     channels: Dict[str, Channel] = {}
 
     all_shows = [s for s in library.shows.values() if s.episodes]
-    claimed: set = set()   # show names already assigned to a channel
 
-    def _make_show_channel(ch_id: str, default_name: str, shows: List[Show],
-                           group: str = "Shows") -> None:
+    def _add_show_channel(ch_id: str, default_name: str, shows: List[Show],
+                          group: str = "Shows") -> None:
         if ch_id in disabled or not shows:
             return
-        ch_name = rename.get(ch_id, default_name)
         entries = _interleave_shows(shows)
         if entries:
-            channels[ch_id] = Channel(id=ch_id, name=ch_name, group=group, entries=entries)
-            claimed.update(s.name for s in shows)
+            channels[ch_id] = Channel(
+                id=ch_id, name=rename.get(ch_id, default_name),
+                group=group, entries=entries,
+            )
 
-    # --- Pass 1: Hits ---
-    hits_shows = [s for s in all_shows if s.rating >= hits_rating]
-    if len(hits_shows) >= GOLDIES_MIN:
-        _make_show_channel("hits", "Hits", hits_shows)
-        log.info("Hits channel: %d shows with rating ≥ %.1f", len(hits_shows), hits_rating)
+    # --- Primetime — every show ---
+    _add_show_channel("primetime", "Primetime", all_shows)
 
-    # --- Pass 2: Goldies ---
-    goldies_shows = [s for s in all_shows
-                     if s.name not in claimed and _show_year(s) and _show_year(s) < goldies_before]
-    if len(goldies_shows) >= GOLDIES_MIN:
-        _make_show_channel("goldies", "Goldies", goldies_shows)
-
-    # --- Pass 3: Genre channels ---
-    # Build genre→shows map from unclaimed shows only.
-    # Each show is assigned to its dominant genre (first genre in its list).
-    dominant_genre: Dict[str, str] = {}   # show_name → genre
+    # --- Genre channels ---
     genre_shows: Dict[str, List[Show]] = {}
     for show in all_shows:
-        if show.name in claimed or not show.genres:
-            continue
-        g = show.genres[0]   # dominant genre (sorted by frequency in scanner)
-        dominant_genre[show.name] = g
-        genre_shows.setdefault(g, []).append(show)
+        for g in show.genres:
+            genre_shows.setdefault(g, []).append(show)
 
     for genre, shows in sorted(genre_shows.items()):
-        # Filter again — some shows may have been claimed by an earlier genre pass
-        unclaimed_shows = [s for s in shows if s.name not in claimed]
-        if len(unclaimed_shows) < SHOW_GENRE_MIN:
+        if len(shows) < SHOW_GENRE_MIN:
             continue
-        ch_id = slugify(genre)
-        _make_show_channel(ch_id, genre, unclaimed_shows)
+        _add_show_channel(slugify(genre), genre, shows)
 
-    # --- Pass 4: Primetime — all remaining unclaimed shows ---
-    remaining_shows = [s for s in all_shows if s.name not in claimed]
-    if remaining_shows:
-        _make_show_channel("primetime", "Primetime", remaining_shows)
+    # --- Goldies ---
+    goldies = [s for s in all_shows if _show_year(s) and _show_year(s) < goldies_before]
+    if len(goldies) >= GOLDIES_MIN:
+        _add_show_channel("goldies", "Goldies", goldies)
 
-    # --- Movies: genre-first, then remainder ---
-    claimed_movies: set = set()
+    # --- Hits ---
+    hits = [s for s in all_shows if s.rating >= hits_rating]
+    if len(hits) >= GOLDIES_MIN:
+        _add_show_channel("hits", "Hits", hits)
+        log.info("Hits channel: %d shows with rating ≥ %.1f", len(hits), hits_rating)
 
-    def _make_movie_channel(ch_id: str, default_name: str, movies: List[Movie],
-                             group: str = "Movies") -> None:
-        if ch_id in disabled or not movies:
-            return
-        ch_name = rename.get(ch_id, default_name)
-        entries = [_movie_to_entry(m) for m in movies]
-        channels[ch_id] = Channel(id=ch_id, name=ch_name, group=group, entries=entries)
-        claimed_movies.update(m.title for m in movies)
-
+    # --- Movies (exclusive: each movie in one channel only) ---
     if library.movies:
-        # Primary genre per movie (first genre)
-        movie_genre: Dict[str, List[Movie]] = {}
+        claimed_movies: set = set()
+
+        genre_movies: Dict[str, List[Movie]] = {}
         for movie in library.movies:
             if movie.genres:
-                movie_genre.setdefault(movie.genres[0], []).append(movie)
+                genre_movies.setdefault(movie.genres[0], []).append(movie)
 
-        for genre, movies in sorted(movie_genre.items()):
+        for genre, movies in sorted(genre_movies.items()):
             unclaimed = [m for m in movies if m.title not in claimed_movies]
             if len(unclaimed) < MOVIE_GENRE_MIN:
                 continue
             ch_id = slugify(genre + "-movies")
-            _make_movie_channel(ch_id, genre + " Movies", unclaimed)
+            if ch_id in disabled:
+                continue
+            entries = [_movie_to_entry(m) for m in unclaimed]
+            channels[ch_id] = Channel(
+                id=ch_id, name=rename.get(ch_id, genre + " Movies"),
+                group="Movies", entries=entries,
+            )
+            claimed_movies.update(m.title for m in unclaimed)
 
-        # Remaining movies → "Movies"
-        remaining_movies = [m for m in library.movies if m.title not in claimed_movies]
-        if remaining_movies:
-            _make_movie_channel("movies", "Movies", remaining_movies)
+        remaining = [m for m in library.movies if m.title not in claimed_movies]
+        if remaining and "movies" not in disabled:
+            entries = [_movie_to_entry(m) for m in remaining]
+            channels["movies"] = Channel(
+                id="movies", name=rename.get("movies", "Movies"),
+                group="Movies", entries=entries,
+            )
 
     log.info("Built %d channels", len(channels))
     return channels
@@ -236,12 +224,25 @@ def _interleave_shows(shows: List[Show]) -> List[ScheduleEntry]:
 # Core schedule position logic
 # ---------------------------------------------------------------------------
 
+def _channel_offset_sec(channel_id: str) -> float:
+    """
+    Deterministic per-channel schedule offset (0 – 7 days in seconds).
+    Derived from the channel slug so it's stable across restarts.
+    Spreads channels that share content apart in time so the same show
+    is very unlikely to be airing simultaneously on two channels.
+    """
+    h = int(hashlib.md5(channel_id.encode()).hexdigest()[:8], 16)
+    return float(h % (7 * 24 * 3600))   # 0..604799 s  (up to 7 days)
+
+
 def _position_at(channel: Channel, at: datetime) -> Tuple[int, float]:
     """
     Return (entry_index, offset_sec) for what is playing on `channel` at
     the given datetime. Pure calculation — no side effects.
+    Each channel gets a deterministic time offset so channels with shared
+    content are staggered and unlikely to air the same thing simultaneously.
     """
-    elapsed = (at - EPOCH).total_seconds()
+    elapsed = (at - EPOCH).total_seconds() + _channel_offset_sec(channel.id)
     pos = elapsed % channel.total_duration
     for i, entry in enumerate(channel.entries):
         if pos < entry.duration_sec:

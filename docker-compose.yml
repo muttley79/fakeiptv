@@ -24,6 +24,9 @@ services:
       FAKEIPTV_MOVIES_PATH: /movies
       FAKEIPTV_TMP_DIR: /tmp/fakeiptv
       FAKEIPTV_CACHE_DIR: /cache
+      # Timezone — must match the host so the schedule epoch and EPG times are correct.
+      # Set TZ in .env (e.g. TZ=Asia/Jerusalem) or hardcode here.
+      TZ: ${TZ:-Asia/Jerusalem}
 
 volumes:
   cache:

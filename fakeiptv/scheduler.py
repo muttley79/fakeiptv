@@ -43,6 +43,8 @@ class ScheduleEntry:
     poster_url: str
     season: int = 0
     episode: int = 0
+    year: int = 0
+    genres: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -187,6 +189,8 @@ def _episode_to_entry(ep: Episode) -> ScheduleEntry:
         poster_url=ep.poster_url,
         season=ep.season,
         episode=ep.episode,
+        year=ep.year,
+        genres=ep.genres,
     )
 
 
@@ -198,6 +202,8 @@ def _movie_to_entry(movie: Movie) -> ScheduleEntry:
         duration_sec=movie.duration_sec,
         plot=movie.plot,
         poster_url=movie.poster_url,
+        year=movie.year,
+        genres=movie.genres,
     )
 
 

@@ -59,6 +59,10 @@ def build_xmltv(
                 ET.SubElement(prog, "sub-title", lang="en").text = entry.subtitle
             if entry.plot:
                 ET.SubElement(prog, "desc", lang="en").text = entry.plot
+            if entry.year:
+                ET.SubElement(prog, "date").text = str(entry.year)
+            for genre in entry.genres:
+                ET.SubElement(prog, "category", lang="en").text = genre
             if entry.season and entry.episode:
                 # XMLTV episode-num system="onscreen": S01 E03
                 ET.SubElement(prog, "episode-num", system="onscreen").text = (

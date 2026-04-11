@@ -3,7 +3,7 @@ services:
     build: .
     restart: unless-stopped
     ports:
-      - "${FAKEIPTV_PORT:-8080}:8080"
+      - "${FAKEIPTV_PORT:-8080}:${FAKEIPTV_PORT:-8080}"
     env_file:
       - .env
     volumes:

@@ -41,6 +41,9 @@ def set_app(instance: "FakeIPTV"):
 @app.route("/playlist.m3u8")
 def playlist():
     content = _app_instance.get_playlist()
+    # Pre-warm all channels in the background so they're ready before the user
+    # taps one.  Channels that are already running are skipped immediately.
+    _app_instance.prewarm_channels()
     return Response(content, mimetype="application/x-mpegurl")
 
 

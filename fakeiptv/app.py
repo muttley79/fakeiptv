@@ -129,6 +129,33 @@ class FakeIPTV:
             return self._epg_cache
 
     # ------------------------------------------------------------------
+    # Channel pre-warming
+    # ------------------------------------------------------------------
+
+    def prewarm_channels(self):
+        """
+        Start ffmpeg for every channel in the background so all channels
+        are ready before the user selects one.  Already-running channels
+        are skipped instantly by ensure_started().  Called each time the
+        playlist is fetched (Televizo polls periodically), so this is
+        effectively idempotent — channels that went idle and stopped will
+        be restarted, channels still running are untouched.
+        """
+        channels = list(self.channels.keys())
+        if not channels:
+            return
+
+        def _warm():
+            for ch_id in channels:
+                self.stream_manager.ensure_started(ch_id)
+                # Small stagger so 40 ffmpeg processes don't all spawn in the
+                # same instant and spike CPU/disk on the Pi.
+                time.sleep(0.3)
+
+        t = threading.Thread(target=_warm, daemon=True, name="prewarm")
+        t.start()
+
+    # ------------------------------------------------------------------
     # Midnight refresh timer
     # ------------------------------------------------------------------
 

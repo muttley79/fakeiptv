@@ -459,6 +459,7 @@ class Scanner:
         cached = self._dur_cache.get(path)
         if cached is not None:
             return cached
+        log.info("Probing duration: %s", os.path.basename(path))
         dur = probe_duration(path)
         if dur:
             self._dur_cache.set(path, dur)

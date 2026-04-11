@@ -6,7 +6,10 @@ server:
   host: 0.0.0.0
   port: 8080
   rpi_ip: 192.168.1.100    # Change to your Raspberry Pi's LAN IP
-  tmp_dir: /run/fakeiptv   # tmpfs ramdisk on RPi — avoids SD card writes for HLS segments
+  # /dev/shm is always tmpfs and user-writable (good for dev/manual runs).
+  # When running as a systemd service, RuntimeDirectory=fakeiptv in the unit
+  # file creates /run/fakeiptv owned by the service user — set that here instead.
+  tmp_dir: /dev/shm/fakeiptv
   subtitles: true          # Include subtitle tracks (SRT/ASS→WebVTT). Set false to disable.
   catchup_days: 7          # Days of past programming available for catch-up. Set 0 to disable.
 

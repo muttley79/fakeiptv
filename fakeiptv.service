@@ -7,6 +7,10 @@ Type=simple
 User=pi
 WorkingDirectory=/opt/fakeiptv
 EnvironmentFile=/opt/fakeiptv/.env
+# Creates /run/fakeiptv owned by User=pi before the process starts.
+# This is a tmpfs ramdisk on Raspberry Pi OS — no SD card writes for HLS segments.
+RuntimeDirectory=fakeiptv
+RuntimeDirectoryPreserve=no
 ExecStart=/opt/fakeiptv/venv/bin/python /opt/fakeiptv/run.py
 Restart=always
 RestartSec=5

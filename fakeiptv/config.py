@@ -21,7 +21,7 @@ class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8080
     rpi_ip: str = "127.0.0.1"
-    tmp_dir: str = "/run/fakeiptv"
+    tmp_dir: str = "/dev/shm/fakeiptv"
     subtitles: bool = True
     catchup_days: int = 7
 

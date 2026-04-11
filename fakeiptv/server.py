@@ -59,8 +59,8 @@ def hls_manifest(channel_id: str):
     if channel_id not in _app_instance.channels:
         abort(404)
 
-    hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
-    if not hls_dir:
+    # Start ffmpeg lazily on first client request for this channel
+    if not _app_instance.stream_manager.ensure_started(channel_id):
         abort(404)
 
     # Wait up to 15 seconds for ffmpeg to write the first manifest
@@ -70,6 +70,7 @@ def hls_manifest(channel_id: str):
             abort(503)
         time.sleep(0.5)
 
+    hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
     resp = send_from_directory(hls_dir, "stream.m3u8")
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"

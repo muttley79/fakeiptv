@@ -157,6 +157,10 @@ class ChannelStreamer:
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                # Isolate ffmpeg from the terminal's process group so that
+                # Ctrl+C in the shell only signals Python, not ffmpeg.
+                # We send terminate() explicitly from _kill().
+                start_new_session=True,
             )
 
     def _kill(self):
@@ -216,24 +220,41 @@ class ChannelStreamer:
 # ---------------------------------------------------------------------------
 
 class StreamManager:
+    """
+    Owns all channel streamers.  ffmpeg is started lazily — only when a client
+    first requests /hls/<channel_id>/stream.m3u8 (via ensure_started).
+    """
+
     def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
+        # All known channels (running or not)
+        self._channels: Dict[str, Channel] = {}
+        # Only channels with an active ffmpeg process
         self._streamers: Dict[str, ChannelStreamer] = {}
         self._lock = threading.Lock()
+
+    def ensure_started(self, ch_id: str) -> bool:
+        """
+        Start the ffmpeg streamer for ch_id if it isn't already running.
+        Returns False if the channel is unknown, True otherwise.
+        Call this before waiting for is_ready().
+        """
+        with self._lock:
+            if ch_id not in self._channels:
+                return False
+            if ch_id not in self._streamers:
+                s = ChannelStreamer(self._channels[ch_id], self._tmp_base, self._subtitles)
+                s.start()
+                self._streamers[ch_id] = s
+            return True
 
     def stop_all(self):
         with self._lock:
             for s in self._streamers.values():
                 s.stop()
             self._streamers.clear()
-
-    def restart_channel(self, ch_id: str):
-        with self._lock:
-            s = self._streamers.get(ch_id)
-            if s:
-                s.stop()
-                s.start()
+            self._channels.clear()
 
     def get_hls_dir(self, ch_id: str) -> Optional[str]:
         s = self._streamers.get(ch_id)
@@ -245,25 +266,25 @@ class StreamManager:
 
     def reload(self, channels: Dict[str, Channel]):
         """
-        Stop streamers for removed channels, start new ones,
-        restart those whose entry list has changed.
+        Update the channel registry.
+        - Stops streamers for channels that were removed.
+        - Restarts *running* streamers whose entry list changed.
+        - New channels are registered but NOT started (lazy).
         """
         with self._lock:
             new_ids = set(channels.keys())
-            old_ids = set(self._streamers.keys())
+            old_ids = set(self._channels.keys())
+            running_ids = set(self._streamers.keys())
 
+            # Stop and remove streamers for channels that no longer exist
             for ch_id in old_ids - new_ids:
-                self._streamers[ch_id].stop()
-                del self._streamers[ch_id]
+                if ch_id in running_ids:
+                    self._streamers[ch_id].stop()
+                    del self._streamers[ch_id]
 
-            for ch_id in new_ids - old_ids:
-                s = ChannelStreamer(channels[ch_id], self._tmp_base, self._subtitles)
-                s.start()
-                self._streamers[ch_id] = s
-
-            # Restart channels whose file list changed
-            for ch_id in new_ids & old_ids:
-                old_paths = [e.path for e in self._streamers[ch_id].channel.entries]
+            # Restart *running* channels whose file list changed
+            for ch_id in new_ids & old_ids & running_ids:
+                old_paths = [e.path for e in self._channels[ch_id].entries]
                 new_paths = [e.path for e in channels[ch_id].entries]
                 if old_paths != new_paths:
                     log.info("Entry list changed for %s — restarting", ch_id)
@@ -271,6 +292,9 @@ class StreamManager:
                     s = ChannelStreamer(channels[ch_id], self._tmp_base, self._subtitles)
                     s.start()
                     self._streamers[ch_id] = s
+
+            # Replace channel registry (new channels are NOT started here)
+            self._channels = dict(channels)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +359,7 @@ class CatchupSession:
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            start_new_session=True,
         )
 
     def stop(self):

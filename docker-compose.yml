@@ -1,6 +1,7 @@
 services:
   fakeiptv:
     build: .
+    container_name: fakeiptv
     restart: unless-stopped
     ports:
       - "${FAKEIPTV_PORT:-8080}:${FAKEIPTV_PORT:-8080}"

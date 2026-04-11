@@ -11,6 +11,7 @@ builds an in-memory lookup dict keyed by normalised title for fast matching.
 import logging
 import re
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -31,9 +32,15 @@ def _normalise(title: str) -> str:
 # Sonarr
 # ---------------------------------------------------------------------------
 
+def _base_url(url: str) -> str:
+    """Extract scheme+host+port only, discarding any browser page path."""
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}"
+
+
 class SonarrClient:
     def __init__(self, base_url: str, api_key: str):
-        self._base = base_url.rstrip("/")
+        self._base = _base_url(base_url)
         self._key = api_key
         self._headers = {"X-Api-Key": api_key}
         # Populated on first use: {normalised_title: series_dict}
@@ -139,7 +146,7 @@ class SonarrClient:
 
 class RadarrClient:
     def __init__(self, base_url: str, api_key: str):
-        self._base = base_url.rstrip("/")
+        self._base = _base_url(base_url)
         self._key = api_key
         self._headers = {"X-Api-Key": api_key}
         self._movies_by_title: Dict[str, dict] = {}

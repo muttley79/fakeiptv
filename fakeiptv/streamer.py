@@ -142,6 +142,15 @@ class ChannelStreamer:
 
     def _launch(self):
         with self._lock:
+            # Remove stale HLS segments and manifest from any previous run so the
+            # player doesn't get confused by timestamp mismatches on restart.
+            for fname in os.listdir(self.hls_dir) if os.path.isdir(self.hls_dir) else []:
+                if fname.endswith(".ts") or fname.endswith(".m3u8") or fname.endswith(".vtt"):
+                    try:
+                        os.remove(os.path.join(self.hls_dir, fname))
+                    except OSError:
+                        pass
+
             if not self._build_concat():
                 log.error("Cannot build concat for %s — no entries?", self.channel.id)
                 return

@@ -526,17 +526,26 @@ class ChannelStreamer:
             # On a modern CPU the overhead is negligible (~1-3% per core per channel).
             audio_opts = ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
 
-            # HDR metadata stripping — if any entry in the channel is HDR10/HLG,
-            # relabel the video stream as BT.709/SDR using a bitstream filter.
-            # This prevents green-screen artifacts on players/displays that don't
-            # support HDR.  No re-encoding; the BSF only rewrites color metadata.
-            has_hdr = any(e.is_hdr for e in self.channel.entries)
+            # HDR metadata stripping via hevc_metadata bitstream filter.
+            # hevc_metadata is HEVC-only — applying it to H.264 data crashes ffmpeg.
+            # Only enable when EVERY entry in the channel is flagged HDR, which
+            # guarantees all entries are HEVC (scanner only sets is_hdr for HEVC).
+            # Mixed HDR+SDR channels are skipped; HDR episodes appear normal on SDR
+            # displays but at least the stream doesn't break.
+            hdr_entries = [e for e in self.channel.entries if e.is_hdr]
+            apply_hdr_bsf = bool(hdr_entries) and len(hdr_entries) == len(self.channel.entries)
             video_bsf_opts = (
                 ["-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1"]
-                if has_hdr else []
+                if apply_hdr_bsf else []
             )
-            if has_hdr:
-                log.info("Channel %s: HDR entries detected — stripping HDR metadata via BSF",
+            if hdr_entries and not apply_hdr_bsf:
+                log.info(
+                    "Channel %s: %d/%d entries are HDR — skipping BSF (mixed channel, "
+                    "HEVC-only filter would break non-HEVC segments)",
+                    self.channel.id, len(hdr_entries), len(self.channel.entries),
+                )
+            elif apply_hdr_bsf:
+                log.info("Channel %s: all entries HDR — stripping HDR metadata via hevc_metadata BSF",
                          self.channel.id)
 
             # --- Subtitles ---
@@ -546,15 +555,38 @@ class ChannelStreamer:
                 self.channel.id, subtitle_langs or "none",
             )
             if subtitle_langs:
-                # Subtitle generation is async: keyframe probe on NAS files takes
-                # 5-15s which would block all channel starts during prewarm.
-                # The background thread probes the inpoint, generates VTTs, then
-                # waits for the first TS segment to fix X-TIMESTAMP-MAP.
+                # Generate VTTs synchronously — pure Python string processing,
+                # completes in < 100ms regardless of file count or NAS speed.
+                # This populates _subtitle_streamers before ffmpeg starts so the
+                # server can build a master playlist on the very first request,
+                # eliminating the race condition where the player gets a no-subtitle
+                # playlist because VTT generation hadn't finished yet.
+                #
+                # We use the nominal inpoint (schedule position) rather than the
+                # keyframe-snapped position.  The potential drift (0 – GOP seconds)
+                # is acceptable; subtitles will appear at roughly the right time and
+                # the X-TIMESTAMP-MAP is updated asynchronously once the first
+                # TS segment is available.
+                np_now = get_now_playing(self.channel)
+                nominal_inpoint = np_now.offset_sec if np_now else 0.0
+                for lang in subtitle_langs:
+                    sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
+                    sub.start(actual_inpoint=nominal_inpoint)
+                    self._subtitle_streamers[lang] = sub
+
+                ready_langs = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
+                log.info(
+                    "Channel %s: subtitle tracks generated: %s (no cues: %s)",
+                    self.channel.id, ready_langs or "none",
+                    [l for l in subtitle_langs if l not in ready_langs] or "none",
+                )
+
+                # Async: wait for first TS segment and fix X-TIMESTAMP-MAP if
+                # the stream PTS doesn't start at exactly 0 (common with HEVC).
                 threading.Thread(
-                    target=self._generate_subtitles_async,
-                    args=(subtitle_langs,),
+                    target=self._update_subtitle_pts,
                     daemon=True,
-                    name=f"sub-gen-{self.channel.id}",
+                    name=f"sub-pts-{self.channel.id}",
                 ).start()
                 # No embedded sub mapping — external SRTs cover subtitles
                 sub_opts = []
@@ -603,42 +635,6 @@ class ChannelStreamer:
                 start_new_session=True,
             )
 
-
-    def _generate_subtitles_async(self, subtitle_langs):
-        """
-        Background thread: probe keyframe inpoint, generate VTTs, then fix TIMESTAMP-MAP.
-
-        Runs asynchronously so channel start is not blocked by slow ffprobe on NAS files
-        (keyframe probe can take 5-15s for large HEVC REMUXes over SMB).
-        By the time prewarm ends (~30s) or the player connects, VTTs are ready.
-        """
-        _np = get_now_playing(self.channel)
-        _nominal_inpoint = _np.offset_sec if _np else 0.0
-        if _nominal_inpoint > 0 and _np:
-            _first_entry = self.channel.entries[_np.entry_index]
-            actual_inpoint = _probe_keyframe_inpoint(_first_entry.path, _nominal_inpoint)
-        else:
-            actual_inpoint = _nominal_inpoint
-        log.debug(
-            "Channel %s: subtitle inpoint nominal=%.3fs actual=%.3fs (snap=%.3fs)",
-            self.channel.id, _nominal_inpoint, actual_inpoint,
-            _nominal_inpoint - actual_inpoint,
-        )
-
-        for lang in subtitle_langs:
-            sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
-            sub.start(actual_inpoint=actual_inpoint)
-            self._subtitle_streamers[lang] = sub
-
-        ready = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
-        log.info(
-            "Channel %s: subtitle tracks ready: %s (failed: %s)",
-            self.channel.id, ready or "none",
-            [l for l in subtitle_langs if l not in ready] or "none",
-        )
-
-        # Fix X-TIMESTAMP-MAP once the first TS segment is available
-        self._update_subtitle_pts()
 
     def _update_subtitle_pts(self):
         """Wait for first TS segment, probe start_pts, fix X-TIMESTAMP-MAP in all VTTs."""

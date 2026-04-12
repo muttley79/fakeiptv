@@ -295,8 +295,11 @@ class ChannelStreamer:
             if self._stop_event.is_set():
                 break
 
+            # ret is None when we killed ffmpeg ourselves (stall detector) — just restart
+            if ret is None:
+                pass
             # Log any ffmpeg stderr output on abnormal exit
-            if ret != 0:
+            elif ret != 0:
                 stderr_output = ""
                 try:
                     stderr_output = proc.stderr.read().decode(errors="replace")

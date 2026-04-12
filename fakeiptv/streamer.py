@@ -263,7 +263,7 @@ class ChannelStreamer:
             return 0.0
 
     def _monitor(self):
-        STALL_TIMEOUT = HLS_SEGMENT_SECONDS * 5  # kill ffmpeg if no new segment for 5 periods
+        STALL_TIMEOUT = 30  # kill ffmpeg if no new segment for 30s (gives NAS time to recover)
         while not self._stop_event.is_set():
             proc = self._process
             if proc is None:

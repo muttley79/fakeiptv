@@ -293,24 +293,28 @@ class ChannelStreamer:
     # Concat file
     # ------------------------------------------------------------------
 
-    def _build_concat(self) -> bool:
+    def _build_concat(self) -> Tuple[bool, bool]:
         """
         Build a ffconcat file covering ~CONCAT_HOURS hours from now.
         Uses inpoint on the first file to seek to the current schedule position.
-        Returns True on success.
+        Returns (success, needs_audio_transcode) where needs_audio_transcode is
+        True if any entry in the window has an audio codec that can't be copied
+        cleanly (DTS, EAC3, TrueHD).  This drives per-window audio decisions so
+        channels with no DTS files in the current window use lossless copy.
         """
         now_playing: Optional[NowPlaying] = get_now_playing(self.channel)
         if now_playing is None:
             log.error("No now-playing for channel %s", self.channel.id)
-            return False
+            return False, False
 
         entries = self.channel.entries
         n = len(entries)
         if n == 0:
-            return False
+            return False, False
 
         total_seconds = CONCAT_HOURS * 3600
         accumulated = 0.0
+        needs_transcode = False
 
         lines = ["ffconcat version 1.0\n"]
 
@@ -320,6 +324,8 @@ class ChannelStreamer:
 
         while accumulated < total_seconds:
             entry = entries[idx % n]
+            if entry.audio_codec in _DTS_CODECS:
+                needs_transcode = True
             # Forward slashes required by ffconcat; escape single quotes so
             # paths like "It's Always Sunny.mkv" don't break the format.
             # Use unquoted paths with backslash escaping.
@@ -341,7 +347,7 @@ class ChannelStreamer:
         with open(self.concat_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
-        return True
+        return True, needs_transcode
 
     # ------------------------------------------------------------------
     # ffmpeg process
@@ -374,21 +380,22 @@ class ChannelStreamer:
                     except OSError:
                         pass
 
-            if not self._build_concat():
+            ok, window_needs_transcode = self._build_concat()
+            if not ok:
                 log.error("Cannot build concat for %s — no entries?", self.channel.id)
                 return
 
-            # --- Audio: pre-detect DTS/EAC3 and force AAC if needed ---
-            # DTS and EAC3 copy cleanly into MPEG-TS but most players can't decode
-            # them.  Unlike eac3/unspecified-sample-rate errors (caught by the monitor
-            # thread), DTS copies silently — so we must detect it before launch.
-            needs_transcode = any(
-                e.audio_codec in _DTS_CODECS for e in self.channel.entries
-            )
-            audio_copy = self._audio_copy and not needs_transcode
-            if needs_transcode and self._audio_copy:
+            # --- Audio: per-window DTS/EAC3 detection ---
+            # Check only entries in the current 4-hour concat window, not all
+            # channel entries.  This keeps channels that have no DTS files
+            # in the current window on lossless copy.  Re-evaluated each time
+            # the concat is rebuilt (~every 4 hours or on channel restart).
+            # The per-channel _audio_copy flag can be forced False by the monitor
+            # thread's runtime fallback (for EAC3 "unspecified sample rate" errors).
+            audio_copy = self._audio_copy and not window_needs_transcode
+            if window_needs_transcode and self._audio_copy:
                 log.info(
-                    "Channel %s has DTS/EAC3 audio — transcoding to AAC",
+                    "Channel %s window has DTS/EAC3 audio — transcoding to AAC",
                     self.channel.id,
                 )
             audio_opts = ["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", "192k"]

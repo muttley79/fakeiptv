@@ -9,6 +9,9 @@ venv/
 # Environment / secrets
 .env
 
+# Local docker-compose — copy from docker-compose.yml.example and edit for your platform
+docker-compose.yml
+
 # Cache files
 *.json
 !package.json

@@ -256,14 +256,42 @@ class ChannelStreamer:
     # Monitor thread — restart ffmpeg when it exits
     # ------------------------------------------------------------------
 
+    def _get_manifest_mtime(self) -> float:
+        try:
+            return os.path.getmtime(self.manifest_path)
+        except OSError:
+            return 0.0
+
     def _monitor(self):
+        STALL_TIMEOUT = HLS_SEGMENT_SECONDS * 5  # kill ffmpeg if no new segment for 5 periods
         while not self._stop_event.is_set():
             proc = self._process
             if proc is None:
                 time.sleep(1)
                 continue
 
-            ret = proc.wait()
+            last_mtime = self._get_manifest_mtime()
+            last_check = time.time()
+            ret = None
+
+            while not self._stop_event.is_set():
+                ret = proc.poll()
+                if ret is not None:
+                    break
+                now = time.time()
+                if self._ready_event.is_set() and now - last_check >= STALL_TIMEOUT:
+                    mtime = self._get_manifest_mtime()
+                    if mtime == last_mtime:
+                        log.warning(
+                            "Channel %s stalled — no new segments in %ds, restarting ffmpeg",
+                            self.channel.id, STALL_TIMEOUT
+                        )
+                        self._kill()
+                        break
+                    last_mtime = mtime
+                    last_check = now
+                time.sleep(1)
+
             if self._stop_event.is_set():
                 break
 

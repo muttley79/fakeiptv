@@ -1,0 +1,36 @@
+services:
+  fakeiptv:
+    build: .
+    container_name: fakeiptv
+    restart: unless-stopped
+    ports:
+      - "${FAKEIPTV_PORT:-8080}:${FAKEIPTV_PORT:-8080}"
+    env_file:
+      - .env
+    volumes:
+      # NAS share mounted directly by Docker via CIFS (see named volume below).
+      - nas_multimedia:/multimedia:ro
+      # Persistent metadata cache (SQLite durations + TMDB responses)
+      - ./fakeiptv-cache:/cache
+      # HLS segments — tmpfs so segments live in RAM, not on disk
+      - type: tmpfs
+        target: /tmp/fakeiptv
+        tmpfs:
+          size: ${FAKEIPTV_TMPFS_SIZE:-1073741824}   # 1 GB default; raise if you have many channels
+    environment:
+      FAKEIPTV_SHOWS_PATH: /multimedia/TV Shows
+      FAKEIPTV_MOVIES_PATH: /multimedia/Movies
+      FAKEIPTV_TMP_DIR: /tmp/fakeiptv
+      FAKEIPTV_CACHE_DIR: /cache
+      TZ: ${TZ:-Asia/Jerusalem}
+      FAKEIPTV_PREWARM: ${FAKEIPTV_PREWARM:-false}
+      FAKEIPTV_PREWARM_TIMEOUT: ${FAKEIPTV_PREWARM_TIMEOUT:-120}
+      FAKEIPTV_READY_SEGMENTS: ${FAKEIPTV_READY_SEGMENTS:-3}
+
+volumes:
+  nas_multimedia:
+    driver: local
+    driver_opts:
+      type: cifs
+      o: "addr=192.168.9.106,username=guest,password=,vers=3.0"
+      device: "//192.168.9.106/Multimedia"

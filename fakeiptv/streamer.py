@@ -526,6 +526,19 @@ class ChannelStreamer:
             # On a modern CPU the overhead is negligible (~1-3% per core per channel).
             audio_opts = ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
 
+            # HDR metadata stripping — if any entry in the channel is HDR10/HLG,
+            # relabel the video stream as BT.709/SDR using a bitstream filter.
+            # This prevents green-screen artifacts on players/displays that don't
+            # support HDR.  No re-encoding; the BSF only rewrites color metadata.
+            has_hdr = any(e.is_hdr for e in self.channel.entries)
+            video_bsf_opts = (
+                ["-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1"]
+                if has_hdr else []
+            )
+            if has_hdr:
+                log.info("Channel %s: HDR entries detected — stripping HDR metadata via BSF",
+                         self.channel.id)
+
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()
             log.debug(
@@ -584,6 +597,7 @@ class ChannelStreamer:
                 "-i", self.concat_path,
                 "-c:v", "copy",
                 *audio_opts,
+                *video_bsf_opts,
                 "-map", "0:v:0",
                 "-map", "0:a:0",
                 # Subtitles: convert embedded SRT/ASS to WebVTT in-stream.

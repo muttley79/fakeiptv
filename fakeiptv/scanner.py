@@ -44,6 +44,7 @@ class Episode:
     audio_codec: str = ""
     subtitle_paths: Dict[str, str] = field(default_factory=dict)
     has_embedded_subs: bool = False
+    is_hdr: bool = False
 
 
 @dataclass
@@ -60,6 +61,7 @@ class Movie:
     audio_codec: str = ""
     subtitle_paths: Dict[str, str] = field(default_factory=dict)
     has_embedded_subs: bool = False
+    is_hdr: bool = False
 
 
 @dataclass
@@ -115,13 +117,15 @@ class DurationCache:
                 key               TEXT PRIMARY KEY,
                 duration          REAL NOT NULL,
                 audio_codec       TEXT NOT NULL DEFAULT '',
-                has_embedded_subs INTEGER NOT NULL DEFAULT -1
+                has_embedded_subs INTEGER NOT NULL DEFAULT -1,
+                is_hdr            INTEGER NOT NULL DEFAULT -1
             )
         """)
         # Migrate older databases that lack the new columns
         for col_def in [
             "ADD COLUMN audio_codec TEXT NOT NULL DEFAULT ''",
             "ADD COLUMN has_embedded_subs INTEGER NOT NULL DEFAULT -1",
+            "ADD COLUMN is_hdr INTEGER NOT NULL DEFAULT -1",
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE durations {col_def}")
@@ -137,24 +141,26 @@ class DurationCache:
         return f"{path}|{mtime}"
 
     def get_info(self, path: str) -> Optional[tuple]:
-        """Return (duration, audio_codec, has_embedded_subs) or None if not cached / needs re-probe."""
+        """Return (duration, audio_codec, has_embedded_subs, is_hdr) or None if not cached."""
         row = self._conn.execute(
-            "SELECT duration, audio_codec, has_embedded_subs FROM durations WHERE key = ?",
+            "SELECT duration, audio_codec, has_embedded_subs, is_hdr FROM durations WHERE key = ?",
             (self._key(path),)
         ).fetchone()
         if row is None:
             return None
-        duration, audio_codec, has_embedded_subs_int = row
-        if has_embedded_subs_int < 0:
-            return None  # legacy entry lacking codec info — re-probe
-        return duration, audio_codec, bool(has_embedded_subs_int)
+        duration, audio_codec, has_embedded_subs_int, is_hdr_int = row
+        if has_embedded_subs_int < 0 or is_hdr_int < 0:
+            return None  # legacy entry lacking fields — re-probe
+        return duration, audio_codec, bool(has_embedded_subs_int), bool(is_hdr_int)
 
-    def set_info(self, path: str, duration: float, audio_codec: str, has_embedded_subs: bool):
+    def set_info(self, path: str, duration: float, audio_codec: str,
+                 has_embedded_subs: bool, is_hdr: bool):
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO durations "
-                "(key, duration, audio_codec, has_embedded_subs) VALUES (?, ?, ?, ?)",
-                (self._key(path), duration, audio_codec, int(has_embedded_subs)),
+                "(key, duration, audio_codec, has_embedded_subs, is_hdr) VALUES (?, ?, ?, ?, ?)",
+                (self._key(path), duration, audio_codec,
+                 int(has_embedded_subs), int(is_hdr)),
             )
             self._conn.commit()
 
@@ -314,10 +320,14 @@ _BITMAP_SUB_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"}
 _LANG_CODES = {"he", "en", "es", "fr", "de", "ar", "ru", "pt", "it", "nl", "pl", "cs", "ja", "ko", "zh"}
 
 
+# HDR transfer functions that indicate HDR10 / HLG content
+_HDR_TRANSFERS = {"smpte2084", "arib-std-b67", "smpte428"}
+
+
 def probe_file_info(path: str):
     """
-    Return (duration_sec, audio_codec, has_text_embedded_subs) via ffprobe.
-    Falls back to (0.0, "", False) on any error.
+    Return (duration_sec, audio_codec, has_text_embedded_subs, is_hdr) via ffprobe.
+    Falls back to (0.0, "", False, False) on any error.
     """
     try:
         result = subprocess.run(
@@ -335,17 +345,23 @@ def probe_file_info(path: str):
         duration = float(data["format"]["duration"])
         audio_codec = ""
         has_embedded_subs = False
+        is_hdr = False
         for stream in data.get("streams", []):
             ctype = stream.get("codec_type", "")
-            if ctype == "audio" and not audio_codec:
+            if ctype == "video" and not is_hdr:
+                transfer = stream.get("color_transfer", "")
+                if transfer in _HDR_TRANSFERS:
+                    is_hdr = True
+                    log.debug("HDR detected in %s (transfer=%s)", path, transfer)
+            elif ctype == "audio" and not audio_codec:
                 audio_codec = stream.get("codec_name", "").lower()
             elif ctype == "subtitle":
                 if stream.get("codec_name", "") not in _BITMAP_SUB_CODECS:
                     has_embedded_subs = True
-        return duration, audio_codec, has_embedded_subs
+        return duration, audio_codec, has_embedded_subs, is_hdr
     except Exception as e:
         log.warning("ffprobe failed for %s: %s", path, e)
-        return 0.0, "", False
+        return 0.0, "", False, False
 
 
 def _find_subtitle_files(video_path: str) -> Dict[str, str]:
@@ -477,7 +493,7 @@ class Scanner:
         nfo_path = os.path.splitext(path)[0] + ".nfo"
         nfo = parse_nfo(nfo_path) if os.path.exists(nfo_path) else {}
 
-        dur_probed, audio_codec, has_embedded_subs = self._get_file_info(path)
+        dur_probed, audio_codec, has_embedded_subs, is_hdr = self._get_file_info(path)
         duration = nfo.get("runtime_sec") or dur_probed
         if not duration:
             log.warning("Could not determine duration for %s, skipping", path)
@@ -548,6 +564,7 @@ class Scanner:
             audio_codec=audio_codec,
             subtitle_paths=subtitle_paths,
             has_embedded_subs=has_embedded_subs,
+            is_hdr=is_hdr,
         )
 
     # ------------------------------------------------------------------
@@ -613,7 +630,7 @@ class Scanner:
                 if not nfo.get("runtime_sec") and meta.get("runtime_sec"):
                     nfo["runtime_sec"] = meta["runtime_sec"]
 
-        dur_probed, audio_codec, has_embedded_subs = self._get_file_info(path)
+        dur_probed, audio_codec, has_embedded_subs, is_hdr = self._get_file_info(path)
         duration = nfo.get("runtime_sec") or dur_probed
         if not duration:
             log.warning("Could not determine duration for %s, skipping", path)
@@ -650,6 +667,7 @@ class Scanner:
             audio_codec=audio_codec,
             subtitle_paths=subtitle_paths,
             has_embedded_subs=has_embedded_subs,
+            is_hdr=is_hdr,
         )
 
     # ------------------------------------------------------------------
@@ -657,15 +675,15 @@ class Scanner:
     # ------------------------------------------------------------------
 
     def _get_file_info(self, path: str):
-        """Return (duration, audio_codec, has_embedded_subs), using cache when available."""
+        """Return (duration, audio_codec, has_embedded_subs, is_hdr), using cache when available."""
         info = self._dur_cache.get_info(path)
         if info is not None:
             return info
         log.info("Probing: %s", os.path.basename(path))
-        dur, audio_codec, has_embedded_subs = probe_file_info(path)
+        dur, audio_codec, has_embedded_subs, is_hdr = probe_file_info(path)
         if dur:
-            self._dur_cache.set_info(path, dur, audio_codec, has_embedded_subs)
-        return dur, audio_codec, has_embedded_subs
+            self._dur_cache.set_info(path, dur, audio_codec, has_embedded_subs, is_hdr)
+        return dur, audio_codec, has_embedded_subs, is_hdr
 
     @staticmethod
     def _clean_filename_title(filename: str) -> str:

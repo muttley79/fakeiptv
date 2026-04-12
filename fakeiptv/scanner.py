@@ -41,6 +41,9 @@ class Episode:
     poster_url: str = ""
     tmdb_id: str = ""
     rating: float = 0.0   # show-level rating (0–10), propagated to all episodes
+    audio_codec: str = ""
+    subtitle_paths: Dict[str, str] = field(default_factory=dict)
+    has_embedded_subs: bool = False
 
 
 @dataclass
@@ -54,6 +57,9 @@ class Movie:
     poster_url: str = ""
     tmdb_id: str = ""
     rating: float = 0.0   # 0–10 scale
+    audio_codec: str = ""
+    subtitle_paths: Dict[str, str] = field(default_factory=dict)
+    has_embedded_subs: bool = False
 
 
 @dataclass
@@ -106,10 +112,21 @@ class DurationCache:
         self._lock = threading.Lock()
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS durations (
-                key  TEXT PRIMARY KEY,
-                duration REAL NOT NULL
+                key               TEXT PRIMARY KEY,
+                duration          REAL NOT NULL,
+                audio_codec       TEXT NOT NULL DEFAULT '',
+                has_embedded_subs INTEGER NOT NULL DEFAULT -1
             )
         """)
+        # Migrate older databases that lack the new columns
+        for col_def in [
+            "ADD COLUMN audio_codec TEXT NOT NULL DEFAULT ''",
+            "ADD COLUMN has_embedded_subs INTEGER NOT NULL DEFAULT -1",
+        ]:
+            try:
+                self._conn.execute(f"ALTER TABLE durations {col_def}")
+            except Exception:
+                pass  # column already exists
         self._conn.commit()
 
     def _key(self, path: str) -> str:
@@ -119,19 +136,35 @@ class DurationCache:
             mtime = "0"
         return f"{path}|{mtime}"
 
-    def get(self, path: str) -> Optional[float]:
+    def get_info(self, path: str) -> Optional[tuple]:
+        """Return (duration, audio_codec, has_embedded_subs) or None if not cached / needs re-probe."""
         row = self._conn.execute(
-            "SELECT duration FROM durations WHERE key = ?", (self._key(path),)
+            "SELECT duration, audio_codec, has_embedded_subs FROM durations WHERE key = ?",
+            (self._key(path),)
         ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            return None
+        duration, audio_codec, has_embedded_subs_int = row
+        if has_embedded_subs_int < 0:
+            return None  # legacy entry lacking codec info — re-probe
+        return duration, audio_codec, bool(has_embedded_subs_int)
 
-    def set(self, path: str, duration: float):
+    def set_info(self, path: str, duration: float, audio_codec: str, has_embedded_subs: bool):
         with self._lock:
             self._conn.execute(
-                "INSERT OR REPLACE INTO durations (key, duration) VALUES (?, ?)",
-                (self._key(path), duration),
+                "INSERT OR REPLACE INTO durations "
+                "(key, duration, audio_codec, has_embedded_subs) VALUES (?, ?, ?, ?)",
+                (self._key(path), duration, audio_codec, int(has_embedded_subs)),
             )
             self._conn.commit()
+
+    # Legacy accessors kept for any external callers
+    def get(self, path: str) -> Optional[float]:
+        info = self.get_info(path)
+        return info[0] if info is not None else None
+
+    def set(self, path: str, duration: float):
+        self.set_info(path, duration, "", False)
 
 
 # ---------------------------------------------------------------------------
@@ -271,17 +304,27 @@ def parse_nfo(nfo_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ffprobe duration
+# ffprobe helpers
 # ---------------------------------------------------------------------------
 
-def probe_duration(path: str) -> float:
-    """Return duration in seconds via ffprobe. Returns 0.0 on failure."""
+# Bitmap subtitle codecs that cannot be converted to WebVTT
+_BITMAP_SUB_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"}
+
+# Known language code suffixes for external SRT files
+_LANG_CODES = {"he", "en", "es", "fr", "de", "ar", "ru", "pt", "it", "nl", "pl", "cs", "ja", "ko", "zh"}
+
+
+def probe_file_info(path: str):
+    """
+    Return (duration_sec, audio_codec, has_text_embedded_subs) via ffprobe.
+    Falls back to (0.0, "", False) on any error.
+    """
     try:
         result = subprocess.run(
             [
                 "ffprobe", "-v", "quiet",
                 "-print_format", "json",
-                "-show_format",
+                "-show_format", "-show_streams",
                 path,
             ],
             capture_output=True,
@@ -289,10 +332,45 @@ def probe_duration(path: str) -> float:
             timeout=30,
         )
         data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
+        duration = float(data["format"]["duration"])
+        audio_codec = ""
+        has_embedded_subs = False
+        for stream in data.get("streams", []):
+            ctype = stream.get("codec_type", "")
+            if ctype == "audio" and not audio_codec:
+                audio_codec = stream.get("codec_name", "").lower()
+            elif ctype == "subtitle":
+                if stream.get("codec_name", "") not in _BITMAP_SUB_CODECS:
+                    has_embedded_subs = True
+        return duration, audio_codec, has_embedded_subs
     except Exception as e:
         log.warning("ffprobe failed for %s: %s", path, e)
-        return 0.0
+        return 0.0, "", False
+
+
+def _find_subtitle_files(video_path: str) -> Dict[str, str]:
+    """
+    Return {lang: path} for external subtitle files alongside the video file.
+    Matches:
+      <basename>.<lang>.srt  e.g.  Show.S01E01.he.srt  → {"he": "..."}
+      <basename>.srt         (unlabeled)                → {"": "..."}
+    """
+    base = os.path.splitext(video_path)[0]
+    result: Dict[str, str] = {}
+    for lang in sorted(_LANG_CODES):
+        candidate = f"{base}.{lang}.srt"
+        if os.path.exists(candidate):
+            result[lang] = candidate
+    # Unlabeled .srt — only if not already covered by a lang-specific file
+    plain = f"{base}.srt"
+    if os.path.exists(plain) and "" not in result:
+        result[""] = plain
+    return result
+
+
+# Keep old name as alias so any external callers don't break
+def probe_duration(path: str) -> float:
+    return probe_file_info(path)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +475,12 @@ class Scanner:
         nfo_path = os.path.splitext(path)[0] + ".nfo"
         nfo = parse_nfo(nfo_path) if os.path.exists(nfo_path) else {}
 
-        duration = nfo.get("runtime_sec") or self._get_duration(path)
+        dur_probed, audio_codec, has_embedded_subs = self._get_file_info(path)
+        duration = nfo.get("runtime_sec") or dur_probed
         if not duration:
             log.warning("Could not determine duration for %s, skipping", path)
             return None
+        subtitle_paths = _find_subtitle_files(path)
 
         title = nfo.get("title") or self._clean_filename_title(os.path.basename(path))
         season = nfo.get("season") or self._guess_season(path)
@@ -463,6 +543,9 @@ class Scanner:
             poster_url=poster_url,
             tmdb_id=tmdb_id,
             rating=rating,
+            audio_codec=audio_codec,
+            subtitle_paths=subtitle_paths,
+            has_embedded_subs=has_embedded_subs,
         )
 
     # ------------------------------------------------------------------
@@ -528,10 +611,12 @@ class Scanner:
                 if not nfo.get("runtime_sec") and meta.get("runtime_sec"):
                     nfo["runtime_sec"] = meta["runtime_sec"]
 
-        duration = nfo.get("runtime_sec") or self._get_duration(path)
+        dur_probed, audio_codec, has_embedded_subs = self._get_file_info(path)
+        duration = nfo.get("runtime_sec") or dur_probed
         if not duration:
             log.warning("Could not determine duration for %s, skipping", path)
             return None
+        subtitle_paths = _find_subtitle_files(path)
 
         # --- TMDB (last resort) ---
         if self._tmdb._api_key and (not genres or not plot or not rating):
@@ -560,21 +645,25 @@ class Scanner:
             poster_url=poster_url,
             tmdb_id=tmdb_id,
             rating=rating,
+            audio_codec=audio_codec,
+            subtitle_paths=subtitle_paths,
+            has_embedded_subs=has_embedded_subs,
         )
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _get_duration(self, path: str) -> float:
-        cached = self._dur_cache.get(path)
-        if cached is not None:
-            return cached
-        log.info("Probing duration: %s", os.path.basename(path))
-        dur = probe_duration(path)
+    def _get_file_info(self, path: str):
+        """Return (duration, audio_codec, has_embedded_subs), using cache when available."""
+        info = self._dur_cache.get_info(path)
+        if info is not None:
+            return info
+        log.info("Probing: %s", os.path.basename(path))
+        dur, audio_codec, has_embedded_subs = probe_file_info(path)
         if dur:
-            self._dur_cache.set(path, dur)
-        return dur
+            self._dur_cache.set_info(path, dur, audio_codec, has_embedded_subs)
+        return dur, audio_codec, has_embedded_subs
 
     @staticmethod
     def _clean_filename_title(filename: str) -> str:

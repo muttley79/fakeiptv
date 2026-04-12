@@ -19,7 +19,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .scheduler import Channel, NowPlaying, ScheduleEntry, get_now_playing, get_playing_at
 
@@ -32,6 +32,103 @@ RESTART_DELAY = 1          # seconds to wait before restarting a dead process
 IDLE_TIMEOUT = 600         # stop ffmpeg after 10 min with no client requests (watched)
 IDLE_TIMEOUT_PREWARM = 120 # default; overridden per-instance via StreamManager config
 IDLE_CHECK_INTERVAL = 30   # how often the reaper checks for idle channels
+
+# Audio codecs that copy cleanly into MPEG-TS but Televizo cannot decode.
+# Channels with any of these trigger AAC transcoding for the entire channel.
+_DTS_CODECS = {"dts", "eac3", "truehd", "mlp"}
+
+# Empty SRT content used as a placeholder when an entry has no subtitle file
+# for a given language. Must be a syntactically valid SRT file.
+_EMPTY_SRT_CONTENT = "1\n00:00:00,000 --> 23:59:59,000\n \n\n"
+
+
+class SubtitleStreamer:
+    """
+    Manages one ffmpeg WebVTT HLS subtitle track for a single language.
+    Runs a concat of SRT files (using empty.srt placeholders for entries
+    that lack a subtitle in this language) at real-time speed, producing
+    sub_{lang}.m3u8 in the same HLS directory as the video stream.
+    """
+
+    def __init__(self, channel: Channel, lang: str, hls_dir: str):
+        self._channel = channel
+        self.lang = lang
+        self.hls_dir = hls_dir
+        lang_label = lang or "und"
+        self.concat_path = os.path.join(hls_dir, f"sub_{lang_label}_concat.txt")
+        self.manifest_path = os.path.join(hls_dir, f"sub_{lang_label}.m3u8")
+        self._process: Optional[subprocess.Popen] = None
+
+    def build_concat(self, empty_srt: str) -> bool:
+        now_playing: Optional[NowPlaying] = get_now_playing(self._channel)
+        if now_playing is None:
+            return False
+        entries = self._channel.entries
+        n = len(entries)
+        if n == 0:
+            return False
+        total_seconds = CONCAT_HOURS * 3600
+        accumulated = 0.0
+        lines = ["ffconcat version 1.0\n"]
+        idx = now_playing.entry_index
+        offset = now_playing.offset_sec
+        first = True
+        while accumulated < total_seconds:
+            entry = entries[idx % n]
+            sub_path = entry.subtitle_paths.get(self.lang, empty_srt)
+            path = sub_path.replace("\\", "/")
+            path = re.sub(r"([ \t'\"])", r"\\\1", path)
+            lines.append(f"file {path}\n")
+            if first and offset > 0:
+                lines.append(f"inpoint {offset:.3f}\n")
+                accumulated += entry.duration_sec - offset
+                first = False
+            else:
+                accumulated += entry.duration_sec
+            idx += 1
+        with open(self.concat_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+        return True
+
+    def start(self, empty_srt: str):
+        if not self.build_concat(empty_srt):
+            log.warning("SubtitleStreamer: could not build concat for lang=%r", self.lang)
+            return
+        lang_label = self.lang or "und"
+        seg_pattern = os.path.join(self.hls_dir, f"sub_{lang_label}_%d.vtt")
+        cmd = [
+            "nice", "-n", "10",
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-fflags", "+genpts",
+            "-re", "-f", "concat", "-safe", "0", "-i", self.concat_path,
+            "-c:s", "webvtt",
+            "-f", "hls",
+            "-hls_time", str(HLS_SEGMENT_SECONDS),
+            "-hls_list_size", str(HLS_LIST_SIZE),
+            "-hls_flags", "delete_segments+omit_endlist+append_list",
+            "-hls_segment_filename", seg_pattern,
+            self.manifest_path,
+        ]
+        log.debug("Subtitle ffmpeg (%s): %s", self.lang or "und", " ".join(cmd))
+        self._process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def stop(self):
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+        self._process = None
 
 
 class ChannelStreamer:
@@ -55,8 +152,12 @@ class ChannelStreamer:
         self._started_at: float = 0.0
         self._ever_watched: bool = False  # True once a client touches this channel
         self.hls_dir = os.path.join(tmp_base, f"ch_{channel.id}")
-        self.manifest_path = os.path.join(self.hls_dir, "stream.m3u8")
+        # Video manifest — named "video.m3u8" so the server can serve a master
+        # playlist at "stream.m3u8" when subtitle tracks are present.
+        self.manifest_path = os.path.join(self.hls_dir, "video.m3u8")
         self.concat_path = os.path.join(self.hls_dir, "concat.txt")
+        self._empty_srt: str = os.path.join(self.hls_dir, "empty.srt")
+        self._subtitle_streamers: Dict[str, SubtitleStreamer] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -77,6 +178,9 @@ class ChannelStreamer:
     def stop(self):
         self._stop_event.set()
         self._kill()
+        for sub in self._subtitle_streamers.values():
+            sub.stop()
+        self._subtitle_streamers.clear()
         if os.path.isdir(self.hls_dir):
             shutil.rmtree(self.hls_dir, ignore_errors=True)
         log.info("Stopped streamer for channel: %s", self.channel.name)
@@ -179,12 +283,24 @@ class ChannelStreamer:
     # ffmpeg process
     # ------------------------------------------------------------------
 
+    def _get_subtitle_langs(self):
+        """Collect all external SRT languages available across this channel's entries."""
+        langs = set()
+        for entry in self.channel.entries:
+            langs.update(entry.subtitle_paths.keys())
+        return sorted(langs)
+
     def _launch(self):
         self._ready_event.clear()
         threading.Thread(
             target=self._watch_ready, daemon=True, name=f"ready-{self.channel.id}"
         ).start()
         with self._lock:
+            # Stop any running subtitle processes before cleaning up the directory
+            for sub in self._subtitle_streamers.values():
+                sub.stop()
+            self._subtitle_streamers.clear()
+
             # Remove stale HLS segments and manifest from any previous run so the
             # player doesn't get confused by timestamp mismatches on restart.
             for fname in os.listdir(self.hls_dir) if os.path.isdir(self.hls_dir) else []:
@@ -198,8 +314,44 @@ class ChannelStreamer:
                 log.error("Cannot build concat for %s — no entries?", self.channel.id)
                 return
 
+            # --- Audio: pre-detect DTS/EAC3 and force AAC if needed ---
+            # DTS and EAC3 copy cleanly into MPEG-TS but most players can't decode
+            # them.  Unlike eac3/unspecified-sample-rate errors (caught by the monitor
+            # thread), DTS copies silently — so we must detect it before launch.
+            needs_transcode = any(
+                e.audio_codec in _DTS_CODECS for e in self.channel.entries
+            )
+            audio_copy = self._audio_copy and not needs_transcode
+            if needs_transcode and self._audio_copy:
+                log.info(
+                    "Channel %s has DTS/EAC3 audio — transcoding to AAC",
+                    self.channel.id,
+                )
+            audio_opts = ["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", "192k"]
+
+            # --- Subtitles ---
+            subtitle_langs = self._get_subtitle_langs()
+            if subtitle_langs:
+                # External SRT files found: spawn separate subtitle processes.
+                # Create the empty.srt placeholder if it doesn't exist yet.
+                if not os.path.exists(self._empty_srt):
+                    with open(self._empty_srt, "w", encoding="utf-8") as f:
+                        f.write(_EMPTY_SRT_CONTENT)
+                for lang in subtitle_langs:
+                    sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
+                    sub.start(self._empty_srt)
+                    self._subtitle_streamers[lang] = sub
+                log.info(
+                    "Channel %s: started subtitle tracks for langs: %s",
+                    self.channel.id, subtitle_langs,
+                )
+                # No embedded sub mapping — external SRTs cover subtitles
+                sub_opts = []
+            else:
+                # No external SRTs: try embedded text subtitles via the video process.
+                sub_opts = ["-map", "0:s:0?", "-c:s", "webvtt"] if self._subtitles else []
+
             seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
-            audio_opts = ["-c:a", "copy"] if self._audio_copy else ["-c:a", "aac", "-b:a", "192k"]
             cmd = [
                 "nice", "-n", "10",   # lower CPU priority — yields to other processes
                 "ffmpeg",
@@ -220,9 +372,9 @@ class ChannelStreamer:
                 "-map", "0:v:0",
                 "-map", "0:a:0",
                 # Subtitles: convert embedded SRT/ASS to WebVTT in-stream.
+                # Only used when no external SRT files are available.
                 # The '?' makes the map optional — no error if a file has no subs.
-                # PGS (Blu-ray bitmap subs) are skipped; only text-based tracks work.
-                *(["-map", "0:s:0?", "-c:s", "webvtt"] if self._subtitles else []),
+                *sub_opts,
                 "-f", "hls",
                 "-hls_time", str(HLS_SEGMENT_SECONDS),
                 "-hls_list_size", str(HLS_LIST_SIZE),
@@ -483,6 +635,13 @@ class StreamManager:
             # Replace channel registry (new channels are NOT started here)
             self._channels = dict(channels)
             self._channel_order = list(channels.keys())
+
+    def get_subtitle_languages(self, ch_id: str):
+        """Return sorted list of subtitle language codes available for ch_id."""
+        s = self._streamers.get(ch_id)
+        if s is None:
+            return []
+        return sorted(s._subtitle_streamers.keys())
 
     def has_active_streamers(self) -> bool:
         """True if any channel is currently running."""

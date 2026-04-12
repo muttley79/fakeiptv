@@ -53,6 +53,9 @@ class ScheduleEntry:
     episode: int = 0
     year: int = 0
     genres: List[str] = field(default_factory=list)
+    audio_codec: str = ""
+    subtitle_paths: Dict[str, str] = field(default_factory=dict)
+    has_embedded_subs: bool = False
 
 
 @dataclass
@@ -208,6 +211,9 @@ def _episode_to_entry(ep: Episode) -> ScheduleEntry:
         episode=ep.episode,
         year=ep.year,
         genres=ep.genres,
+        audio_codec=ep.audio_codec,
+        subtitle_paths=ep.subtitle_paths,
+        has_embedded_subs=ep.has_embedded_subs,
     )
 
 
@@ -221,6 +227,9 @@ def _movie_to_entry(movie: Movie) -> ScheduleEntry:
         poster_url=movie.poster_url,
         year=movie.year,
         genres=movie.genres,
+        audio_codec=movie.audio_codec,
+        subtitle_paths=movie.subtitle_paths,
+        has_embedded_subs=movie.has_embedded_subs,
     )
 
 

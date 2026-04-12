@@ -63,6 +63,39 @@ def epg_gz():
 # HLS stream
 # ---------------------------------------------------------------------------
 
+_LANG_NAMES = {
+    "he": "Hebrew", "en": "English", "es": "Spanish", "fr": "French",
+    "de": "German", "ar": "Arabic", "ru": "Russian", "pt": "Portuguese",
+    "it": "Italian", "nl": "Dutch", "pl": "Polish", "cs": "Czech",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "": "Subtitles",
+}
+
+
+def _build_master_playlist(subtitle_langs) -> str:
+    """
+    Build an HLS master playlist that references the video stream (video.m3u8)
+    and one subtitle track per language (sub_{lang}.m3u8).
+    The EXT-X-START tag steers players to the live edge on channel switch.
+    """
+    lines = [
+        "#EXTM3U\n",
+        "#EXT-X-START:TIME-OFFSET=-4.0,PRECISE=NO\n",
+    ]
+    for i, lang in enumerate(subtitle_langs):
+        name = _LANG_NAMES.get(lang, lang.upper() or "Subtitles")
+        default = "YES" if i == 0 else "NO"
+        lang_label = lang or "und"
+        lines.append(
+            f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",'
+            f'LANGUAGE="{lang_label}",NAME="{name}",'
+            f'DEFAULT={default},AUTOSELECT={default},'
+            f'URI="sub_{lang_label}.m3u8"\n'
+        )
+    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=8000000,SUBTITLES="subs"\n')
+    lines.append("video.m3u8\n")
+    return "".join(lines)
+
+
 @app.route("/hls/<channel_id>/stream.m3u8")
 def hls_manifest(channel_id: str):
     global _prewarm_done
@@ -105,24 +138,33 @@ def hls_manifest(channel_id: str):
 
     _app_instance.stream_manager.touch(channel_id)
 
-    # Wait (up to 20s) for ffmpeg to produce its first segment.
+    # Wait (up to 30s) for ffmpeg to produce its first segment.
     # Uses threading.Event — all concurrent requests for the same channel share
     # one event, so this does not create one thread per request.
     if not _app_instance.stream_manager.wait_ready(channel_id, timeout=30):
         abort(503)
 
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
-    manifest_path = os.path.join(hls_dir, "stream.m3u8")
-    with open(manifest_path, "r") as f:
-        content = f.read()
-    # Tell the player to start near the live edge instead of the oldest segment
-    # in the sliding window, preventing replay of recently-watched content on
-    # channel switch-back. TIME-OFFSET=-4.0 = 2 segments before live edge.
-    content = content.replace(
-        "#EXTM3U\n",
-        "#EXTM3U\n#EXT-X-START:TIME-OFFSET=-4.0,PRECISE=NO\n",
-        1,
-    )
+
+    # If the channel has subtitle tracks, serve an HLS master playlist that
+    # references both the video rendition (video.m3u8) and subtitle playlists.
+    # Without subtitles, serve the video manifest directly (same as before).
+    subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
+    if subtitle_langs:
+        content = _build_master_playlist(subtitle_langs)
+    else:
+        manifest_path = os.path.join(hls_dir, "video.m3u8")
+        with open(manifest_path, "r") as f:
+            content = f.read()
+        # Tell the player to start near the live edge instead of the oldest segment
+        # in the sliding window, preventing replay of recently-watched content on
+        # channel switch-back. TIME-OFFSET=-4.0 = 2 segments before live edge.
+        content = content.replace(
+            "#EXTM3U\n",
+            "#EXTM3U\n#EXT-X-START:TIME-OFFSET=-4.0,PRECISE=NO\n",
+            1,
+        )
+
     resp = Response(content, mimetype="application/x-mpegurl")
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"

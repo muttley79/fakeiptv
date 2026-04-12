@@ -75,7 +75,8 @@ class SubtitleStreamer:
         first = True
         while accumulated < total_seconds:
             entry = entries[idx % n]
-            sub_path = entry.subtitle_paths.get(self.lang, empty_srt)
+            raw_path = entry.subtitle_paths.get(self.lang, empty_srt)
+            sub_path = self._to_utf8(raw_path)
             path = sub_path.replace("\\", "/")
             path = re.sub(r"([ \t'\"])", r"\\\1", path)
             lines.append(f"file {path}\n")
@@ -90,22 +91,50 @@ class SubtitleStreamer:
             f.writelines(lines)
         return True
 
-    def _detect_charenc(self) -> str:
+    def _to_utf8(self, src_path: str) -> str:
         """
-        Sample the first real SRT file for this language.
-        Returns 'UTF-8' if the file reads clean, otherwise 'cp1255'
-        (common for Hebrew/Arabic/Russian SRT files from Windows tools).
+        Return a path to a UTF-8 encoded SRT file.
+        If src_path is already valid UTF-8, returns it unchanged.
+        Otherwise converts (trying cp1255, iso-8859-8, latin-1 in order)
+        and writes the result to hls_dir/srt_utf8/, reusing it on restarts.
         """
-        for entry in self._channel.entries:
-            sub_path = entry.subtitle_paths.get(self.lang)
-            if sub_path and os.path.exists(sub_path):
-                try:
-                    with open(sub_path, "rb") as f:
-                        f.read(4096).decode("utf-8")
-                    return "UTF-8"
-                except UnicodeDecodeError:
-                    return "cp1255"
-        return "UTF-8"
+        try:
+            with open(src_path, "rb") as f:
+                f.read().decode("utf-8")
+            return src_path
+        except UnicodeDecodeError:
+            pass
+
+        # Try common Hebrew/Windows encodings, fall back to latin-1 (never fails)
+        content = None
+        for enc in ("cp1255", "iso-8859-8", "latin-1"):
+            try:
+                with open(src_path, encoding=enc, errors="strict") as f:
+                    content = f.read()
+                log.info(
+                    "Subtitle %s: converting from %s to UTF-8",
+                    os.path.basename(src_path), enc,
+                )
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+
+        if content is None:
+            return src_path  # should never happen (latin-1 always succeeds)
+
+        utf8_dir = os.path.join(self.hls_dir, "srt_utf8")
+        os.makedirs(utf8_dir, exist_ok=True)
+        import hashlib
+        key = f"{src_path}|{os.path.getmtime(src_path):.0f}"
+        h = hashlib.md5(key.encode()).hexdigest()[:10]
+        out_path = os.path.join(utf8_dir, f"{h}_{os.path.basename(src_path)}")
+        if not os.path.exists(out_path):
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        return out_path
+
+    def is_running(self) -> bool:
+        return self._process is not None and self._process.poll() is None
 
     def start(self, empty_srt: str):
         if not self.build_concat(empty_srt):
@@ -114,17 +143,10 @@ class SubtitleStreamer:
         lang_label = self.lang or "und"
         seg_pattern = os.path.join(self.hls_dir, f"sub_{lang_label}_%d.vtt")
 
-        charenc = self._detect_charenc()
-        charenc_opts = ["-sub_charenc", charenc] if charenc != "UTF-8" else []
-        if charenc != "UTF-8":
-            log.info("Subtitle track %s (%s): detected encoding %s", lang_label, self._channel.id, charenc)
-
         cmd = [
             "nice", "-n", "10",
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-fflags", "+genpts",
-            # charenc must be an input option — place before -f concat
-            *charenc_opts,
             "-re", "-f", "concat", "-safe", "0", "-i", self.concat_path,
             "-map", "0:s?",        # explicitly map subtitle stream from concat
             "-c:s", "webvtt",
@@ -681,11 +703,13 @@ class StreamManager:
             self._channel_order = list(channels.keys())
 
     def get_subtitle_languages(self, ch_id: str):
-        """Return sorted list of subtitle language codes available for ch_id."""
+        """Return sorted list of subtitle language codes whose ffmpeg is still running."""
         s = self._streamers.get(ch_id)
         if s is None:
             return []
-        return sorted(s._subtitle_streamers.keys())
+        return sorted(
+            lang for lang, sub in s._subtitle_streamers.items() if sub.is_running()
+        )
 
     def has_active_streamers(self) -> bool:
         """True if any channel is currently running."""

@@ -100,11 +100,20 @@ class ChannelStreamer:
         return self._ready_event.wait(timeout=timeout)
 
     def _watch_ready(self):
-        """Background thread: set _ready_event the instant the manifest appears."""
+        """Background thread: set _ready_event once enough segments are buffered.
+        Waiting for MIN_READY_SEGMENTS before signalling avoids startup stutter —
+        if we fire on the first segment the client plays it and then has to wait
+        for the next one to be written, causing 1-2 visible stutters on channel switch.
+        """
+        MIN_READY_SEGMENTS = 3
         while not self._stop_event.is_set():
             if os.path.exists(self.manifest_path):
-                self._ready_event.set()
-                return
+                seg_count = sum(
+                    1 for f in os.listdir(self.hls_dir) if f.endswith(".ts")
+                )
+                if seg_count >= MIN_READY_SEGMENTS:
+                    self._ready_event.set()
+                    return
             time.sleep(0.2)
 
     # ------------------------------------------------------------------

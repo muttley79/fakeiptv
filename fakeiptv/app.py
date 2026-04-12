@@ -35,6 +35,7 @@ class FakeIPTV:
             subtitles=config.server.subtitles,
             prewarm_timeout=config.server.prewarm_timeout,
             ready_segments=config.server.ready_segments,
+            session_mode=config.server.prewarm_session,
         )
         self.catchup_manager = CatchupManager(
             tmp_base=config.server.tmp_dir,

@@ -328,11 +328,14 @@ class StreamManager:
     """
 
     def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True,
-                 prewarm_timeout: int = IDLE_TIMEOUT_PREWARM, ready_segments: int = 3):
+                 prewarm_timeout: int = IDLE_TIMEOUT_PREWARM, ready_segments: int = 3,
+                 session_mode: bool = False):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._prewarm_timeout = prewarm_timeout
         self._ready_segments = ready_segments
+        self._session_mode = session_mode
+        self._last_global_touch: float = time.time()
         # All known channels (running or not)
         self._channels: Dict[str, Channel] = {}
         # Only channels with an active ffmpeg process
@@ -358,6 +361,8 @@ class StreamManager:
                                    ready_segments=self._ready_segments)
                 s.start()
                 self._streamers[ch_id] = s
+            if self._session_mode:
+                self._last_global_touch = time.time()
             return True
 
     def touch(self, ch_id: str):
@@ -365,6 +370,8 @@ class StreamManager:
         s = self._streamers.get(ch_id)
         if s:
             s.touch()
+            if self._session_mode:
+                self._last_global_touch = time.time()
 
     def stop_all(self):
         with self._lock:
@@ -435,14 +442,26 @@ class StreamManager:
         while True:
             time.sleep(IDLE_CHECK_INTERVAL)
             with self._lock:
-                idle = [ch_id for ch_id, s in self._streamers.items() if s.is_idle()]
-                for ch_id in idle:
-                    timeout = IDLE_TIMEOUT if self._streamers[ch_id]._ever_watched else IDLE_TIMEOUT_PREWARM
-                    log.info(
-                        "Channel %s idle for >%ds — stopping ffmpeg", ch_id, timeout
-                    )
-                    self._streamers[ch_id].stop()
-                    del self._streamers[ch_id]
+                if self._session_mode:
+                    # Session mode: keep all channels alive together; stop all at once
+                    # when no channel has been touched for prewarm_timeout seconds.
+                    if self._streamers and (time.time() - self._last_global_touch) > self._prewarm_timeout:
+                        log.info(
+                            "Session idle for >%ds — stopping all %d channels",
+                            self._prewarm_timeout, len(self._streamers)
+                        )
+                        for s in self._streamers.values():
+                            s.stop()
+                        self._streamers.clear()
+                else:
+                    idle = [ch_id for ch_id, s in self._streamers.items() if s.is_idle()]
+                    for ch_id in idle:
+                        timeout = IDLE_TIMEOUT if self._streamers[ch_id]._ever_watched else IDLE_TIMEOUT_PREWARM
+                        log.info(
+                            "Channel %s idle for >%ds — stopping ffmpeg", ch_id, timeout
+                        )
+                        self._streamers[ch_id].stop()
+                        del self._streamers[ch_id]
 
 
 # ---------------------------------------------------------------------------

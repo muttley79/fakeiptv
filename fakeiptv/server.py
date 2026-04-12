@@ -90,7 +90,7 @@ def hls_manifest(channel_id: str):
     # Pre-warm all channels on first request of each "session" (if enabled via FAKEIPTV_PREWARM).
     # _prewarm_done resets when all channels have gone idle (nobody watching),
     # so the next viewer triggers a fresh pre-warm.
-    if _app_instance.config.server.prewarm:
+    if _app_instance.config.server.prewarm or _app_instance.config.server.prewarm_session:
         global _prewarm_done
         if not _prewarm_done:
             _prewarm_done = True

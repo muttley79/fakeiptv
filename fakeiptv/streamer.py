@@ -144,10 +144,17 @@ class SubtitleStreamer:
 
             if srt_path and os.path.exists(srt_path):
                 raw = _read_srt(srt_path)
-                for start, end, text in _parse_srt_cues(raw):
+                cues = _parse_srt_cues(raw)
+                # Some SRTs use disc/absolute timestamps instead of
+                # file-relative ones (e.g. episode at 02:30:00 on disc has
+                # cues starting at 02:30:04 rather than 00:00:04).
+                # Normalize by subtracting the minimum cue time so all
+                # timestamps become relative to the video file's start.
+                srt_offset = min((s for s, e, t in cues), default=0.0)
+                for start, end, text in cues:
                     # Shift cue into the stream timeline
-                    s_adj = start - inpoint + stream_pos
-                    e_adj = end   - inpoint + stream_pos
+                    s_adj = (start - srt_offset) - inpoint + stream_pos
+                    e_adj = (end   - srt_offset) - inpoint + stream_pos
                     if e_adj <= 0:
                         continue   # cue entirely before our start
                     s_adj = max(0.0, s_adj)

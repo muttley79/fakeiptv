@@ -124,8 +124,8 @@ def _probe_keyframe_inpoint(path: str, inpoint: float) -> float:
                     inpoint, actual, inpoint - actual,
                 )
             return actual
-    except Exception:
-        log.debug("_probe_keyframe_inpoint failed for %s @ %.3f", path, inpoint)
+    except Exception as exc:
+        log.debug("_probe_keyframe_inpoint failed for %s @ %.3f: %s", path, inpoint, exc)
     return inpoint
 
 
@@ -156,8 +156,16 @@ class SubtitleStreamer:
 
     def start(self, actual_inpoint: float = None):
         try:
-            self._generate(actual_inpoint)
-            self._ok = True
+            cue_count = self._generate(actual_inpoint)
+            if cue_count == 0:
+                log.warning(
+                    "SubtitleStreamer (%s, %s): 0 cues in current window — "
+                    "track will be omitted from master playlist",
+                    self._channel.id, self.lang or "und",
+                )
+                self._ok = False
+            else:
+                self._ok = True
         except Exception:
             log.exception(
                 "SubtitleStreamer (%s, %s): generation failed",
@@ -277,6 +285,7 @@ class SubtitleStreamer:
             self.lang or "und", self._channel.id, cue_count,
             entries_with_subs, entries_without_subs,
         )
+        return cue_count
 
 
 class ChannelStreamer:

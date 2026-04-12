@@ -33,10 +33,6 @@ IDLE_TIMEOUT = 600         # stop ffmpeg after 10 min with no client requests (w
 IDLE_TIMEOUT_PREWARM = 120 # default; overridden per-instance via StreamManager config
 IDLE_CHECK_INTERVAL = 30   # how often the reaper checks for idle channels
 
-# Audio codecs that copy cleanly into MPEG-TS but Televizo cannot decode.
-# Channels with any of these trigger AAC transcoding for the entire channel.
-_DTS_CODECS = {"dts", "eac3", "truehd", "mlp"}
-
 
 def _srt_ts_to_sec(ts: str) -> float:
     """Convert SRT/VTT timestamp (HH:MM:SS,mmm or HH:MM:SS.mmm) to seconds."""
@@ -293,28 +289,24 @@ class ChannelStreamer:
     # Concat file
     # ------------------------------------------------------------------
 
-    def _build_concat(self) -> Tuple[bool, bool]:
+    def _build_concat(self) -> bool:
         """
         Build a ffconcat file covering ~CONCAT_HOURS hours from now.
         Uses inpoint on the first file to seek to the current schedule position.
-        Returns (success, needs_audio_transcode) where needs_audio_transcode is
-        True if any entry in the window has an audio codec that can't be copied
-        cleanly (DTS, EAC3, TrueHD).  This drives per-window audio decisions so
-        channels with no DTS files in the current window use lossless copy.
+        Returns True on success.
         """
         now_playing: Optional[NowPlaying] = get_now_playing(self.channel)
         if now_playing is None:
             log.error("No now-playing for channel %s", self.channel.id)
-            return False, False
+            return False
 
         entries = self.channel.entries
         n = len(entries)
         if n == 0:
-            return False, False
+            return False
 
         total_seconds = CONCAT_HOURS * 3600
         accumulated = 0.0
-        needs_transcode = False
 
         lines = ["ffconcat version 1.0\n"]
 
@@ -324,8 +316,6 @@ class ChannelStreamer:
 
         while accumulated < total_seconds:
             entry = entries[idx % n]
-            if entry.audio_codec in _DTS_CODECS:
-                needs_transcode = True
             # Forward slashes required by ffconcat; escape single quotes so
             # paths like "It's Always Sunny.mkv" don't break the format.
             # Use unquoted paths with backslash escaping.
@@ -347,7 +337,7 @@ class ChannelStreamer:
         with open(self.concat_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
-        return True, needs_transcode
+        return True
 
     # ------------------------------------------------------------------
     # ffmpeg process
@@ -380,25 +370,14 @@ class ChannelStreamer:
                     except OSError:
                         pass
 
-            ok, window_needs_transcode = self._build_concat()
-            if not ok:
+            if not self._build_concat():
                 log.error("Cannot build concat for %s — no entries?", self.channel.id)
                 return
 
-            # --- Audio: per-window DTS/EAC3 detection ---
-            # Check only entries in the current 4-hour concat window, not all
-            # channel entries.  This keeps channels that have no DTS files
-            # in the current window on lossless copy.  Re-evaluated each time
-            # the concat is rebuilt (~every 4 hours or on channel restart).
-            # The per-channel _audio_copy flag can be forced False by the monitor
-            # thread's runtime fallback (for EAC3 "unspecified sample rate" errors).
-            audio_copy = self._audio_copy and not window_needs_transcode
-            if window_needs_transcode and self._audio_copy:
-                log.info(
-                    "Channel %s window has DTS/EAC3 audio — transcoding to AAC",
-                    self.channel.id,
-                )
-            audio_opts = ["-c:a", "copy"] if audio_copy else ["-c:a", "aac", "-b:a", "192k"]
+            # Always transcode audio to AAC so any source codec (DTS, EAC3,
+            # AC3, TrueHD, …) works transparently without per-channel detection.
+            # On a modern CPU the overhead is negligible (~1-3% per core per channel).
+            audio_opts = ["-c:a", "aac", "-b:a", "192k"]
 
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()
@@ -539,23 +518,6 @@ class ChannelStreamer:
                         )
                         self._subtitles = False
 
-                    # Some audio codecs can't remux cleanly into MPEG-TS with -c copy:
-                    #   - eac3: loses sample rate metadata
-                    #   - dts / dts-hd: too-large packets or unsupported in TS
-                    # Fall back to AAC transcoding for this channel.
-                    _audio_errors = (
-                        "unspecified sample rate",
-                        "packet too large",
-                        "invalid data found when processing input",
-                        "dts-hd ma is not supported",
-                        "no core found",
-                    )
-                    if self._audio_copy and any(e in stderr_output.lower() for e in _audio_errors):
-                        log.warning(
-                            "Channel %s has incompatible audio — "
-                            "falling back to AAC transcoding", self.channel.id
-                        )
-                        self._audio_copy = False
                 else:
                     log.info(
                         "ffmpeg exited (code %d) for %s — concat exhausted, restarting",

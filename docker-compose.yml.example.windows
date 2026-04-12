@@ -7,8 +7,6 @@ services:
       - "${FAKEIPTV_PORT:-8080}:${FAKEIPTV_PORT:-8080}"
     env_file:
       - .env
-    # Privileged mode is required for mount.cifs to work inside Docker Desktop on Windows
-    privileged: true
     volumes:
       # Persistent metadata cache (SQLite durations + TMDB responses)
       - ./fakeiptv-cache:/cache
@@ -17,12 +15,13 @@ services:
         target: /tmp/fakeiptv
         tmpfs:
           size: ${FAKEIPTV_TMPFS_SIZE:-1073741824}   # 1 GB default; raise if you have many channels
+      # NAS share via NFS — mounted by Docker at the VM level, then bind-propagated into the container.
+      # Docker Desktop for Windows: in-container mount.cifs fails (errno 95) and bind-mounting a
+      # Windows network drive yields an empty directory. Using a named NFS volume works because
+      # the Docker Desktop VM kernel supports NFS natively.
+      # Adjust addr, device, and options to match your NAS.
+      - nas_multimedia:/multimedia:ro
     environment:
-      # NAS share — mounted inside the container by entrypoint.sh
-      NAS_HOST: 192.168.9.106
-      NAS_SHARE: Multimedia
-      NAS_USER: guest
-      NAS_PASS: ""
       FAKEIPTV_SHOWS_PATH: /multimedia/TV Shows
       FAKEIPTV_MOVIES_PATH: /multimedia/Movies
       FAKEIPTV_TMP_DIR: /tmp/fakeiptv
@@ -31,3 +30,11 @@ services:
       FAKEIPTV_PREWARM: ${FAKEIPTV_PREWARM:-false}
       FAKEIPTV_PREWARM_TIMEOUT: ${FAKEIPTV_PREWARM_TIMEOUT:-120}
       FAKEIPTV_READY_SEGMENTS: ${FAKEIPTV_READY_SEGMENTS:-3}
+
+volumes:
+  nas_multimedia:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=192.168.9.106,hard,intr,rsize=8192,wsize=8192,timeo=14,nfsvers=3,ro"
+      device: ":/Multimedia"

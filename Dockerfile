@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY fakeiptv/ ./fakeiptv/
 COPY run.py config.yaml entrypoint.sh ./
-RUN chmod +x entrypoint.sh
+RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 
 # HLS segments live in a tmpfs volume mounted at runtime (see docker-compose).
 # Cache (SQLite) lives in a named volume for persistence across restarts.

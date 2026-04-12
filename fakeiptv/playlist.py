@@ -44,7 +44,7 @@ def build_m3u8(
             )
 
         lines.append(
-            f'#EXTINF:-1 tvg-id="{channel.id}" tvg-name="{channel.name}" '
+            f'#EXTINF:0 tvg-id="{channel.id}" tvg-name="{channel.name}" '
             f'tvg-chno="{chno}" '
             f'tvg-logo="{logo}" group-title="{channel.group}"{catchup_attrs},{channel.name}\n'
         )

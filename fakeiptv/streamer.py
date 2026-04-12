@@ -30,7 +30,7 @@ HLS_LIST_SIZE = 10         # sliding window — keep 10 × 2s segments (~20s of 
 CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
 RESTART_DELAY = 1          # seconds to wait before restarting a dead process
 IDLE_TIMEOUT = 600         # stop ffmpeg after 10 min with no client requests (watched)
-IDLE_TIMEOUT_PREWARM = 120 # stop after 2 min if pre-warmed but never directly watched
+IDLE_TIMEOUT_PREWARM = 120 # default; overridden per-instance via StreamManager config
 IDLE_CHECK_INTERVAL = 30   # how often the reaper checks for idle channels
 
 
@@ -38,11 +38,14 @@ class ChannelStreamer:
     """Manages the ffmpeg process for a single channel."""
 
     def __init__(self, channel: Channel, tmp_base: str, subtitles: bool = True,
-                 audio_copy: bool = True):
+                 audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
+                 ready_segments: int = 3):
         self.channel = channel
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._audio_copy = audio_copy   # False → transcode audio to AAC
+        self._prewarm_timeout = prewarm_timeout
+        self._ready_segments = ready_segments
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -84,8 +87,11 @@ class ChannelStreamer:
         self._ever_watched = True
 
     def is_idle(self) -> bool:
-        timeout = IDLE_TIMEOUT if self._ever_watched else IDLE_TIMEOUT_PREWARM
-        return (time.time() - self._last_accessed) > timeout
+        if self._ever_watched:
+            return (time.time() - self._last_accessed) > IDLE_TIMEOUT
+        if self._prewarm_timeout == 0:
+            return False  # 0 = never reap pre-warmed channels
+        return (time.time() - self._last_accessed) > self._prewarm_timeout
 
     def is_ready(self) -> bool:
         """True once the HLS manifest exists (ffmpeg has written at least one segment)."""
@@ -105,13 +111,12 @@ class ChannelStreamer:
         if we fire on the first segment the client plays it and then has to wait
         for the next one to be written, causing 1-2 visible stutters on channel switch.
         """
-        MIN_READY_SEGMENTS = 3
         while not self._stop_event.is_set():
             if os.path.exists(self.manifest_path):
                 seg_count = sum(
                     1 for f in os.listdir(self.hls_dir) if f.endswith(".ts")
                 )
-                if seg_count >= MIN_READY_SEGMENTS:
+                if seg_count >= self._ready_segments:
                     self._ready_event.set()
                     return
             time.sleep(0.2)
@@ -322,9 +327,12 @@ class StreamManager:
     first requests /hls/<channel_id>/stream.m3u8 (via ensure_started).
     """
 
-    def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True):
+    def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True,
+                 prewarm_timeout: int = IDLE_TIMEOUT_PREWARM, ready_segments: int = 3):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
+        self._prewarm_timeout = prewarm_timeout
+        self._ready_segments = ready_segments
         # All known channels (running or not)
         self._channels: Dict[str, Channel] = {}
         # Only channels with an active ffmpeg process
@@ -345,7 +353,9 @@ class StreamManager:
             if ch_id not in self._channels:
                 return False
             if ch_id not in self._streamers:
-                s = ChannelStreamer(self._channels[ch_id], self._tmp_base, self._subtitles)
+                s = ChannelStreamer(self._channels[ch_id], self._tmp_base, self._subtitles,
+                                   prewarm_timeout=self._prewarm_timeout,
+                                   ready_segments=self._ready_segments)
                 s.start()
                 self._streamers[ch_id] = s
             return True
@@ -407,6 +417,8 @@ class StreamManager:
                     s = ChannelStreamer(
                         channels[ch_id], self._tmp_base,
                         subtitles=kept_subs, audio_copy=kept_audio,
+                        prewarm_timeout=self._prewarm_timeout,
+                        ready_segments=self._ready_segments,
                     )
                     s.start()
                     self._streamers[ch_id] = s

@@ -99,6 +99,9 @@ Environment variables always take precedence over `config.yaml`.
 | `FAKEIPTV_TMP_DIR` | `/tmp/fakeiptv` | Where HLS segments are written (use tmpfs) |
 | `FAKEIPTV_CACHE_DIR` | `~/.fakeiptv/` | SQLite cache for durations + TMDB metadata |
 | `FAKEIPTV_SUBTITLES` | `true` | Include subtitle tracks (SRT/ASS→WebVTT) |
+| `FAKEIPTV_PREWARM` | `false` | Start all channels on first client connect (smoother channel switching, higher CPU spike) |
+| `FAKEIPTV_PREWARM_TIMEOUT` | `120` | Seconds before a pre-warmed-but-never-watched channel is stopped (`0` = never stop) |
+| `FAKEIPTV_READY_SEGMENTS` | `3` | HLS segments buffered before a channel is declared ready (~2s each; higher = less startup stutter, more channel-switch delay) |
 | `FAKEIPTV_CATCHUP_DAYS` | `7` | Days of past programming available for catch-up |
 | `FAKEIPTV_TMDB_API_KEY` | _(empty)_ | Optional — TMDB metadata fallback |
 | `FAKEIPTV_SONARR_URL` | _(empty)_ | Optional — Sonarr integration for ratings/metadata |

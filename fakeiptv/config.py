@@ -26,6 +26,8 @@ class ServerConfig:
     subtitles: bool = True
     catchup_days: int = 7
     prewarm: bool = False
+    prewarm_timeout: int = 120   # seconds before a pre-warmed-only channel is stopped
+    ready_segments: int = 3      # segments buffered before a channel is declared ready
 
 
 @dataclass
@@ -99,6 +101,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         subtitles=_env_bool("FAKEIPTV_SUBTITLES", server_raw.get("subtitles", True)),
         catchup_days=_env_int("FAKEIPTV_CATCHUP_DAYS", int(server_raw.get("catchup_days", 7))),
         prewarm=_env_bool("FAKEIPTV_PREWARM", server_raw.get("prewarm", False)),
+        prewarm_timeout=_env_int("FAKEIPTV_PREWARM_TIMEOUT", int(server_raw.get("prewarm_timeout", 120))),
+        ready_segments=_env_int("FAKEIPTV_READY_SEGMENTS", int(server_raw.get("ready_segments", 3))),
     )
     metadata = MetadataConfig(
         tmdb_api_key=_env("FAKEIPTV_TMDB_API_KEY", meta_raw.get("tmdb_api_key", "")),

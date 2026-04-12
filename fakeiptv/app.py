@@ -33,6 +33,8 @@ class FakeIPTV:
         self.stream_manager = StreamManager(
             tmp_base=config.server.tmp_dir,
             subtitles=config.server.subtitles,
+            prewarm_timeout=config.server.prewarm_timeout,
+            ready_segments=config.server.ready_segments,
         )
         self.catchup_manager = CatchupManager(
             tmp_base=config.server.tmp_dir,

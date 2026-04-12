@@ -28,4 +28,6 @@ services:
       # Set TZ in .env (e.g. TZ=Asia/Jerusalem) or hardcode here.
       TZ: ${TZ:-Asia/Jerusalem}
       FAKEIPTV_PREWARM: ${FAKEIPTV_PREWARM:-false}
+      FAKEIPTV_PREWARM_TIMEOUT: ${FAKEIPTV_PREWARM_TIMEOUT:-120}
+      FAKEIPTV_READY_SEGMENTS: ${FAKEIPTV_READY_SEGMENTS:-3}
 

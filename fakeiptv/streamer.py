@@ -114,9 +114,27 @@ class SubtitleStreamer:
             cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        # Log any immediate startup errors in a background thread
+        proc = self._process
+        lang_label = self.lang or "und"
+        channel_id = self._channel.id
+
+        def _log_stderr():
+            try:
+                out = proc.stderr.read().decode(errors="replace")
+                if out.strip():
+                    log.warning(
+                        "Subtitle ffmpeg (%s, %s) stderr:\n%s",
+                        channel_id, lang_label, out[:500],
+                    )
+            except Exception:
+                pass
+
+        threading.Thread(target=_log_stderr, daemon=True,
+                         name=f"sub-stderr-{channel_id}-{lang_label}").start()
 
     def stop(self):
         if self._process and self._process.poll() is None:

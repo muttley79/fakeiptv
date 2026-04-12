@@ -546,33 +546,16 @@ class ChannelStreamer:
                 self.channel.id, subtitle_langs or "none",
             )
             if subtitle_langs:
-                # Probe actual keyframe position so subtitle timestamps align with
-                # where ffmpeg actually starts decoding (keyframe snap with -c:v copy
-                # can be 0–GOP_size seconds before the nominal inpoint).
-                _np = get_now_playing(self.channel)
-                _nominal_inpoint = _np.offset_sec if _np else 0.0
-                if _nominal_inpoint > 0 and _np:
-                    _first_entry = self.channel.entries[_np.entry_index]
-                    actual_inpoint = _probe_keyframe_inpoint(_first_entry.path, _nominal_inpoint)
-                else:
-                    actual_inpoint = _nominal_inpoint
-                log.debug(
-                    "Channel %s: subtitle inpoint nominal=%.3fs actual=%.3fs (snap=%.3fs)",
-                    self.channel.id, _nominal_inpoint, actual_inpoint,
-                    _nominal_inpoint - actual_inpoint,
-                )
-
-                # External SRT files found: generate WebVTT + playlist in Python.
-                for lang in subtitle_langs:
-                    sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
-                    sub.start(actual_inpoint=actual_inpoint)
-                    self._subtitle_streamers[lang] = sub
-                ready = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
-                log.info(
-                    "Channel %s: subtitle tracks ready: %s (failed: %s)",
-                    self.channel.id, ready or "none",
-                    [l for l in subtitle_langs if l not in ready] or "none",
-                )
+                # Subtitle generation is async: keyframe probe on NAS files takes
+                # 5-15s which would block all channel starts during prewarm.
+                # The background thread probes the inpoint, generates VTTs, then
+                # waits for the first TS segment to fix X-TIMESTAMP-MAP.
+                threading.Thread(
+                    target=self._generate_subtitles_async,
+                    args=(subtitle_langs,),
+                    daemon=True,
+                    name=f"sub-gen-{self.channel.id}",
+                ).start()
                 # No embedded sub mapping — external SRTs cover subtitles
                 sub_opts = []
             else:
@@ -620,16 +603,42 @@ class ChannelStreamer:
                 start_new_session=True,
             )
 
-            # If subtitle tracks were generated, start a background thread that
-            # waits for the first TS segment, probes its start_pts, and rewrites
-            # X-TIMESTAMP-MAP so WebVTT cues align with the player's timeline.
-            # (-c:v copy preserves source PTS values so they don't start at 0.)
-            if self._subtitle_streamers:
-                threading.Thread(
-                    target=self._update_subtitle_pts,
-                    daemon=True,
-                    name=f"sub-pts-{self.channel.id}",
-                ).start()
+
+    def _generate_subtitles_async(self, subtitle_langs):
+        """
+        Background thread: probe keyframe inpoint, generate VTTs, then fix TIMESTAMP-MAP.
+
+        Runs asynchronously so channel start is not blocked by slow ffprobe on NAS files
+        (keyframe probe can take 5-15s for large HEVC REMUXes over SMB).
+        By the time prewarm ends (~30s) or the player connects, VTTs are ready.
+        """
+        _np = get_now_playing(self.channel)
+        _nominal_inpoint = _np.offset_sec if _np else 0.0
+        if _nominal_inpoint > 0 and _np:
+            _first_entry = self.channel.entries[_np.entry_index]
+            actual_inpoint = _probe_keyframe_inpoint(_first_entry.path, _nominal_inpoint)
+        else:
+            actual_inpoint = _nominal_inpoint
+        log.debug(
+            "Channel %s: subtitle inpoint nominal=%.3fs actual=%.3fs (snap=%.3fs)",
+            self.channel.id, _nominal_inpoint, actual_inpoint,
+            _nominal_inpoint - actual_inpoint,
+        )
+
+        for lang in subtitle_langs:
+            sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
+            sub.start(actual_inpoint=actual_inpoint)
+            self._subtitle_streamers[lang] = sub
+
+        ready = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
+        log.info(
+            "Channel %s: subtitle tracks ready: %s (failed: %s)",
+            self.channel.id, ready or "none",
+            [l for l in subtitle_langs if l not in ready] or "none",
+        )
+
+        # Fix X-TIMESTAMP-MAP once the first TS segment is available
+        self._update_subtitle_pts()
 
     def _update_subtitle_pts(self):
         """Wait for first TS segment, probe start_pts, fix X-TIMESTAMP-MAP in all VTTs."""

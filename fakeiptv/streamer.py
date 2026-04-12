@@ -328,10 +328,11 @@ class StreamManager:
     """
 
     def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True,
-                 prewarm_timeout: int = IDLE_TIMEOUT_PREWARM, ready_segments: int = 3,
-                 session_mode: bool = False):
+                 audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
+                 ready_segments: int = 3, session_mode: bool = False):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
+        self._audio_copy = audio_copy
         self._prewarm_timeout = prewarm_timeout
         self._ready_segments = ready_segments
         self._session_mode = session_mode
@@ -357,6 +358,7 @@ class StreamManager:
                 return False
             if ch_id not in self._streamers:
                 s = ChannelStreamer(self._channels[ch_id], self._tmp_base, self._subtitles,
+                                   audio_copy=self._audio_copy,
                                    prewarm_timeout=self._prewarm_timeout,
                                    ready_segments=self._ready_segments)
                 s.start()
@@ -419,7 +421,9 @@ class StreamManager:
                     log.info("Entry list changed for %s — restarting", ch_id)
                     old_s = self._streamers[ch_id]
                     kept_subs = old_s._subtitles
-                    kept_audio = old_s._audio_copy
+                    # Preserve per-channel audio fallback state, but always respect
+                    # the global audio_copy setting (False = always transcode).
+                    kept_audio = old_s._audio_copy and self._audio_copy
                     old_s.stop()
                     s = ChannelStreamer(
                         channels[ch_id], self._tmp_base,

@@ -148,24 +148,34 @@ def hls_manifest(channel_id: str):
 
     # If the channel has subtitle tracks, serve an HLS master playlist that
     # references both the video rendition (video.m3u8) and subtitle playlists.
-    # Wait up to 5s for each subtitle manifest to appear; drop any that don't.
-    # Without subtitles, serve the video manifest directly (same as before).
+    # On first request: wait up to 5s for each subtitle manifest to appear.
+    # On subsequent requests: check existence without waiting (fast path).
+    # Drop any language whose manifest never appears (ffmpeg failed for it).
     subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
     ready_langs = []
     if subtitle_langs:
-        deadline = time.time() + 5
-        for lang in subtitle_langs:
-            lang_label = lang or "und"
-            sub_path = os.path.join(hls_dir, f"sub_{lang_label}.m3u8")
-            while not os.path.exists(sub_path) and time.time() < deadline:
-                time.sleep(0.1)
-            if os.path.exists(sub_path):
-                ready_langs.append(lang)
-            else:
-                log.warning(
-                    "Subtitle manifest sub_%s.m3u8 not ready for %s — omitting from master",
-                    lang_label, channel_id,
-                )
+        # Check which manifests already exist (fast path for subsequent polls)
+        existing = [
+            lang for lang in subtitle_langs
+            if os.path.exists(os.path.join(hls_dir, f"sub_{lang or 'und'}.m3u8"))
+        ]
+        if existing:
+            ready_langs = existing
+        else:
+            # First request: wait up to 5s for manifests to appear
+            deadline = time.time() + 5
+            for lang in subtitle_langs:
+                lang_label = lang or "und"
+                sub_path = os.path.join(hls_dir, f"sub_{lang_label}.m3u8")
+                while not os.path.exists(sub_path) and time.time() < deadline:
+                    time.sleep(0.1)
+                if os.path.exists(sub_path):
+                    ready_langs.append(lang)
+                else:
+                    log.warning(
+                        "Subtitle manifest sub_%s.m3u8 not ready for %s — omitting from master",
+                        lang_label, channel_id,
+                    )
 
     if ready_langs:
         content = _build_master_playlist(ready_langs)

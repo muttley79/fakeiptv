@@ -90,17 +90,43 @@ class SubtitleStreamer:
             f.writelines(lines)
         return True
 
+    def _detect_charenc(self) -> str:
+        """
+        Sample the first real SRT file for this language.
+        Returns 'UTF-8' if the file reads clean, otherwise 'cp1255'
+        (common for Hebrew/Arabic/Russian SRT files from Windows tools).
+        """
+        for entry in self._channel.entries:
+            sub_path = entry.subtitle_paths.get(self.lang)
+            if sub_path and os.path.exists(sub_path):
+                try:
+                    with open(sub_path, "rb") as f:
+                        f.read(4096).decode("utf-8")
+                    return "UTF-8"
+                except UnicodeDecodeError:
+                    return "cp1255"
+        return "UTF-8"
+
     def start(self, empty_srt: str):
         if not self.build_concat(empty_srt):
             log.warning("SubtitleStreamer: could not build concat for lang=%r", self.lang)
             return
         lang_label = self.lang or "und"
         seg_pattern = os.path.join(self.hls_dir, f"sub_{lang_label}_%d.vtt")
+
+        charenc = self._detect_charenc()
+        charenc_opts = ["-sub_charenc", charenc] if charenc != "UTF-8" else []
+        if charenc != "UTF-8":
+            log.info("Subtitle track %s (%s): detected encoding %s", lang_label, self._channel.id, charenc)
+
         cmd = [
             "nice", "-n", "10",
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-fflags", "+genpts",
+            # charenc must be an input option — place before -f concat
+            *charenc_opts,
             "-re", "-f", "concat", "-safe", "0", "-i", self.concat_path,
+            "-map", "0:s?",        # explicitly map subtitle stream from concat
             "-c:s", "webvtt",
             "-f", "hls",
             "-hls_time", str(HLS_SEGMENT_SECONDS),

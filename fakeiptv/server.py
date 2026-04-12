@@ -108,7 +108,7 @@ def hls_manifest(channel_id: str):
     # Wait (up to 20s) for ffmpeg to produce its first segment.
     # Uses threading.Event — all concurrent requests for the same channel share
     # one event, so this does not create one thread per request.
-    if not _app_instance.stream_manager.wait_ready(channel_id, timeout=20):
+    if not _app_instance.stream_manager.wait_ready(channel_id, timeout=30):
         abort(503)
 
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)

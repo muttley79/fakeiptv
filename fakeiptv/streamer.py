@@ -360,16 +360,20 @@ class StreamManager:
 
     def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True,
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
-                 ready_segments: int = 3, session_mode: bool = False):
+                 ready_segments: int = 3, session_mode: bool = False,
+                 prewarm_adjacent: int = 0):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._audio_copy = audio_copy
         self._prewarm_timeout = prewarm_timeout
         self._ready_segments = ready_segments
         self._session_mode = session_mode
+        self._prewarm_adjacent = prewarm_adjacent
         self._last_global_touch: float = time.time()
         # All known channels (running or not)
         self._channels: Dict[str, Channel] = {}
+        # Ordered channel list — mirrors playlist order, used for adjacency
+        self._channel_order: List[str] = []
         # Only channels with an active ffmpeg process
         self._streamers: Dict[str, ChannelStreamer] = {}
         self._lock = threading.Lock()
@@ -405,6 +409,17 @@ class StreamManager:
             s.touch()
             if self._session_mode:
                 self._last_global_touch = time.time()
+
+        if self._prewarm_adjacent > 0:
+            order = self._channel_order  # snapshot — avoids holding lock during iteration
+            if ch_id in order:
+                idx = order.index(ch_id)
+                for offset in range(-self._prewarm_adjacent, self._prewarm_adjacent + 1):
+                    if offset == 0:
+                        continue
+                    adj_idx = idx + offset
+                    if 0 <= adj_idx < len(order):
+                        self.ensure_started(order[adj_idx])
 
     def stop_all(self):
         with self._lock:
@@ -467,6 +482,7 @@ class StreamManager:
 
             # Replace channel registry (new channels are NOT started here)
             self._channels = dict(channels)
+            self._channel_order = list(channels.keys())
 
     def has_active_streamers(self) -> bool:
         """True if any channel is currently running."""

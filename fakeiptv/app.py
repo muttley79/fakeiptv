@@ -37,6 +37,7 @@ class FakeIPTV:
             prewarm_timeout=config.server.prewarm_timeout,
             ready_segments=config.server.ready_segments,
             session_mode=config.server.prewarm_session,
+            prewarm_adjacent=config.server.prewarm_adjacent,
         )
         self.catchup_manager = CatchupManager(
             tmp_base=config.server.tmp_dir,

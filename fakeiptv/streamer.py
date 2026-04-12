@@ -37,17 +37,67 @@ IDLE_CHECK_INTERVAL = 30   # how often the reaper checks for idle channels
 # Channels with any of these trigger AAC transcoding for the entire channel.
 _DTS_CODECS = {"dts", "eac3", "truehd", "mlp"}
 
-# Empty SRT content used as a placeholder when an entry has no subtitle file
-# for a given language. Must be a syntactically valid SRT file.
-_EMPTY_SRT_CONTENT = "1\n00:00:00,000 --> 23:59:59,000\n \n\n"
+
+def _srt_ts_to_sec(ts: str) -> float:
+    """Convert SRT/VTT timestamp (HH:MM:SS,mmm or HH:MM:SS.mmm) to seconds."""
+    ts = ts.strip().replace(",", ".")
+    parts = ts.split(":")
+    h, m, s = int(parts[0]), int(parts[1]), float(parts[2])
+    return h * 3600 + m * 60 + s
+
+
+def _sec_to_vtt_ts(sec: float) -> str:
+    """Convert seconds to WebVTT timestamp (HH:MM:SS.mmm)."""
+    sec = max(0.0, sec)
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:06.3f}"
+
+
+_SRT_TS_RE = re.compile(
+    r"(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{3})"
+)
+
+
+def _read_srt(path: str) -> str:
+    """Read SRT file using the first encoding that succeeds."""
+    for enc in ("utf-8-sig", "utf-8", "cp1255", "iso-8859-8", "latin-1"):
+        try:
+            with open(path, encoding=enc) as f:
+                return f.read()
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return ""
+
+
+def _parse_srt_cues(text: str):
+    """Parse SRT text, return list of (start_sec, end_sec, cue_text)."""
+    cues = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = block.strip().splitlines()
+        for i, line in enumerate(lines):
+            m = _SRT_TS_RE.match(line.strip())
+            if m:
+                start = _srt_ts_to_sec(m.group(1))
+                end = _srt_ts_to_sec(m.group(2))
+                text_part = "\n".join(lines[i + 1:]).strip()
+                if text_part:
+                    cues.append((start, end, text_part))
+                break
+    return cues
 
 
 class SubtitleStreamer:
     """
-    Manages one ffmpeg WebVTT HLS subtitle track for a single language.
-    Runs a concat of SRT files (using empty.srt placeholders for entries
-    that lack a subtitle in this language) at real-time speed, producing
-    sub_{lang}.m3u8 in the same HLS directory as the video stream.
+    Generates a static WebVTT subtitle file + HLS playlist for one language.
+
+    Reads SRT files directly in Python (handling any encoding), adjusts cue
+    timestamps so t=0 matches the video stream's start, and writes:
+      sub_{lang}.vtt   — combined WebVTT for the ~4h concat window
+      sub_{lang}.m3u8  — VOD-style single-entry HLS playlist
+
+    No ffmpeg process.  Instant generation.  Regenerates on channel restart.
     """
 
     def __init__(self, channel: Channel, lang: str, hls_dir: str):
@@ -55,146 +105,95 @@ class SubtitleStreamer:
         self.lang = lang
         self.hls_dir = hls_dir
         lang_label = lang or "und"
-        self.concat_path = os.path.join(hls_dir, f"sub_{lang_label}_concat.txt")
+        self.vtt_path = os.path.join(hls_dir, f"sub_{lang_label}.vtt")
         self.manifest_path = os.path.join(hls_dir, f"sub_{lang_label}.m3u8")
-        self._process: Optional[subprocess.Popen] = None
-
-    def build_concat(self, empty_srt: str) -> bool:
-        now_playing: Optional[NowPlaying] = get_now_playing(self._channel)
-        if now_playing is None:
-            return False
-        entries = self._channel.entries
-        n = len(entries)
-        if n == 0:
-            return False
-        total_seconds = CONCAT_HOURS * 3600
-        accumulated = 0.0
-        lines = ["ffconcat version 1.0\n"]
-        idx = now_playing.entry_index
-        offset = now_playing.offset_sec
-        first = True
-        while accumulated < total_seconds:
-            entry = entries[idx % n]
-            raw_path = entry.subtitle_paths.get(self.lang, empty_srt)
-            sub_path = self._to_utf8(raw_path)
-            path = sub_path.replace("\\", "/")
-            path = re.sub(r"([ \t'\"])", r"\\\1", path)
-            lines.append(f"file {path}\n")
-            if first and offset > 0:
-                lines.append(f"inpoint {offset:.3f}\n")
-                accumulated += entry.duration_sec - offset
-                first = False
-            else:
-                accumulated += entry.duration_sec
-            idx += 1
-        with open(self.concat_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        return True
-
-    def _to_utf8(self, src_path: str) -> str:
-        """
-        Return a path to a UTF-8 encoded SRT file.
-        If src_path is already valid UTF-8, returns it unchanged.
-        Otherwise converts (trying cp1255, iso-8859-8, latin-1 in order)
-        and writes the result to hls_dir/srt_utf8/, reusing it on restarts.
-        """
-        try:
-            with open(src_path, "rb") as f:
-                f.read().decode("utf-8")
-            return src_path
-        except UnicodeDecodeError:
-            pass
-
-        # Try common Hebrew/Windows encodings, fall back to latin-1 (never fails)
-        content = None
-        for enc in ("cp1255", "iso-8859-8", "latin-1"):
-            try:
-                with open(src_path, encoding=enc, errors="strict") as f:
-                    content = f.read()
-                log.info(
-                    "Subtitle %s: converting from %s to UTF-8",
-                    os.path.basename(src_path), enc,
-                )
-                break
-            except (UnicodeDecodeError, LookupError):
-                continue
-
-        if content is None:
-            return src_path  # should never happen (latin-1 always succeeds)
-
-        utf8_dir = os.path.join(self.hls_dir, "srt_utf8")
-        os.makedirs(utf8_dir, exist_ok=True)
-        import hashlib
-        key = f"{src_path}|{os.path.getmtime(src_path):.0f}"
-        h = hashlib.md5(key.encode()).hexdigest()[:10]
-        out_path = os.path.join(utf8_dir, f"{h}_{os.path.basename(src_path)}")
-        if not os.path.exists(out_path):
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(content)
-        return out_path
+        self._ok = False
 
     def is_running(self) -> bool:
-        return self._process is not None and self._process.poll() is None
+        """True when the subtitle files were successfully generated."""
+        return self._ok
 
-    def start(self, empty_srt: str):
-        if not self.build_concat(empty_srt):
-            log.warning("SubtitleStreamer: could not build concat for lang=%r", self.lang)
-            return
-        lang_label = self.lang or "und"
-        seg_pattern = os.path.join(self.hls_dir, f"sub_{lang_label}_%d.vtt")
-
-        cmd = [
-            "nice", "-n", "10",
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-fflags", "+genpts",
-            "-re", "-f", "concat", "-safe", "0", "-i", self.concat_path,
-            "-map", "0:s?",        # explicitly map subtitle stream from concat
-            "-c:s", "webvtt",
-            "-f", "hls",
-            "-hls_time", str(HLS_SEGMENT_SECONDS),
-            "-hls_list_size", str(HLS_LIST_SIZE),
-            "-hls_flags", "delete_segments+omit_endlist+append_list",
-            "-hls_segment_filename", seg_pattern,
-            self.manifest_path,
-        ]
-        log.debug("Subtitle ffmpeg (%s): %s", self.lang or "und", " ".join(cmd))
-        self._process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        # Log any immediate startup errors in a background thread
-        proc = self._process
-        lang_label = self.lang or "und"
-        channel_id = self._channel.id
-
-        def _log_stderr():
-            try:
-                out = proc.stderr.read().decode(errors="replace")
-                if out.strip():
-                    log.warning(
-                        "Subtitle ffmpeg (%s, %s) stderr:\n%s",
-                        channel_id, lang_label, out[:500],
-                    )
-            except Exception:
-                pass
-
-        threading.Thread(target=_log_stderr, daemon=True,
-                         name=f"sub-stderr-{channel_id}-{lang_label}").start()
+    def start(self, _empty_srt: str = ""):
+        try:
+            self._generate()
+            self._ok = True
+        except Exception:
+            log.exception(
+                "SubtitleStreamer (%s, %s): generation failed",
+                self._channel.id, self.lang or "und",
+            )
+            self._ok = False
 
     def stop(self):
-        if self._process and self._process.poll() is None:
-            try:
-                self._process.terminate()
-                self._process.wait(timeout=5)
-            except Exception:
-                try:
-                    self._process.kill()
-                except Exception:
-                    pass
-        self._process = None
+        self._ok = False
+
+    def _generate(self):
+        now_playing: Optional[NowPlaying] = get_now_playing(self._channel)
+        if now_playing is None:
+            raise RuntimeError("no now-playing")
+
+        entries = self._channel.entries
+        n = len(entries)
+        total_seconds = CONCAT_HOURS * 3600
+
+        cue_lines: list = []
+        stream_pos = 0.0          # seconds into the HLS stream
+        inpoint = now_playing.offset_sec   # where we start within the first entry
+        idx = now_playing.entry_index
+        cue_count = 0
+
+        while stream_pos < total_seconds:
+            entry = entries[idx % n]
+            srt_path = entry.subtitle_paths.get(self.lang, "")
+
+            if srt_path and os.path.exists(srt_path):
+                raw = _read_srt(srt_path)
+                for start, end, text in _parse_srt_cues(raw):
+                    # Shift cue into the stream timeline
+                    s_adj = start - inpoint + stream_pos
+                    e_adj = end   - inpoint + stream_pos
+                    if e_adj <= 0:
+                        continue   # cue entirely before our start
+                    s_adj = max(0.0, s_adj)
+                    if s_adj >= total_seconds:
+                        break      # past the window
+                    cue_lines.append(
+                        f"{_sec_to_vtt_ts(s_adj)} --> {_sec_to_vtt_ts(e_adj)}\n"
+                        f"{text}\n\n"
+                    )
+                    cue_count += 1
+
+            remaining = entry.duration_sec - inpoint
+            stream_pos += remaining
+            inpoint = 0.0
+            idx += 1
+
+        # WebVTT file
+        # X-TIMESTAMP-MAP aligns VTT time 0 with MPEG-TS PTS 0
+        # (video stream starts at PTS 0 due to -avoid_negative_ts make_zero)
+        with open(self.vtt_path, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\n")
+            f.write("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n")
+            f.writelines(cue_lines)
+
+        # VOD-style HLS playlist — single segment pointing to the VTT file.
+        # The player downloads the full file and seeks within it.
+        vtt_name = os.path.basename(self.vtt_path)
+        with open(self.manifest_path, "w", encoding="utf-8") as f:
+            f.write(
+                "#EXTM3U\n"
+                "#EXT-X-TARGETDURATION:14400\n"
+                "#EXT-X-VERSION:3\n"
+                "#EXT-X-MEDIA-SEQUENCE:0\n"
+                f"#EXTINF:{total_seconds:.1f},\n"
+                f"{vtt_name}\n"
+                "#EXT-X-ENDLIST\n"
+            )
+
+        log.info(
+            "Subtitle track %s (%s): %d cues written",
+            self.lang or "und", self._channel.id, cue_count,
+        )
 
 
 class ChannelStreamer:
@@ -222,7 +221,6 @@ class ChannelStreamer:
         # playlist at "stream.m3u8" when subtitle tracks are present.
         self.manifest_path = os.path.join(self.hls_dir, "video.m3u8")
         self.concat_path = os.path.join(self.hls_dir, "concat.txt")
-        self._empty_srt: str = os.path.join(self.hls_dir, "empty.srt")
         self._subtitle_streamers: Dict[str, SubtitleStreamer] = {}
 
     # ------------------------------------------------------------------
@@ -398,18 +396,15 @@ class ChannelStreamer:
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()
             if subtitle_langs:
-                # External SRT files found: spawn separate subtitle processes.
-                # Create the empty.srt placeholder if it doesn't exist yet.
-                if not os.path.exists(self._empty_srt):
-                    with open(self._empty_srt, "w", encoding="utf-8") as f:
-                        f.write(_EMPTY_SRT_CONTENT)
+                # External SRT files found: generate WebVTT + playlist in Python.
                 for lang in subtitle_langs:
                     sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
-                    sub.start(self._empty_srt)
+                    sub.start()
                     self._subtitle_streamers[lang] = sub
+                ready = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
                 log.info(
-                    "Channel %s: started subtitle tracks for langs: %s",
-                    self.channel.id, subtitle_langs,
+                    "Channel %s: subtitle tracks ready: %s",
+                    self.channel.id, ready or "none",
                 )
                 # No embedded sub mapping — external SRTs cover subtitles
                 sub_opts = []

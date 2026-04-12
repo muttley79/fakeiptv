@@ -377,7 +377,7 @@ class ChannelStreamer:
             # Always transcode audio to AAC so any source codec (DTS, EAC3,
             # AC3, TrueHD, …) works transparently without per-channel detection.
             # On a modern CPU the overhead is negligible (~1-3% per core per channel).
-            audio_opts = ["-c:a", "aac", "-b:a", "192k"]
+            audio_opts = ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
 
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()

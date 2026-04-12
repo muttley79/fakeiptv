@@ -112,7 +112,18 @@ def hls_manifest(channel_id: str):
         abort(503)
 
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
-    resp = send_from_directory(hls_dir, "stream.m3u8")
+    manifest_path = os.path.join(hls_dir, "stream.m3u8")
+    with open(manifest_path, "r") as f:
+        content = f.read()
+    # Tell the player to start near the live edge instead of the oldest segment
+    # in the sliding window, preventing replay of recently-watched content on
+    # channel switch-back. TIME-OFFSET=-4.0 = 2 segments before live edge.
+    content = content.replace(
+        "#EXTM3U\n",
+        "#EXTM3U\n#EXT-X-START:TIME-OFFSET=-4.0,PRECISE=NO\n",
+        1,
+    )
+    resp = Response(content, mimetype="application/x-mpegurl")
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp

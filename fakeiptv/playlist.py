@@ -21,7 +21,7 @@ def build_m3u8(
     catchup_days: if > 0, adds catchup attributes to each channel entry
     """
     generation_date = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
-    lines = [f'#EXTM3U url-tvg="{epg_url}" x-tvg-url="{epg_url}" generation-date="{generation_date}"\n']
+    lines = [f'#EXTM3U url-tvg="{epg_url}" generation-date="{generation_date}"\n']
 
     # Sort: Shows first, then Genre Mix, then Movies
     group_order = {"Shows": 0, "Genre Mix": 1, "Movies": 2}

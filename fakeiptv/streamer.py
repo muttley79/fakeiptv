@@ -83,6 +83,31 @@ def _parse_srt_cues(text: str):
                     cues.append((start, end, text_part))
                 break
     return cues
+def _probe_segment_start_pts(seg_path: str) -> Optional[int]:
+    """
+    Return the MPEG-TS start_pts (90kHz units) of the first video stream in seg_path.
+
+    With -c:v copy, ffmpeg preserves source PTS values rather than resetting to 0,
+    so the segments' starting PTS is non-zero.  This value is needed to write a
+    correct X-TIMESTAMP-MAP so WebVTT cues align with the player's timeline.
+    """
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "v:0",
+            seg_path,
+        ], capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout)
+        streams = data.get("streams", [])
+        if streams:
+            pts = streams[0].get("start_pts")
+            if pts is not None:
+                return int(pts)
+    except Exception as exc:
+        log.debug("_probe_segment_start_pts failed for %s: %s", seg_path, exc)
+    return None
+
+
 def _probe_keyframe_inpoint(path: str, inpoint: float) -> float:
     """
     Return the timestamp of the last video keyframe at or before `inpoint`.
@@ -175,6 +200,32 @@ class SubtitleStreamer:
 
     def stop(self):
         self._ok = False
+
+    def update_timestamp_map(self, start_pts: int):
+        """
+        Rewrite X-TIMESTAMP-MAP in the VTT to use the actual MPEG-TS starting PTS.
+
+        Called once the first HLS segment is available and its start_pts is known.
+        With -c:v copy, ffmpeg preserves source timestamps so PTS never starts at 0;
+        using the real start_pts makes the player sync VTT cues to the correct position.
+        """
+        try:
+            with open(self.vtt_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            updated = content.replace(
+                "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000",
+                f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000",
+                1,
+            )
+            if updated != content:
+                with open(self.vtt_path, "w", encoding="utf-8") as f:
+                    f.write(updated)
+                log.debug(
+                    "Updated TIMESTAMP-MAP in %s → MPEGTS:%d (%.3fs)",
+                    os.path.basename(self.vtt_path), start_pts, start_pts / 90000,
+                )
+        except Exception as exc:
+            log.warning("Failed to update TIMESTAMP-MAP in %s: %s", self.vtt_path, exc)
 
     def _generate(self, actual_inpoint: float = None):
         now_playing: Optional[NowPlaying] = get_now_playing(self._channel)
@@ -554,6 +605,53 @@ class ChannelStreamer:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+
+            # If subtitle tracks were generated, start a background thread that
+            # waits for the first TS segment, probes its start_pts, and rewrites
+            # X-TIMESTAMP-MAP so WebVTT cues align with the player's timeline.
+            # (-c:v copy preserves source PTS values so they don't start at 0.)
+            if self._subtitle_streamers:
+                threading.Thread(
+                    target=self._update_subtitle_pts,
+                    daemon=True,
+                    name=f"sub-pts-{self.channel.id}",
+                ).start()
+
+    def _update_subtitle_pts(self):
+        """Wait for first TS segment, probe start_pts, fix X-TIMESTAMP-MAP in all VTTs."""
+        deadline = time.time() + 30
+        seg_path = None
+        while time.time() < deadline:
+            if os.path.isdir(self.hls_dir):
+                entries = [
+                    os.path.join(self.hls_dir, f)
+                    for f in os.listdir(self.hls_dir)
+                    if f.endswith(".ts")
+                ]
+                if entries:
+                    seg_path = min(entries, key=lambda p: os.path.getmtime(p))
+                    break
+            time.sleep(0.2)
+
+        if seg_path is None:
+            log.debug("_update_subtitle_pts: no segment appeared for %s", self.channel.id)
+            return
+
+        start_pts = _probe_segment_start_pts(seg_path)
+        if start_pts is None or start_pts == 0:
+            log.debug(
+                "_update_subtitle_pts: start_pts=%s for %s — skipping update",
+                start_pts, self.channel.id,
+            )
+            return
+
+        log.debug(
+            "Channel %s: updating subtitle TIMESTAMP-MAP → MPEGTS:%d (%.3fs)",
+            self.channel.id, start_pts, start_pts / 90000,
+        )
+        for sub in self._subtitle_streamers.values():
+            if sub.is_running():
+                sub.update_timestamp_map(start_pts)
 
     def _kill(self):
         with self._lock:

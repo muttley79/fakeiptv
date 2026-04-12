@@ -7,9 +7,8 @@ services:
       - "${FAKEIPTV_PORT:-8080}:${FAKEIPTV_PORT:-8080}"
     env_file:
       - .env
-    # SYS_ADMIN is required for the entrypoint to mount the CIFS share inside the container
-    cap_add:
-      - SYS_ADMIN
+    # Privileged mode is required for mount.cifs to work inside Docker Desktop on Windows
+    privileged: true
     volumes:
       # Persistent metadata cache (SQLite durations + TMDB responses)
       - ./fakeiptv-cache:/cache

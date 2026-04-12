@@ -184,12 +184,20 @@ class SubtitleStreamer:
         inpoint = actual_inpoint if actual_inpoint is not None else now_playing.offset_sec
         idx = now_playing.entry_index
         cue_count = 0
+        entries_with_subs = 0
+        entries_without_subs = 0
+
+        log.debug(
+            "SubtitleStreamer._generate: channel=%s lang=%s entry_index=%d inpoint=%.3fs",
+            self._channel.id, self.lang or "und", idx, inpoint,
+        )
 
         while stream_pos < total_seconds:
             entry = entries[idx % n]
             srt_path = entry.subtitle_paths.get(self.lang, "")
 
             if srt_path and os.path.exists(srt_path):
+                entries_with_subs += 1
                 raw = _read_srt(srt_path)
                 cues = _parse_srt_cues(raw)
                 # Some SRTs use disc/absolute timestamps instead of
@@ -198,11 +206,14 @@ class SubtitleStreamer:
                 # Normalize by subtracting the minimum cue time so all
                 # timestamps become relative to the video file's start.
                 srt_offset = min((s for s, e, t in cues), default=0.0)
+                entry_cues_added = 0
+                entry_cues_skipped = 0
                 for start, end, text in cues:
                     # Shift cue into the stream timeline
                     s_adj = (start - srt_offset) - inpoint + stream_pos
                     e_adj = (end   - srt_offset) - inpoint + stream_pos
                     if e_adj <= 0:
+                        entry_cues_skipped += 1
                         continue   # cue entirely before our start
                     s_adj = max(0.0, s_adj)
                     if s_adj >= total_seconds:
@@ -212,6 +223,26 @@ class SubtitleStreamer:
                         f"{text}\n\n"
                     )
                     cue_count += 1
+                    entry_cues_added += 1
+                if entries_with_subs <= 3:
+                    # Log details only for the first few entries to avoid spam
+                    log.debug(
+                        "  [%s] %s: srt_offset=%.3fs, %d cues raw, %d added, %d skipped (stream_pos=%.1fs)",
+                        self.lang or "und", os.path.basename(srt_path),
+                        srt_offset, len(cues), entry_cues_added, entry_cues_skipped, stream_pos,
+                    )
+            else:
+                entries_without_subs += 1
+                if not srt_path:
+                    log.debug(
+                        "  [%s] entry %d (%s): no srt for this lang",
+                        self.lang or "und", idx % n, entry.title,
+                    )
+                elif not os.path.exists(srt_path):
+                    log.warning(
+                        "  [%s] entry %d (%s): srt path missing on disk: %s",
+                        self.lang or "und", idx % n, entry.title, srt_path,
+                    )
 
             remaining = entry.duration_sec - inpoint
             stream_pos += remaining
@@ -241,8 +272,10 @@ class SubtitleStreamer:
             )
 
         log.info(
-            "Subtitle track %s (%s): %d cues written",
+            "Subtitle track %s (%s): %d cues written "
+            "(entries with subs: %d, without: %d)",
             self.lang or "und", self._channel.id, cue_count,
+            entries_with_subs, entries_without_subs,
         )
 
 
@@ -435,6 +468,10 @@ class ChannelStreamer:
 
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()
+            log.debug(
+                "Channel %s: subtitle langs from entries: %s",
+                self.channel.id, subtitle_langs or "none",
+            )
             if subtitle_langs:
                 # Probe actual keyframe position so subtitle timestamps align with
                 # where ffmpeg actually starts decoding (keyframe snap with -c:v copy
@@ -446,6 +483,11 @@ class ChannelStreamer:
                     actual_inpoint = _probe_keyframe_inpoint(_first_entry.path, _nominal_inpoint)
                 else:
                     actual_inpoint = _nominal_inpoint
+                log.debug(
+                    "Channel %s: subtitle inpoint nominal=%.3fs actual=%.3fs (snap=%.3fs)",
+                    self.channel.id, _nominal_inpoint, actual_inpoint,
+                    _nominal_inpoint - actual_inpoint,
+                )
 
                 # External SRT files found: generate WebVTT + playlist in Python.
                 for lang in subtitle_langs:
@@ -454,8 +496,9 @@ class ChannelStreamer:
                     self._subtitle_streamers[lang] = sub
                 ready = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
                 log.info(
-                    "Channel %s: subtitle tracks ready: %s",
+                    "Channel %s: subtitle tracks ready: %s (failed: %s)",
                     self.channel.id, ready or "none",
+                    [l for l in subtitle_langs if l not in ready] or "none",
                 )
                 # No embedded sub mapping — external SRTs cover subtitles
                 sub_opts = []

@@ -365,6 +365,8 @@ def _find_subtitle_files(video_path: str) -> Dict[str, str]:
     plain = f"{base}.srt"
     if os.path.exists(plain) and "" not in result:
         result[""] = plain
+    if result:
+        log.debug("Subtitle files found for %s: %s", os.path.basename(video_path), list(result.keys()))
     return result
 
 

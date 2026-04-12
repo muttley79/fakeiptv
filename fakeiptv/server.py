@@ -152,6 +152,7 @@ def hls_manifest(channel_id: str):
     # On subsequent requests: check existence without waiting (fast path).
     # Drop any language whose manifest never appears (ffmpeg failed for it).
     subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
+    log.debug("hls_manifest %s: subtitle_langs from StreamManager: %s", channel_id, subtitle_langs or "none")
     ready_langs = []
     if subtitle_langs:
         # Check which manifests already exist (fast path for subsequent polls)
@@ -159,6 +160,7 @@ def hls_manifest(channel_id: str):
             lang for lang in subtitle_langs
             if os.path.exists(os.path.join(hls_dir, f"sub_{lang or 'und'}.m3u8"))
         ]
+        log.debug("hls_manifest %s: subtitle manifests already on disk: %s", channel_id, existing or "none")
         if existing:
             ready_langs = existing
         else:
@@ -177,6 +179,8 @@ def hls_manifest(channel_id: str):
                         lang_label, channel_id,
                     )
 
+    log.debug("hls_manifest %s: serving %s playlist (ready_langs=%s)",
+              channel_id, "master" if ready_langs else "simple video", ready_langs or "none")
     if ready_langs:
         content = _build_master_playlist(ready_langs)
     else:

@@ -10,6 +10,7 @@ it is automatically restarted with a freshly calculated concat file.
 
 CatchupManager handles on-demand VOD sessions for past programmes.
 """
+import json
 import logging
 import os
 import re
@@ -82,6 +83,50 @@ def _parse_srt_cues(text: str):
                     cues.append((start, end, text_part))
                 break
     return cues
+def _probe_keyframe_inpoint(path: str, inpoint: float) -> float:
+    """
+    Return the timestamp of the last video keyframe at or before `inpoint`.
+
+    When ffmpeg uses an ffconcat `inpoint` with -c:v copy it can only start
+    at a keyframe boundary.  If the nearest keyframe is N seconds before the
+    nominal inpoint, the video stream will start N seconds earlier than our
+    subtitle timings expect — causing subtitles to drift by up to the GOP
+    interval (can be 30 s on long-GOP HEVC content).
+
+    Probing once per channel start and passing the result to SubtitleStreamer
+    keeps VTT LOCAL timestamps aligned with the actual video PTS=0 frame.
+    """
+    if inpoint <= 0:
+        return 0.0
+    try:
+        start = max(0.0, inpoint - 60)
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,flags",
+            "-read_intervals", f"{start:.3f}%{inpoint + 0.5:.3f}",
+            path,
+        ], capture_output=True, text=True, timeout=15)
+        packets = json.loads(r.stdout).get("packets", [])
+        kf_times = [
+            float(p["pts_time"])
+            for p in packets
+            if p.get("flags", "").startswith("K")
+            and p.get("pts_time") not in (None, "N/A")
+        ]
+        candidates = [k for k in kf_times if k <= inpoint]
+        if candidates:
+            actual = max(candidates)
+            if abs(actual - inpoint) > 0.1:
+                log.debug(
+                    "Subtitle inpoint adjusted %.3f → %.3f (keyframe snap %.3fs)",
+                    inpoint, actual, inpoint - actual,
+                )
+            return actual
+    except Exception:
+        log.debug("_probe_keyframe_inpoint failed for %s @ %.3f", path, inpoint)
+    return inpoint
 
 
 class SubtitleStreamer:
@@ -109,9 +154,9 @@ class SubtitleStreamer:
         """True when the subtitle files were successfully generated."""
         return self._ok
 
-    def start(self, _empty_srt: str = ""):
+    def start(self, actual_inpoint: float = None):
         try:
-            self._generate()
+            self._generate(actual_inpoint)
             self._ok = True
         except Exception:
             log.exception(
@@ -123,7 +168,7 @@ class SubtitleStreamer:
     def stop(self):
         self._ok = False
 
-    def _generate(self):
+    def _generate(self, actual_inpoint: float = None):
         now_playing: Optional[NowPlaying] = get_now_playing(self._channel)
         if now_playing is None:
             raise RuntimeError("no now-playing")
@@ -134,7 +179,9 @@ class SubtitleStreamer:
 
         cue_lines: list = []
         stream_pos = 0.0          # seconds into the HLS stream
-        inpoint = now_playing.offset_sec   # where we start within the first entry
+        # Use the keyframe-probed inpoint if provided, otherwise the nominal
+        # schedule offset.  They differ by 0–GOP_interval seconds.
+        inpoint = actual_inpoint if actual_inpoint is not None else now_playing.offset_sec
         idx = now_playing.entry_index
         cue_count = 0
 
@@ -389,10 +436,21 @@ class ChannelStreamer:
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()
             if subtitle_langs:
+                # Probe actual keyframe position so subtitle timestamps align with
+                # where ffmpeg actually starts decoding (keyframe snap with -c:v copy
+                # can be 0–GOP_size seconds before the nominal inpoint).
+                _np = get_now_playing(self.channel)
+                _nominal_inpoint = _np.offset_sec if _np else 0.0
+                if _nominal_inpoint > 0 and _np:
+                    _first_entry = self.channel.entries[_np.entry_index]
+                    actual_inpoint = _probe_keyframe_inpoint(_first_entry.path, _nominal_inpoint)
+                else:
+                    actual_inpoint = _nominal_inpoint
+
                 # External SRT files found: generate WebVTT + playlist in Python.
                 for lang in subtitle_langs:
                     sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
-                    sub.start()
+                    sub.start(actual_inpoint=actual_inpoint)
                     self._subtitle_streamers[lang] = sub
                 ready = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
                 log.info(

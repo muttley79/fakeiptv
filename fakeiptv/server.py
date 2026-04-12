@@ -138,51 +138,32 @@ def hls_manifest(channel_id: str):
 
     _app_instance.stream_manager.touch(channel_id)
 
-    # Wait (up to 30s) for ffmpeg to produce its first segment.
+    # Wait (up to 30s) for ffmpeg to produce enough segments (READY_SEGMENTS).
     # Uses threading.Event — all concurrent requests for the same channel share
     # one event, so this does not create one thread per request.
     if not _app_instance.stream_manager.wait_ready(channel_id, timeout=30):
         abort(503)
 
+    # Wait for subtitle VTTs to be written with the correct X-TIMESTAMP-MAP.
+    # The first TS segment appears at ~2s; subtitle write completes at ~2.5s.
+    # wait_ready already blocks for ~6s (3 segments), so by the time we reach
+    # here the subtitle event is almost always already set — zero net delay.
+    # Timeout of 10s is a safety fallback; we still serve video if it expires.
+    _app_instance.stream_manager.wait_subtitle_ready(channel_id, timeout=10)
+
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
 
-    # If the channel has subtitle tracks, serve an HLS master playlist that
-    # references both the video rendition (video.m3u8) and subtitle playlists.
-    # On first request: wait up to 5s for each subtitle manifest to appear.
-    # On subsequent requests: check existence without waiting (fast path).
-    # Drop any language whose manifest never appears (ffmpeg failed for it).
+    # Build master playlist if subtitle tracks are available, otherwise serve
+    # the raw video manifest.  get_subtitle_languages() only returns languages
+    # whose VTT files have been written (is_running() == True), so we never
+    # reference a subtitle track whose file doesn't exist on disk yet.
     subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
-    log.debug("hls_manifest %s: subtitle_langs from StreamManager: %s", channel_id, subtitle_langs or "none")
-    ready_langs = []
-    if subtitle_langs:
-        # Check which manifests already exist (fast path for subsequent polls)
-        existing = [
-            lang for lang in subtitle_langs
-            if os.path.exists(os.path.join(hls_dir, f"sub_{lang or 'und'}.m3u8"))
-        ]
-        log.debug("hls_manifest %s: subtitle manifests already on disk: %s", channel_id, existing or "none")
-        if existing:
-            ready_langs = existing
-        else:
-            # First request: wait up to 5s for manifests to appear
-            deadline = time.time() + 5
-            for lang in subtitle_langs:
-                lang_label = lang or "und"
-                sub_path = os.path.join(hls_dir, f"sub_{lang_label}.m3u8")
-                while not os.path.exists(sub_path) and time.time() < deadline:
-                    time.sleep(0.1)
-                if os.path.exists(sub_path):
-                    ready_langs.append(lang)
-                else:
-                    log.warning(
-                        "Subtitle manifest sub_%s.m3u8 not ready for %s — omitting from master",
-                        lang_label, channel_id,
-                    )
+    log.debug("hls_manifest %s: subtitle_langs=%s", channel_id, subtitle_langs or "none")
 
-    log.debug("hls_manifest %s: serving %s playlist (ready_langs=%s)",
-              channel_id, "master" if ready_langs else "simple video", ready_langs or "none")
-    if ready_langs:
-        content = _build_master_playlist(ready_langs)
+    log.debug("hls_manifest %s: serving %s playlist",
+              channel_id, "master" if subtitle_langs else "simple video")
+    if subtitle_langs:
+        content = _build_master_playlist(subtitle_langs)
     else:
         manifest_path = os.path.join(hls_dir, "video.m3u8")
         with open(manifest_path, "r") as f:

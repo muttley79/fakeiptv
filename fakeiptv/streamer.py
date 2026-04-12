@@ -158,12 +158,21 @@ class SubtitleStreamer:
     """
     Generates a static WebVTT subtitle file + HLS playlist for one language.
 
-    Reads SRT files directly in Python (handling any encoding), adjusts cue
-    timestamps so t=0 matches the video stream's start, and writes:
-      sub_{lang}.vtt   — combined WebVTT for the ~4h concat window
-      sub_{lang}.m3u8  — VOD-style single-entry HLS playlist
+    Two-phase design to eliminate a race condition where the player downloads
+    the VTT before X-TIMESTAMP-MAP is corrected:
 
-    No ffmpeg process.  Instant generation.  Regenerates on channel restart.
+      Phase 1 — build_cues(inpoint):
+        Pure in-memory SRT parsing.  Returns (cue_lines, cue_count).
+        No file I/O.  Completes in < 100ms.  Called synchronously in _launch().
+
+      Phase 2 — write_files(cue_lines, cue_count, start_pts):
+        Writes sub_{lang}.vtt with the correct X-TIMESTAMP-MAP=MPEGTS:{start_pts}
+        and sub_{lang}.m3u8.  Called from an async thread once the first HLS
+        segment has been probed for its start PTS (typically ~2 s after launch).
+
+    The server waits for a _subtitle_ready_event (set after Phase 2) before
+    serving the master playlist, but since wait_ready already blocks for 3
+    video segments (~6 s), the subtitle wait adds zero net startup delay.
     """
 
     def __init__(self, channel: Channel, lang: str, hls_dir: str):
@@ -176,58 +185,56 @@ class SubtitleStreamer:
         self._ok = False
 
     def is_running(self) -> bool:
-        """True when the subtitle files were successfully generated."""
+        """True when the subtitle files have been written with a correct TIMESTAMP-MAP."""
         return self._ok
 
-    def start(self, actual_inpoint: float = None):
-        try:
-            cue_count = self._generate(actual_inpoint)
-            if cue_count == 0:
-                log.warning(
-                    "SubtitleStreamer (%s, %s): 0 cues in current window — "
-                    "track will be omitted from master playlist",
-                    self._channel.id, self.lang or "und",
-                )
-                self._ok = False
-            else:
-                self._ok = True
-        except Exception:
-            log.exception(
-                "SubtitleStreamer (%s, %s): generation failed",
-                self._channel.id, self.lang or "und",
+    def build_cues(self, inpoint: float):
+        """
+        Phase 1: parse SRT files, return (cue_lines, cue_count).
+        No file writes.  Safe to call synchronously in _launch().
+        """
+        return self._generate(inpoint)
+
+    def write_files(self, cue_lines: list, cue_count: int, start_pts: int):
+        """
+        Phase 2: write VTT + manifest to disk with the correct TIMESTAMP-MAP.
+        Called after the first HLS segment's start_pts is known.
+        """
+        total_seconds = CONCAT_HOURS * 3600
+        with open(self.vtt_path, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\n")
+            f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
+            f.writelines(cue_lines)
+
+        vtt_name = os.path.basename(self.vtt_path)
+        with open(self.manifest_path, "w", encoding="utf-8") as f:
+            f.write(
+                "#EXTM3U\n"
+                "#EXT-X-TARGETDURATION:14400\n"
+                "#EXT-X-VERSION:3\n"
+                "#EXT-X-MEDIA-SEQUENCE:0\n"
+                f"#EXTINF:{total_seconds:.1f},\n"
+                f"{vtt_name}\n"
+                "#EXT-X-ENDLIST\n"
             )
+
+        if cue_count > 0:
+            self._ok = True
+            log.debug(
+                "Subtitle track %s (%s): files written, MPEGTS:%d (%.3fs)",
+                self.lang or "und", self._channel.id, start_pts, start_pts / 90000,
+            )
+        else:
             self._ok = False
 
     def stop(self):
         self._ok = False
 
-    def update_timestamp_map(self, start_pts: int):
+    def _generate(self, inpoint: float = None):
         """
-        Rewrite X-TIMESTAMP-MAP in the VTT to use the actual MPEG-TS starting PTS.
-
-        Called once the first HLS segment is available and its start_pts is known.
-        With -c:v copy, ffmpeg preserves source timestamps so PTS never starts at 0;
-        using the real start_pts makes the player sync VTT cues to the correct position.
+        Parse SRT files and return (cue_lines, cue_count).
+        Pure in-memory — no file I/O.  Called by build_cues().
         """
-        try:
-            with open(self.vtt_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            updated = content.replace(
-                "X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000",
-                f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000",
-                1,
-            )
-            if updated != content:
-                with open(self.vtt_path, "w", encoding="utf-8") as f:
-                    f.write(updated)
-                log.debug(
-                    "Updated TIMESTAMP-MAP in %s → MPEGTS:%d (%.3fs)",
-                    os.path.basename(self.vtt_path), start_pts, start_pts / 90000,
-                )
-        except Exception as exc:
-            log.warning("Failed to update TIMESTAMP-MAP in %s: %s", self.vtt_path, exc)
-
-    def _generate(self, actual_inpoint: float = None):
         now_playing: Optional[NowPlaying] = get_now_playing(self._channel)
         if now_playing is None:
             raise RuntimeError("no now-playing")
@@ -237,10 +244,9 @@ class SubtitleStreamer:
         total_seconds = CONCAT_HOURS * 3600
 
         cue_lines: list = []
-        stream_pos = 0.0          # seconds into the HLS stream
-        # Use the keyframe-probed inpoint if provided, otherwise the nominal
-        # schedule offset.  They differ by 0–GOP_interval seconds.
-        inpoint = actual_inpoint if actual_inpoint is not None else now_playing.offset_sec
+        stream_pos = 0.0
+        if inpoint is None:
+            inpoint = now_playing.offset_sec
         idx = now_playing.entry_index
         cue_count = 0
         entries_with_subs = 0
@@ -259,24 +265,21 @@ class SubtitleStreamer:
                 entries_with_subs += 1
                 raw = _read_srt(srt_path)
                 cues = _parse_srt_cues(raw)
-                # Some SRTs use disc/absolute timestamps instead of
-                # file-relative ones (e.g. episode at 02:30:00 on disc has
-                # cues starting at 02:30:04 rather than 00:00:04).
-                # Normalize by subtracting the minimum cue time so all
-                # timestamps become relative to the video file's start.
+                # Some SRTs use disc/absolute timestamps (e.g. episode at 02:30:00
+                # on disc has cues starting at 02:30:04 rather than 00:00:04).
+                # Normalize by subtracting the minimum cue time.
                 srt_offset = min((s for s, e, t in cues), default=0.0)
                 entry_cues_added = 0
                 entry_cues_skipped = 0
                 for start, end, text in cues:
-                    # Shift cue into the stream timeline
                     s_adj = (start - srt_offset) - inpoint + stream_pos
                     e_adj = (end   - srt_offset) - inpoint + stream_pos
                     if e_adj <= 0:
                         entry_cues_skipped += 1
-                        continue   # cue entirely before our start
+                        continue
                     s_adj = max(0.0, s_adj)
                     if s_adj >= total_seconds:
-                        break      # past the window
+                        break
                     cue_lines.append(
                         f"{_sec_to_vtt_ts(s_adj)} --> {_sec_to_vtt_ts(e_adj)}\n"
                         f"{text}\n\n"
@@ -284,7 +287,6 @@ class SubtitleStreamer:
                     cue_count += 1
                     entry_cues_added += 1
                 if entries_with_subs <= 3:
-                    # Log details only for the first few entries to avoid spam
                     log.debug(
                         "  [%s] %s: srt_offset=%.3fs, %d cues raw, %d added, %d skipped (stream_pos=%.1fs)",
                         self.lang or "und", os.path.basename(srt_path),
@@ -308,35 +310,13 @@ class SubtitleStreamer:
             inpoint = 0.0
             idx += 1
 
-        # WebVTT file
-        # X-TIMESTAMP-MAP aligns VTT time 0 with MPEG-TS PTS 0
-        # (video stream starts at PTS 0 due to -avoid_negative_ts make_zero)
-        with open(self.vtt_path, "w", encoding="utf-8") as f:
-            f.write("WEBVTT\n")
-            f.write("X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n")
-            f.writelines(cue_lines)
-
-        # VOD-style HLS playlist — single segment pointing to the VTT file.
-        # The player downloads the full file and seeks within it.
-        vtt_name = os.path.basename(self.vtt_path)
-        with open(self.manifest_path, "w", encoding="utf-8") as f:
-            f.write(
-                "#EXTM3U\n"
-                "#EXT-X-TARGETDURATION:14400\n"
-                "#EXT-X-VERSION:3\n"
-                "#EXT-X-MEDIA-SEQUENCE:0\n"
-                f"#EXTINF:{total_seconds:.1f},\n"
-                f"{vtt_name}\n"
-                "#EXT-X-ENDLIST\n"
-            )
-
         log.info(
-            "Subtitle track %s (%s): %d cues written "
+            "Subtitle track %s (%s): %d cues built "
             "(entries with subs: %d, without: %d)",
             self.lang or "und", self._channel.id, cue_count,
             entries_with_subs, entries_without_subs,
         )
-        return cue_count
+        return cue_lines, cue_count
 
 
 class ChannelStreamer:
@@ -365,6 +345,10 @@ class ChannelStreamer:
         self.manifest_path = os.path.join(self.hls_dir, "video.m3u8")
         self.concat_path = os.path.join(self.hls_dir, "concat.txt")
         self._subtitle_streamers: Dict[str, SubtitleStreamer] = {}
+        # Set once subtitle VTTs have been written with the correct TIMESTAMP-MAP.
+        # The server waits on this before serving the master playlist so the player
+        # always gets a VTT that has the right MPEGTS anchor (never MPEGTS:0).
+        self._subtitle_ready_event = threading.Event()
 
     # ------------------------------------------------------------------
     # Public API
@@ -415,6 +399,16 @@ class ChannelStreamer:
         no per-request polling loops.  Returns True if ready within timeout.
         """
         return self._ready_event.wait(timeout=timeout)
+
+    def wait_subtitle_ready(self, timeout: float = 10.0) -> bool:
+        """
+        Block until subtitle VTTs have been written (or timeout expires).
+        Returns True if ready.  Always returns True for channels without SRTs
+        (event is set immediately in _launch()).  Called after wait_ready() so
+        the wait is typically already satisfied (subtitle write finishes in ~2s,
+        wait_ready blocks for ~6s).
+        """
+        return self._subtitle_ready_event.wait(timeout=timeout)
 
     def _watch_ready(self):
         """Background thread: set _ready_event once enough segments are buffered.
@@ -550,48 +544,50 @@ class ChannelStreamer:
 
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()
+            self._subtitle_ready_event.clear()
             log.debug(
                 "Channel %s: subtitle langs from entries: %s",
                 self.channel.id, subtitle_langs or "none",
             )
             if subtitle_langs:
-                # Generate VTTs synchronously — pure Python string processing,
-                # completes in < 100ms regardless of file count or NAS speed.
-                # This populates _subtitle_streamers before ffmpeg starts so the
-                # server can build a master playlist on the very first request,
-                # eliminating the race condition where the player gets a no-subtitle
-                # playlist because VTT generation hadn't finished yet.
-                #
-                # We use the nominal inpoint (schedule position) rather than the
-                # keyframe-snapped position.  The potential drift (0 – GOP seconds)
-                # is acceptable; subtitles will appear at roughly the right time and
-                # the X-TIMESTAMP-MAP is updated asynchronously once the first
-                # TS segment is available.
+                # Phase 1 — synchronous: parse all SRT files, build cue lists in memory.
+                # Pure Python; completes in < 100ms regardless of NAS speed.
+                # Populates _subtitle_streamers so get_subtitle_languages() returns
+                # the correct set on the very first server request.
                 np_now = get_now_playing(self.channel)
                 nominal_inpoint = np_now.offset_sec if np_now else 0.0
+                pending: Dict[str, tuple] = {}   # lang → (SubtitleStreamer, cue_lines, cue_count)
                 for lang in subtitle_langs:
                     sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
-                    sub.start(actual_inpoint=nominal_inpoint)
-                    self._subtitle_streamers[lang] = sub
+                    try:
+                        cue_lines, cue_count = sub.build_cues(nominal_inpoint)
+                    except Exception:
+                        log.exception("SubtitleStreamer build_cues failed (%s, %s)",
+                                      self.channel.id, lang or "und")
+                        cue_lines, cue_count = [], 0
+                    pending[lang] = (sub, cue_lines, cue_count)
+                    self._subtitle_streamers[lang] = sub  # registered; _ok still False
 
-                ready_langs = [l for l, s in self._subtitle_streamers.items() if s.is_running()]
-                log.info(
-                    "Channel %s: subtitle tracks generated: %s (no cues: %s)",
-                    self.channel.id, ready_langs or "none",
-                    [l for l in subtitle_langs if l not in ready_langs] or "none",
+                log.debug(
+                    "Channel %s: subtitle cue building done — langs: %s",
+                    self.channel.id, list(pending),
                 )
 
-                # Async: wait for first TS segment and fix X-TIMESTAMP-MAP if
-                # the stream PTS doesn't start at exactly 0 (common with HEVC).
+                # Phase 2 — async: wait for first TS segment, probe start_pts,
+                # write VTT files with correct X-TIMESTAMP-MAP=MPEGTS:{start_pts}.
+                # Sets _subtitle_ready_event when done so the server can serve the
+                # master playlist with the correct subtitle tracks.
                 threading.Thread(
-                    target=self._update_subtitle_pts,
+                    target=self._write_subtitle_files_async,
+                    args=(pending,),
                     daemon=True,
-                    name=f"sub-pts-{self.channel.id}",
+                    name=f"sub-write-{self.channel.id}",
                 ).start()
                 # No embedded sub mapping — external SRTs cover subtitles
                 sub_opts = []
             else:
                 # No external SRTs: try embedded text subtitles via the video process.
+                self._subtitle_ready_event.set()   # no subs → immediately ready
                 sub_opts = ["-map", "0:s:0?", "-c:s", "webvtt"] if self._subtitles else []
 
             seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
@@ -636,41 +632,59 @@ class ChannelStreamer:
             )
 
 
-    def _update_subtitle_pts(self):
-        """Wait for first TS segment, probe start_pts, fix X-TIMESTAMP-MAP in all VTTs."""
+    def _write_subtitle_files_async(self, pending: dict):
+        """
+        Phase 2 of subtitle generation (background thread).
+
+        Waits for the first HLS TS segment to appear, probes its start_pts
+        (the actual MPEG-TS PTS at stream start — non-zero for HEVC with
+        B-frames even after -avoid_negative_ts make_zero), then writes all
+        VTT files with X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000.
+
+        Because wait_ready already blocks the server for ~6s (3 segments),
+        and the first segment appears at ~2s, this thread finishes well before
+        the server returns the first manifest.  Zero net startup delay.
+        """
+        # Wait for the first TS segment (up to 30s)
         deadline = time.time() + 30
         seg_path = None
-        while time.time() < deadline:
+        while time.time() < deadline and not self._stop_event.is_set():
             if os.path.isdir(self.hls_dir):
-                entries = [
+                ts_files = [
                     os.path.join(self.hls_dir, f)
                     for f in os.listdir(self.hls_dir)
                     if f.endswith(".ts")
                 ]
-                if entries:
-                    seg_path = min(entries, key=lambda p: os.path.getmtime(p))
+                if ts_files:
+                    # Pick the earliest-written segment (lowest mtime = seg0)
+                    seg_path = min(ts_files, key=os.path.getmtime)
                     break
-            time.sleep(0.2)
+            time.sleep(0.1)
 
         if seg_path is None:
-            log.debug("_update_subtitle_pts: no segment appeared for %s", self.channel.id)
-            return
-
-        start_pts = _probe_segment_start_pts(seg_path)
-        if start_pts is None or start_pts == 0:
+            log.warning("_write_subtitle_files_async: no TS segment for %s — using MPEGTS:0",
+                        self.channel.id)
+            start_pts = 0
+        else:
+            start_pts = _probe_segment_start_pts(seg_path) or 0
             log.debug(
-                "_update_subtitle_pts: start_pts=%s for %s — skipping update",
-                start_pts, self.channel.id,
+                "Channel %s: subtitle TIMESTAMP-MAP → MPEGTS:%d (%.3fs)",
+                self.channel.id, start_pts, start_pts / 90000,
             )
-            return
 
-        log.debug(
-            "Channel %s: updating subtitle TIMESTAMP-MAP → MPEGTS:%d (%.3fs)",
-            self.channel.id, start_pts, start_pts / 90000,
-        )
-        for sub in self._subtitle_streamers.values():
+        # Write VTT files now that we have the correct start_pts
+        ready_langs = []
+        for lang, (sub, cue_lines, cue_count) in pending.items():
+            sub.write_files(cue_lines, cue_count, start_pts)
             if sub.is_running():
-                sub.update_timestamp_map(start_pts)
+                ready_langs.append(lang)
+
+        log.info(
+            "Channel %s: subtitle tracks ready: %s (no cues: %s)",
+            self.channel.id, ready_langs or "none",
+            [l for l in pending if l not in ready_langs] or "none",
+        )
+        self._subtitle_ready_event.set()
 
     def _kill(self):
         with self._lock:
@@ -901,13 +915,24 @@ class StreamManager:
             self._channel_order = list(channels.keys())
 
     def get_subtitle_languages(self, ch_id: str):
-        """Return sorted list of subtitle language codes whose ffmpeg is still running."""
+        """Return sorted list of subtitle language codes that have VTT files written."""
         s = self._streamers.get(ch_id)
         if s is None:
             return []
         return sorted(
             lang for lang, sub in s._subtitle_streamers.items() if sub.is_running()
         )
+
+    def wait_subtitle_ready(self, ch_id: str, timeout: float = 10.0) -> bool:
+        """
+        Block until subtitle files are written for ch_id.
+        Returns True if ready within timeout.  Safe to call even if the
+        channel has no subtitle tracks (event is set immediately in that case).
+        """
+        s = self._streamers.get(ch_id)
+        if s is None:
+            return True
+        return s.wait_subtitle_ready(timeout)
 
     def has_active_streamers(self) -> bool:
         """True if any channel is currently running."""

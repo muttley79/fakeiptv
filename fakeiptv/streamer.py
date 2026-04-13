@@ -230,6 +230,34 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
     return inpoint
 
 
+_LATIN_RUN_RE = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[ \'-][A-Za-z][A-Za-z0-9]*)*')
+
+
+def _he_bidi_fix(line: str) -> str:
+    """
+    Fix Hebrew RTL display in ExoPlayer-based players (Televizo, Stremio Android).
+
+    Two transforms applied to each cue line:
+
+    1. Prepend U+200F (RLM, RIGHT-TO-LEFT MARK) — zero-width character that
+       forces the paragraph base direction to RTL.  Without it, ExoPlayer may
+       guess LTR when the line starts with a boundary-neutral char (dash, quote,
+       digit), which puts terminal punctuation on the wrong visual side.
+
+    2. Wrap each Latin run with U+2066 … U+2069 (LRI … PDI, Left-to-Right
+       Isolate / Pop Directional Isolate).  English words inside Hebrew create
+       LTR bidi runs; ExoPlayer treats run boundaries as word-wrap points,
+       splitting one subtitle cue across two visual lines.  LRI/PDI isolates
+       the English segment so surrounding Hebrew sees it as a single opaque
+       RTL unit, eliminating the rogue break points.
+    """
+    RLM = '\u200F'
+    LRI = '\u2066'
+    PDI = '\u2069'
+    fixed = _LATIN_RUN_RE.sub(lambda m: LRI + m.group() + PDI, line)
+    return RLM + fixed
+
+
 class SubtitleStreamer:
     """
     Generates a static WebVTT subtitle file + HLS playlist for one language.
@@ -280,6 +308,18 @@ class SubtitleStreamer:
         with open(self.vtt_path, "w", encoding="utf-8") as f:
             f.write("WEBVTT\n")
             f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
+            # Per-track CSS: transparent background + 1px outline stroke.
+            # Four-direction zero-blur text-shadow creates a clean outline.
+            cue_style = (
+                "  background-color: transparent;\n"
+                "  text-shadow: 1px 0 0 #000, -1px 0 0 #000, 0 1px 0 #000, 0 -1px 0 #000;\n"
+            )
+            if self.lang == "he":
+                # Explicit RTL direction for ExoPlayer versions that respect
+                # ::cue CSS — belt-and-suspenders alongside the RLM prepend in
+                # _he_bidi_fix.
+                cue_style += "  direction: rtl;\n"
+            f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
             f.writelines(cue_lines)
 
         vtt_name = os.path.basename(self.vtt_path)
@@ -367,6 +407,8 @@ class SubtitleStreamer:
                     s_adj = max(0.0, s_adj)
                     if s_adj >= total_seconds:
                         break
+                    if self.lang == "he":
+                        text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
                     cue_lines.append(
                         f"{_sec_to_vtt_ts(s_adj)} --> {_sec_to_vtt_ts(e_adj)}\n"
                         f"{text}\n\n"

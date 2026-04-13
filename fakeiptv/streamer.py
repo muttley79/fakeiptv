@@ -123,13 +123,14 @@ def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
     """
     Prime the NAS SMB disk cache for a seek to `inpoint` in `path`.
 
-    MKV seeking requires two disk regions that are cold on first access:
-      1. The Cues element — stored near the end of the file after mkvmerge.
-      2. The cluster at the target timestamp — proportional to inpoint/duration.
+    MKV seeking requires three disk regions that are cold on first access:
+      1. The file header — ffmpeg reads this first when opening any container.
+      2. The Cues element — stored near the end of the file after mkvmerge.
+      3. The cluster at the target timestamp — proportional to inpoint/duration.
 
-    Reading 256 KB from each region is ~50ms on a warm LAN connection and puts
-    both areas into the NAS RAM cache.  Subsequent accesses by ffmpeg and ffprobe
-    then complete in <100ms instead of the 2-4s each would take from cold disk.
+    Reading these regions is ~100ms on a warm LAN connection and puts all areas
+    into the NAS RAM cache.  Subsequent accesses by ffmpeg and ffprobe then
+    complete in <100ms instead of the 2-10s each would take from cold disk.
 
     Called once from _launch() (before Popen) and once from _probe_keyframe_inpoint
     (before ffprobe); the second call is nearly free because the cache is already warm.
@@ -138,15 +139,20 @@ def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
         return
     try:
         file_size = os.path.getsize(path)
-        WARM = 256 * 1024  # 256 KB per region
+        HEAD = 65536        # 64 KB — file header + EBML SeekHead
+        WARM = 512 * 1024   # 512 KB per seek region (wider window for estimation error)
         with open(path, 'rb') as f:
-            # Region 1: file tail — Cues element lives here after mkvmerge
-            f.seek(max(0, file_size - WARM))
+            # Region 1: file header — ffmpeg reads this to detect the container format
+            # and parse the SeekHead.  Not otherwise prewarmed.
+            f.read(HEAD)
+            # Region 2: file tail — Cues element lives here after mkvmerge
+            f.seek(max(HEAD, file_size - WARM))
             f.read(WARM)
-            # Region 2: estimated cluster for inpoint.
+            # Region 3: estimated cluster for inpoint.
             # bytes_per_sec derived from known duration and file size.
+            # Read WARM bytes centred on the estimate to absorb bitrate variance.
             bps = file_size / entry_duration
-            cluster_pos = max(0, int(inpoint * bps) - WARM // 2)
+            cluster_pos = max(HEAD, int(inpoint * bps) - WARM // 2)
             if cluster_pos < file_size - WARM * 2:
                 f.seek(cluster_pos)
                 f.read(WARM)
@@ -834,7 +840,7 @@ class ChannelStreamer:
         #     reasonable NAS latency while failing fast on genuinely broken files.
         #   RUNNING_TIMEOUT — how long to wait for the NEXT segment once the channel is
         #     already running.  A 30s gap mid-stream is a genuine stall.
-        STARTUP_TIMEOUT = 10
+        STARTUP_TIMEOUT = 20
         RUNNING_TIMEOUT = 30
         while not self._stop_event.is_set():
             proc = self._process
@@ -859,7 +865,7 @@ class ChannelStreamer:
                         if not os.path.exists(self.manifest_path):
                             log.warning(
                                 "Channel %s stalled with no output after %ds — restarting ffmpeg",
-                                self.channel.id, STARTUP_TIMEOUT,
+                                self.channel.id, timeout,
                             )
                         else:
                             log.warning(

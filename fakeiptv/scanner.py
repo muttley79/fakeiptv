@@ -63,7 +63,6 @@ class Movie:
     has_embedded_subs: bool = False
     is_hdr: bool = False
 
-
 @dataclass
 class Show:
     name: str
@@ -126,6 +125,7 @@ class DurationCache:
             "ADD COLUMN audio_codec TEXT NOT NULL DEFAULT ''",
             "ADD COLUMN has_embedded_subs INTEGER NOT NULL DEFAULT -1",
             "ADD COLUMN is_hdr INTEGER NOT NULL DEFAULT -1",
+            "ADD COLUMN slow_seek INTEGER NOT NULL DEFAULT -1",  # kept for schema compat, unused
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE durations {col_def}")
@@ -170,7 +170,7 @@ class DurationCache:
         return info[0] if info is not None else None
 
     def set(self, path: str, duration: float):
-        self.set_info(path, duration, "", False)
+        self.set_info(path, duration, "", False, False)
 
 
 # ---------------------------------------------------------------------------

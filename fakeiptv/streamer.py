@@ -30,6 +30,13 @@ log = logging.getLogger(__name__)
 # (prewarm) don't thrash the NAS with 30+ ffprobe processes at once.
 _keyframe_probe_sem = threading.Semaphore(3)
 
+# Files whose keyframe probe timed out recently: path → unix timestamp of failure.
+# When a channel restarts within seconds of a timeout (e.g. startup stall → restart)
+# we skip the re-probe immediately instead of wasting another timeout window.
+# TTL = 60s; after that the file gets a fresh probe attempt.
+_keyframe_probe_failures: Dict[str, float] = {}
+_KEYFRAME_PROBE_FAIL_TTL = 60.0   # seconds
+
 HLS_SEGMENT_SECONDS = 2
 HLS_LIST_SIZE = 15         # sliding window — keep 15 × 2s segments (~30s of buffer)
 CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
@@ -112,7 +119,43 @@ def _probe_segment_start_pts(seg_path: str) -> Optional[int]:
     return None
 
 
-def _probe_keyframe_inpoint(path: str, inpoint: float) -> float:
+def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
+    """
+    Prime the NAS SMB disk cache for a seek to `inpoint` in `path`.
+
+    MKV seeking requires two disk regions that are cold on first access:
+      1. The Cues element — stored near the end of the file after mkvmerge.
+      2. The cluster at the target timestamp — proportional to inpoint/duration.
+
+    Reading 256 KB from each region is ~50ms on a warm LAN connection and puts
+    both areas into the NAS RAM cache.  Subsequent accesses by ffmpeg and ffprobe
+    then complete in <100ms instead of the 2-4s each would take from cold disk.
+
+    Called once from _launch() (before Popen) and once from _probe_keyframe_inpoint
+    (before ffprobe); the second call is nearly free because the cache is already warm.
+    """
+    if inpoint <= 0 or entry_duration <= 0:
+        return
+    try:
+        file_size = os.path.getsize(path)
+        WARM = 256 * 1024  # 256 KB per region
+        with open(path, 'rb') as f:
+            # Region 1: file tail — Cues element lives here after mkvmerge
+            f.seek(max(0, file_size - WARM))
+            f.read(WARM)
+            # Region 2: estimated cluster for inpoint.
+            # bytes_per_sec derived from known duration and file size.
+            bps = file_size / entry_duration
+            cluster_pos = max(0, int(inpoint * bps) - WARM // 2)
+            if cluster_pos < file_size - WARM * 2:
+                f.seek(cluster_pos)
+                f.read(WARM)
+    except Exception:
+        pass  # non-fatal — ffmpeg/ffprobe will just be slower on cold cache
+
+
+def _probe_keyframe_inpoint(path: str, inpoint: float,
+                            entry_duration: float = 0.0) -> float:
     """
     Return the timestamp of the last video keyframe at or before `inpoint`.
 
@@ -124,12 +167,31 @@ def _probe_keyframe_inpoint(path: str, inpoint: float) -> float:
 
     Probing once per channel start and passing the result to SubtitleStreamer
     keeps VTT LOCAL timestamps aligned with the actual video PTS=0 frame.
+
+    Pre-warms the NAS SMB cache before calling ffprobe.  MKV seeking requires
+    two disk regions: the Cues element (end of file) and the cluster at the
+    target position.  Cold cache on a spinning-disk NAS makes each region read
+    take 2-4s; a 256 KB pre-read per region brings both into cache so ffprobe
+    completes in <1s rather than timing out.
     """
     if inpoint <= 0:
         return 0.0
+
+    # Skip probe if this file timed out recently — we'd get the same result
+    # (nominal inpoint) but waste the full timeout again for nothing.
+    now = time.time()
+    last_fail = _keyframe_probe_failures.get(path, 0.0)
+    if now - last_fail < _KEYFRAME_PROBE_FAIL_TTL:
+        log.debug("_probe_keyframe_inpoint: skipping %s (failed %.0fs ago)", path, now - last_fail)
+        return inpoint
+
     # Serialise concurrent probes to avoid thrashing the NAS when many
     # channels start simultaneously (prewarm).  Max 3 probes at a time.
     with _keyframe_probe_sem:
+        # Pre-warm the NAS cache at the seek target so ffprobe completes fast.
+        # (_launch already called _nas_prewarm; this second call is nearly free.)
+        _nas_prewarm(path, inpoint, entry_duration)
+
         try:
             start = max(0.0, inpoint - 30)
             r = subprocess.run([
@@ -158,6 +220,7 @@ def _probe_keyframe_inpoint(path: str, inpoint: float) -> float:
                 return actual
         except Exception as exc:
             log.debug("_probe_keyframe_inpoint failed for %s @ %.3f: %s", path, inpoint, exc)
+            _keyframe_probe_failures[path] = time.time()
     return inpoint
 
 
@@ -593,6 +656,14 @@ class ChannelStreamer:
                 self._subtitle_ready_event.set()   # no subs → immediately ready
                 sub_opts = ["-map", "0:s:0?", "-c:s", "webvtt"] if self._subtitles else []
 
+            # Pre-warm the NAS disk cache at the seek target before starting
+            # ffmpeg.  Without this, cold-cache seeks to deep positions (e.g.
+            # 83 min into a 30 GB BluRay) take 5-10s over SMB, exhausting the
+            # STARTUP_TIMEOUT and causing a needless restart from entry beginning.
+            np = get_now_playing(self.channel)
+            if np and np.offset_sec > 0 and np.entry:
+                _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
+
             seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
             cmd = [
                 "ffmpeg",
@@ -665,8 +736,11 @@ class ChannelStreamer:
         actual_inpoint = nominal_inpoint
         if nominal_inpoint > 0 and np_now is not None:
             entry_path = np_now.entry.path if np_now.entry else None
+            entry_duration = np_now.entry.duration_sec if np_now.entry else 0.0
             if entry_path:
-                actual_inpoint = _probe_keyframe_inpoint(entry_path, nominal_inpoint)
+                actual_inpoint = _probe_keyframe_inpoint(
+                    entry_path, nominal_inpoint, entry_duration
+                )
 
         pending: Dict[str, tuple] = {}
         for lang in subtitle_langs:
@@ -754,7 +828,14 @@ class ChannelStreamer:
             return 0.0
 
     def _monitor(self):
-        STALL_TIMEOUT = 30  # kill ffmpeg if no new segment for 30s (gives NAS time to recover)
+        # Two-tier stall detection:
+        #   STARTUP_TIMEOUT — how long to wait for the FIRST segment.  Files with a
+        #     proper seek index (MKV Cues / MP4 moov) start in 2-3s.  10s allows
+        #     reasonable NAS latency while failing fast on genuinely broken files.
+        #   RUNNING_TIMEOUT — how long to wait for the NEXT segment once the channel is
+        #     already running.  A 30s gap mid-stream is a genuine stall.
+        STARTUP_TIMEOUT = 10
+        RUNNING_TIMEOUT = 30
         while not self._stop_event.is_set():
             proc = self._process
             if proc is None:
@@ -770,13 +851,21 @@ class ChannelStreamer:
                 if ret is not None:
                     break
                 now = time.time()
-                if now - last_check >= STALL_TIMEOUT:
+                # Use the longer startup timeout until the manifest exists (first segment written)
+                timeout = RUNNING_TIMEOUT if os.path.exists(self.manifest_path) else STARTUP_TIMEOUT
+                if now - last_check >= timeout:
                     mtime = self._get_manifest_mtime()
                     if mtime == last_mtime:
-                        log.warning(
-                            "Channel %s stalled — no new segments in %ds, restarting ffmpeg",
-                            self.channel.id, STALL_TIMEOUT
-                        )
+                        if not os.path.exists(self.manifest_path):
+                            log.warning(
+                                "Channel %s stalled with no output after %ds — restarting ffmpeg",
+                                self.channel.id, STARTUP_TIMEOUT,
+                            )
+                        else:
+                            log.warning(
+                                "Channel %s stalled — no new segments in %ds, restarting ffmpeg",
+                                self.channel.id, RUNNING_TIMEOUT,
+                            )
                         self._kill()
                         break
                     last_mtime = mtime

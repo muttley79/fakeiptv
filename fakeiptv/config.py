@@ -30,7 +30,7 @@ class ServerConfig:
     prewarm_session: bool = False  # keep all channels alive until X seconds after last activity
     prewarm_adjacent: int = 0     # warm N channels on each side of the watched channel (0 = off)
     prewarm_timeout: int = 120   # seconds before a pre-warmed-only channel is stopped
-    ready_segments: int = 3      # segments buffered before a channel is declared ready
+    ready_segments: int = 1      # segments buffered before a channel is declared ready
 
 
 @dataclass
@@ -108,7 +108,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         prewarm_session=_env_bool("FAKEIPTV_PREWARM_SESSION", server_raw.get("prewarm_session", False)),
         prewarm_adjacent=_env_int("FAKEIPTV_PREWARM_ADJACENT", int(server_raw.get("prewarm_adjacent", 0))),
         prewarm_timeout=_env_int("FAKEIPTV_PREWARM_TIMEOUT", int(server_raw.get("prewarm_timeout", 120))),
-        ready_segments=_env_int("FAKEIPTV_READY_SEGMENTS", int(server_raw.get("ready_segments", 3))),
+        ready_segments=_env_int("FAKEIPTV_READY_SEGMENTS", int(server_raw.get("ready_segments", 1))),
     )
     metadata = MetadataConfig(
         tmdb_api_key=_env("FAKEIPTV_TMDB_API_KEY", meta_raw.get("tmdb_api_key", "")),

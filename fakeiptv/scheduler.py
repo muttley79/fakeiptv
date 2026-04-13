@@ -116,7 +116,7 @@ def build_channels(
                           group: str = "Shows") -> None:
         if ch_id in disabled or not shows:
             return
-        entries = _interleave_shows(shows)
+        entries = _interleave_shows(shows, ch_id)
         if entries:
             channels[ch_id] = Channel(
                 id=ch_id, name=rename.get(ch_id, default_name),
@@ -180,6 +180,16 @@ def build_channels(
             )
             claimed_movies.update(m.title for m in unclaimed)
 
+        # Movie Hits — high-rated movies (non-exclusive: can overlap genre channels)
+        hit_movies = [m for m in library.movies if m.rating >= hits_rating]
+        if hit_movies and "movie-hits" not in disabled:
+            entries = [_movie_to_entry(m) for m in hit_movies]
+            channels["movie-hits"] = Channel(
+                id="movie-hits", name=rename.get("movie-hits", "Movie Hits"),
+                group="Movies", entries=entries,
+            )
+            log.info("Movie Hits channel: %d movies with rating ≥ %.1f", len(hit_movies), hits_rating)
+
         remaining = [m for m in library.movies if m.title not in claimed_movies]
         if remaining and "movies" not in disabled:
             entries = [_movie_to_entry(m) for m in remaining]
@@ -236,13 +246,17 @@ def _movie_to_entry(movie: Movie) -> ScheduleEntry:
     )
 
 
-def _interleave_shows(shows: List[Show]) -> List[ScheduleEntry]:
+def _interleave_shows(shows: List[Show], channel_id: str = "") -> List[ScheduleEntry]:
     """
     Round-robin episodes across shows so the mix alternates between them.
 
     Each show's contribution is capped at SHOW_GENRE_EPISODE_CAP_FACTOR ×
     the smallest show's episode count so that a show with many seasons
     doesn't run uninterrupted after shorter shows are exhausted.
+
+    Each show's episode list is rotated by a hash of (channel_id + show_title)
+    so the same show starts at a different episode in each channel it appears
+    in — preventing two channels from airing the same episode simultaneously.
     """
     if not shows:
         return []
@@ -252,7 +266,15 @@ def _interleave_shows(shows: List[Show]) -> List[ScheduleEntry]:
     min_eps = min(episode_counts)
     cap = min_eps * SHOW_GENRE_EPISODE_CAP_FACTOR
 
-    iterators = [iter(show.episodes[:cap]) for show in shows]
+    def _rotated_episodes(show: Show) -> List[Episode]:
+        eps = show.episodes[:cap]
+        if not eps or not channel_id:
+            return eps
+        h = int(hashlib.md5((channel_id + show.name).encode()).hexdigest()[:8], 16)
+        offset = h % len(eps)
+        return eps[offset:] + eps[:offset]
+
+    iterators = [iter(_rotated_episodes(show)) for show in shows]
     entries = []
     while True:
         added = False

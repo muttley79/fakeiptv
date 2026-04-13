@@ -36,6 +36,11 @@ _keyframe_probe_sem = threading.Semaphore(3)
 # TTL = 60s; after that the file gets a fresh probe attempt.
 _keyframe_probe_failures: Dict[str, float] = {}
 _KEYFRAME_PROBE_FAIL_TTL = 60.0   # seconds
+# Per-file GOP size cache: path → max keyframe interval in seconds, probed
+# from the first 10 s of the file (position 0, no seeking — always fast).
+# Used as the fallback compensation when the main inpoint probe fails.
+_gop_size_cache: Dict[str, float] = {}
+_DEFAULT_GOP_SEC = 5.0   # used when GOP probe itself fails
 
 HLS_SEGMENT_SECONDS = 2
 HLS_LIST_SIZE = 15         # sliding window — keep 15 × 2s segments (~30s of buffer)
@@ -160,6 +165,44 @@ def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
         pass  # non-fatal — ffmpeg/ffprobe will just be slower on cold cache
 
 
+def _probe_gop_size(path: str) -> float:
+    """
+    Return the max keyframe interval (GOP size) for the file, in seconds.
+
+    Probes only the first 10 s of the file (read_intervals 0%10), so no
+    seeking is required — fast even for UHD MKV files without a Cues element.
+    Result is cached in _gop_size_cache (in-memory, per container start).
+    Falls back to _DEFAULT_GOP_SEC if the probe fails.
+    """
+    if path in _gop_size_cache:
+        return _gop_size_cache[path]
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet",
+            "-print_format", "json",
+            "-select_streams", "v:0",
+            "-show_entries", "packet=pts_time,flags",
+            "-read_intervals", "0%10",
+            path,
+        ], capture_output=True, text=True, timeout=8)
+        packets = json.loads(r.stdout).get("packets", [])
+        kf_times = sorted([
+            float(p["pts_time"]) for p in packets
+            if p.get("flags", "").startswith("K")
+            and p.get("pts_time") not in (None, "N/A")
+        ])
+        if len(kf_times) >= 2:
+            gop = max(b - a for a, b in zip(kf_times, kf_times[1:]))
+            log.debug("GOP probe %s: %.2fs (from %d keyframes)",
+                      os.path.basename(path), gop, len(kf_times))
+            _gop_size_cache[path] = gop
+            return gop
+    except Exception as exc:
+        log.debug("GOP probe failed for %s: %s", os.path.basename(path), exc)
+    _gop_size_cache[path] = _DEFAULT_GOP_SEC
+    return _DEFAULT_GOP_SEC
+
+
 def _probe_keyframe_inpoint(path: str, inpoint: float,
                             entry_duration: float = 0.0) -> float:
     """
@@ -183,13 +226,20 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
     if inpoint <= 0:
         return 0.0
 
-    # Skip probe if this file timed out recently — we'd get the same result
-    # (nominal inpoint) but waste the full timeout again for nothing.
+    # GOP-based fallback: probe the first 10 s of the file (no seeking, always
+    # fast) to get the actual keyframe interval for this file.  Used when the
+    # main probe below fails — ensures compensation matches the file's own GOP
+    # rather than a hardcoded constant.
+    gop_size = _probe_gop_size(path)
+    fallback = max(0.0, inpoint - gop_size)
+
+    # Skip probe if this file timed out recently — would waste another timeout.
     now = time.time()
     last_fail = _keyframe_probe_failures.get(path, 0.0)
     if now - last_fail < _KEYFRAME_PROBE_FAIL_TTL:
-        log.debug("_probe_keyframe_inpoint: skipping %s (failed %.0fs ago)", path, now - last_fail)
-        return inpoint
+        log.debug("_probe_keyframe_inpoint: skipping %s (failed %.0fs ago), "
+                  "applying %.2fs GOP compensation", path, now - last_fail, gop_size)
+        return fallback
 
     # Serialise concurrent probes to avoid thrashing the NAS when many
     # channels start simultaneously (prewarm).  Max 3 probes at a time.
@@ -199,7 +249,12 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
         _nas_prewarm(path, inpoint, entry_duration)
 
         try:
-            start = max(0.0, inpoint - 30)
+            # Search up to 60s before inpoint — covers long-GOP HEVC (GOP can
+            # be 30+ s).  Files WITH a seek index answer instantly; files
+            # WITHOUT index scan from the start regardless of window size.
+            # (UHD files without Cues fall back to GOP-based compensation via
+            # _probe_gop_size when this times out.)
+            start = max(0.0, inpoint - 60)
             r = subprocess.run([
                 "ffprobe", "-v", "quiet",
                 "-print_format", "json",
@@ -207,7 +262,7 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
                 "-show_entries", "packet=pts_time,flags",
                 "-read_intervals", f"{start:.3f}%{inpoint + 0.5:.3f}",
                 path,
-            ], capture_output=True, text=True, timeout=10)
+            ], capture_output=True, text=True, timeout=15)
             packets = json.loads(r.stdout).get("packets", [])
             kf_times = [
                 float(p["pts_time"])
@@ -219,15 +274,25 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
             if candidates:
                 actual = max(candidates)
                 if abs(actual - inpoint) > 0.1:
-                    log.debug(
-                        "Subtitle inpoint adjusted %.3f → %.3f (keyframe snap %.3fs)",
+                    log.info(
+                        "Subtitle keyframe snap: %.3fs → %.3fs (Δ=%.3fs) for %s",
                         inpoint, actual, inpoint - actual,
+                        os.path.basename(path),
                     )
                 return actual
+            log.warning(
+                "Subtitle keyframe probe: no keyframes found near %.3fs in %s "
+                "— applying %.2fs GOP compensation (file may lack seek index)",
+                inpoint, os.path.basename(path), gop_size,
+            )
         except Exception as exc:
-            log.debug("_probe_keyframe_inpoint failed for %s @ %.3f: %s", path, inpoint, exc)
+            log.warning(
+                "Subtitle keyframe probe failed for %s @ %.3fs: %s "
+                "— applying %.2fs GOP compensation",
+                os.path.basename(path), inpoint, exc, gop_size,
+            )
             _keyframe_probe_failures[path] = time.time()
-    return inpoint
+    return fallback
 
 
 _LATIN_RUN_RE = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[ \'-][A-Za-z][A-Za-z0-9]*)*')
@@ -777,41 +842,48 @@ class ChannelStreamer:
         returns almost instantly, ffmpeg starts sooner, and the first segment
         appears earlier — reducing total channel startup time.
         """
-        # Step 1 — build cue lists (NAS reads, 2-3s)
+        # Snapshot schedule position once — both the keyframe probe and cue
+        # builder use this so they're always in sync with the concat file.
         np_now = get_now_playing(self.channel)
         nominal_inpoint = np_now.offset_sec if np_now else 0.0
+        entry_path = np_now.entry.path if (np_now and np_now.entry) else None
+        entry_duration = np_now.entry.duration_sec if (np_now and np_now.entry) else 0.0
 
-        # Probe the actual keyframe inpoint for the first entry.  ffmpeg -c:v copy
-        # can only seek to keyframe boundaries, so the stream may start up to one
-        # GOP before nominal_inpoint.  For long-GOP HEVC content that drift can be
-        # 10-30s, causing subtitles to appear at the wrong position.
-        # The probe runs in this async thread so it never delays video startup.
-        actual_inpoint = nominal_inpoint
-        if nominal_inpoint > 0 and np_now is not None:
-            entry_path = np_now.entry.path if np_now.entry else None
-            entry_duration = np_now.entry.duration_sec if np_now.entry else 0.0
-            if entry_path:
-                actual_inpoint = _probe_keyframe_inpoint(
+        # Step 1a — launch keyframe probe in a sub-thread so it runs in
+        # parallel with the NAS SRT reads (step 1b) and segment wait (step 2).
+        # ffmpeg can only start at a keyframe; the probe finds where that is.
+        # With files that have a seek index the probe finishes in <1s.
+        # For cold-NAS or no-index files it can take up to ~15s; running it
+        # concurrently hides that latency behind the other I/O.
+        probe_result: List[float] = [nominal_inpoint]
+
+        def _run_probe():
+            if nominal_inpoint > 0 and entry_path:
+                probe_result[0] = _probe_keyframe_inpoint(
                     entry_path, nominal_inpoint, entry_duration
                 )
 
+        probe_thread = threading.Thread(
+            target=_run_probe, daemon=True,
+            name=f"kf-probe-{self.channel.id}",
+        )
+        probe_thread.start()
+
+        # Step 1b — build cue lists (NAS SRT reads, 2-3s).
+        # Use nominal_inpoint for now; we'll rebuild below if the probe finds
+        # a different (earlier) keyframe boundary.
         pending: Dict[str, tuple] = {}
         for lang in subtitle_langs:
             sub = self._subtitle_streamers.get(lang)
             if sub is None:
                 continue
             try:
-                cue_lines, cue_count = sub.build_cues(actual_inpoint)
+                cue_lines, cue_count = sub.build_cues(nominal_inpoint)
             except Exception:
                 log.exception("SubtitleStreamer build_cues failed (%s, %s)",
                               self.channel.id, lang or "und")
                 cue_lines, cue_count = [], 0
             pending[lang] = (cue_lines, cue_count)
-
-        log.debug(
-            "Channel %s: subtitle cue building done — langs: %s",
-            self.channel.id, list(pending),
-        )
 
         # Step 2 — wait for the first TS segment (up to 30s)
         deadline = time.time() + 30
@@ -835,10 +907,42 @@ class ChannelStreamer:
             start_pts = 0
         else:
             start_pts = _probe_segment_start_pts(seg_path) or 0
-            log.debug(
+            log.info(
                 "Channel %s: subtitle TIMESTAMP-MAP → MPEGTS:%d (%.3fs)",
                 self.channel.id, start_pts, start_pts / 90000,
             )
+
+        # Step 3b — join the keyframe probe.  By now steps 1b + 2 have
+        # consumed ~3-5s, so the probe has been running that long already.
+        # Allow up to 35s total from thread start; the semaphore (max 3
+        # concurrent probes) plus the 15s ffprobe timeout means the worst
+        # case is ~30s when many channels start simultaneously.
+        probe_thread.join(timeout=35.0)
+        actual_inpoint = probe_result[0]
+
+        log.info(
+            "Channel %s: subtitle inpoint nominal=%.3fs actual=%.3fs "
+            "(snap=%.3fs, entry=%s)",
+            self.channel.id, nominal_inpoint, actual_inpoint,
+            nominal_inpoint - actual_inpoint,
+            os.path.basename(entry_path) if entry_path else "?",
+        )
+
+        # If the probe found an earlier keyframe, rebuild cues with the
+        # corrected inpoint so VTT timestamps align with the actual stream.
+        if abs(actual_inpoint - nominal_inpoint) > 0.5:
+            log.info("Channel %s: rebuilding cues with corrected inpoint %.3fs",
+                     self.channel.id, actual_inpoint)
+            for lang in subtitle_langs:
+                sub = self._subtitle_streamers.get(lang)
+                if sub is None:
+                    continue
+                try:
+                    cue_lines, cue_count = sub.build_cues(actual_inpoint)
+                    pending[lang] = (cue_lines, cue_count)
+                except Exception:
+                    log.exception("SubtitleStreamer rebuild_cues failed (%s, %s)",
+                                  self.channel.id, lang or "und")
 
         # Step 4 — write VTT files
         ready_langs = []
@@ -992,6 +1096,10 @@ class StreamManager:
         self._channel_order: List[str] = []
         # Only channels with an active ffmpeg process
         self._streamers: Dict[str, ChannelStreamer] = {}
+        # Channels that have been watched at least once this session.
+        # Persists across streamer deletions so recreated streamers get the
+        # 600s watched timeout instead of the 120s prewarm timeout.
+        self._watched_channels: set = set()
         self._lock = threading.Lock()
         self._reaper = threading.Thread(
             target=self._reap_loop, daemon=True, name="stream-reaper"
@@ -1020,6 +1128,8 @@ class StreamManager:
                                               audio_copy=self._audio_copy,
                                               prewarm_timeout=self._prewarm_timeout,
                                               ready_segments=self._ready_segments)
+                if ch_id in self._watched_channels:
+                    new_streamer._ever_watched = True  # restore 600s timeout after idle stop
                 self._streamers[ch_id] = new_streamer  # register before start()
             if self._session_mode:
                 self._last_global_touch = time.time()
@@ -1029,6 +1139,7 @@ class StreamManager:
 
     def touch(self, ch_id: str):
         """Signal that a client is actively fetching this channel."""
+        self._watched_channels.add(ch_id)
         s = self._streamers.get(ch_id)
         if s:
             s.touch()

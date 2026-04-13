@@ -5,6 +5,7 @@ generates XMLTV EPG data for a configurable window (past + future).
 """
 import hashlib
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -27,10 +28,6 @@ SHOW_GENRE_MIN = 3
 # Maximum fraction of a genre channel's episodes one show may contribute.
 # If a single show would own more than this share, the channel is skipped.
 SHOW_GENRE_MAX_DOMINANCE = 0.6
-
-# Each show's episode contribution is capped at this multiple of the
-# smallest show's episode count, so no show runs away in the mix.
-SHOW_GENRE_EPISODE_CAP_FACTOR = 3
 
 # Minimum number of qualifying shows to create a "Goldies" channel
 GOLDIES_MIN = 2
@@ -57,6 +54,8 @@ class ScheduleEntry:
     subtitle_paths: Dict[str, str] = field(default_factory=dict)
     has_embedded_subs: bool = False
     is_hdr: bool = False
+    video_width: int = 0
+    video_height: int = 0
 
 
 @dataclass
@@ -126,7 +125,7 @@ def build_channels(
     # --- Primetime — every show ---
     _add_show_channel("primetime", "Primetime", all_shows)
 
-    # --- Genre channels ---
+    # --- Genre channels (each show in all its genres) ---
     genre_shows: Dict[str, List[Show]] = {}
     for show in all_shows:
         for g in show.genres:
@@ -156,6 +155,17 @@ def build_channels(
     if len(hits) >= GOLDIES_MIN:
         _add_show_channel("hits", "Hits", hits)
         log.info("Hits channel: %d shows with rating ≥ %.1f", len(hits), hits_rating)
+
+    # --- 5 Mix channels (all shows, distinct schedules via different seeds) ---
+    # Each Mix channel contains every show, but the interleave seed differs
+    # so the playback order is unique per channel.  Combined with each channel's
+    # deterministic time offset, this ensures the 5 mixes air different content
+    # simultaneously even though their show pool is identical to Primetime.
+    for i in range(1, 6):
+        mix_id = f"mix-{i}"
+        if mix_id in disabled:
+            continue
+        _add_show_channel(mix_id, rename.get(mix_id, f"Mix {i}"), all_shows, group="Mix")
 
     # --- Movies (exclusive: each movie in one channel only) ---
     if library.movies:
@@ -226,6 +236,8 @@ def _episode_to_entry(ep: Episode) -> ScheduleEntry:
         subtitle_paths=ep.subtitle_paths,
         has_embedded_subs=ep.has_embedded_subs,
         is_hdr=ep.is_hdr,
+        video_width=ep.video_width,
+        video_height=ep.video_height,
     )
 
 
@@ -243,51 +255,72 @@ def _movie_to_entry(movie: Movie) -> ScheduleEntry:
         subtitle_paths=movie.subtitle_paths,
         has_embedded_subs=movie.has_embedded_subs,
         is_hdr=movie.is_hdr,
+        video_width=movie.video_width,
+        video_height=movie.video_height,
     )
 
 
 def _interleave_shows(shows: List[Show], channel_id: str = "") -> List[ScheduleEntry]:
     """
-    Round-robin episodes across shows so the mix alternates between them.
+    Build a TV-like episode schedule using shuffled round-robin.
 
-    Each show's contribution is capped at SHOW_GENRE_EPISODE_CAP_FACTOR ×
-    the smallest show's episode count so that a show with many seasons
-    doesn't run uninterrupted after shorter shows are exhausted.
+    Each round picks one episode per show in a randomly shuffled order,
+    then moves to the next round.  Shows are removed when exhausted, so
+    shows with more episodes naturally dominate the later rounds.
 
-    Each show's episode list is rotated by a hash of (channel_id + show_title)
-    so the same show starts at a different episode in each channel it appears
-    in — preventing two channels from airing the same episode simultaneously.
+    A 25% per-show chance of an immediate second episode gives the natural
+    feel of a TV double without forcing it every time.
+
+    Per-show episode rotation: each show starts at a deterministic hash-
+    derived offset so the same show begins at a different episode in each
+    channel it appears in.  Combined with _channel_offset_sec this makes
+    cross-channel simultaneous airing of the same show unlikely: shows are
+    evenly spread across the time cycle, not clumped at random positions.
     """
     if not shows:
         return []
-    episode_counts = [len(s.episodes) for s in shows if s.episodes]
-    if not episode_counts:
+
+    seed = int(hashlib.md5(channel_id.encode()).hexdigest()[:8], 16) if channel_id else 0
+    rng = random.Random(seed)
+
+    # Cap each show to at most 8% of total channel episodes so no single
+    # show dominates the channel or the cross-channel collision probability.
+    # Minimum 4 episodes so short shows aren't rounded to zero.
+    total_raw = sum(len(s.episodes) for s in shows if s.episodes)
+    per_show_cap = max(int(total_raw * 0.08), 4)
+
+    # Build per-show episode queues with per-channel rotation and cap
+    show_queues = []
+    for show in shows:
+        if not show.episodes:
+            continue
+        eps = show.episodes[:]
+        if channel_id:
+            h = int(hashlib.md5((channel_id + show.name).encode()).hexdigest()[:8], 16)
+            offset = h % len(eps)
+            eps = eps[offset:] + eps[:offset]
+        eps = eps[:per_show_cap]
+        show_queues.append([show.name, eps])
+
+    if not show_queues:
         return []
-    min_eps = min(episode_counts)
-    cap = min_eps * SHOW_GENRE_EPISODE_CAP_FACTOR
 
-    def _rotated_episodes(show: Show) -> List[Episode]:
-        eps = show.episodes[:cap]
-        if not eps or not channel_id:
-            return eps
-        h = int(hashlib.md5((channel_id + show.name).encode()).hexdigest()[:8], 16)
-        offset = h % len(eps)
-        return eps[offset:] + eps[:offset]
-
-    iterators = [iter(_rotated_episodes(show)) for show in shows]
     entries = []
-    while True:
-        added = False
-        new_iters = []
-        for it in iterators:
-            ep = next(it, None)
-            if ep is not None:
-                entries.append(_episode_to_entry(ep))
-                new_iters.append(it)
-                added = True
-        iterators = new_iters
-        if not added:
-            break
+    while show_queues:
+        rng.shuffle(show_queues)
+        next_queues = []
+        for item in show_queues:
+            name, eps = item
+            if not eps:
+                continue
+            entries.append(_episode_to_entry(eps.pop(0)))
+            # 25% chance of an immediate second episode (TV double)
+            if eps and rng.random() < 0.25:
+                entries.append(_episode_to_entry(eps.pop(0)))
+            if eps:
+                next_queues.append([name, eps])
+        show_queues = next_queues
+
     return entries
 
 
@@ -297,11 +330,19 @@ def _interleave_shows(shows: List[Show], channel_id: str = "") -> List[ScheduleE
 
 def _channel_offset_sec(channel_id: str) -> float:
     """
-    Deterministic per-channel schedule offset (0 – 7 days in seconds).
+    Deterministic per-channel schedule offset (seconds).
     Derived from the channel slug so it's stable across restarts.
-    Spreads channels that share content apart in time so the same show
-    is very unlikely to be airing simultaneously on two channels.
+
+    Primetime + Mix channels all share the same show pool, so they get
+    evenly-spaced offsets across 30 days (one slot every 5 days) to
+    guarantee they're always airing different content simultaneously.
+
+    All other channels use a hash-based offset in 0–7 days.
     """
+    _ALLSHOWS_CHANNELS = ['primetime', 'mix-1', 'mix-2', 'mix-3', 'mix-4', 'mix-5']
+    if channel_id in _ALLSHOWS_CHANNELS:
+        idx = _ALLSHOWS_CHANNELS.index(channel_id)
+        return float(idx * 5 * 24 * 3600)   # 0, 5, 10, 15, 20, 25 days (120h spacing ≈ cycle/6)
     h = int(hashlib.md5(channel_id.encode()).hexdigest()[:8], 16)
     return float(h % (7 * 24 * 3600))   # 0..604799 s  (up to 7 days)
 

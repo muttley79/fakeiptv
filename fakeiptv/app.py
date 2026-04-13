@@ -138,22 +138,32 @@ class FakeIPTV:
     # ------------------------------------------------------------------
 
     def prewarm_channels(self):
-        """Start ffmpeg for every channel in the background, staggered."""
+        """Start ffmpeg for every channel in parallel background threads.
+
+        Each channel's _launch() reads SRT files from NAS (2-3s).  Running them
+        in parallel cuts total prewarm time from ~N×3s (serial) to ~3s (parallel).
+        Threads are staggered by 0.1s to avoid a thundering-herd NAS hit.
+        """
         channels = list(self.channels.keys())
         if not channels:
             return
 
         def _warm():
-            log.info("Pre-warming %d channels...", len(channels))
-            started = 0
+            log.info("Pre-warming %d channels (parallel)...", len(channels))
+            threads = []
             for ch_id in channels:
-                try:
-                    self.stream_manager.ensure_started(ch_id)
-                    started += 1
-                except Exception:
-                    log.exception("Pre-warm failed for channel %s", ch_id)
-                time.sleep(0.3)
-            log.info("Pre-warm complete: %d/%d channels started", started, len(channels))
+                def _start(cid=ch_id):
+                    try:
+                        self.stream_manager.ensure_started(cid)
+                    except Exception:
+                        log.exception("Pre-warm failed for channel %s", cid)
+                t = threading.Thread(target=_start, daemon=True, name=f"prewarm-{ch_id}")
+                t.start()
+                threads.append(t)
+                time.sleep(0.1)  # small stagger — avoids NAS thundering herd
+            for t in threads:
+                t.join()
+            log.info("Pre-warm complete: %d channels started", len(channels))
 
         threading.Thread(target=_warm, daemon=True, name="prewarm").start()
 

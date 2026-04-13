@@ -144,19 +144,15 @@ def hls_manifest(channel_id: str):
     if not _app_instance.stream_manager.wait_ready(channel_id, timeout=30):
         abort(503)
 
-    # Wait for subtitle VTTs to be written with the correct X-TIMESTAMP-MAP.
-    # The first TS segment appears at ~2s; subtitle write completes at ~2.5s.
-    # wait_ready already blocks for ~6s (3 segments), so by the time we reach
-    # here the subtitle event is almost always already set — zero net delay.
-    # Timeout of 10s is a safety fallback; we still serve video if it expires.
-    _app_instance.stream_manager.wait_subtitle_ready(channel_id, timeout=10)
-
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
 
-    # Build master playlist if subtitle tracks are available, otherwise serve
-    # the raw video manifest.  get_subtitle_languages() only returns languages
-    # whose VTT files have been written (is_running() == True), so we never
-    # reference a subtitle track whose file doesn't exist on disk yet.
+    # Build master playlist if the channel has subtitle tracks.
+    # We do NOT wait for VTT files to be written here — that would add 5-8s
+    # of mandatory startup delay.  Instead we declare all channel subtitle
+    # languages immediately (they're known from the channel entries), and let
+    # the /hls/<id>/<lang>.vtt endpoint wait up to 15s for each file to
+    # appear.  This gives the player the master playlist as soon as the first
+    # HLS segment is ready (~2s cold start), while subtitles catch up async.
     subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
     log.debug("hls_manifest %s: subtitle_langs=%s", channel_id, subtitle_langs or "none")
 
@@ -183,6 +179,71 @@ def hls_manifest(channel_id: str):
     return resp
 
 
+@app.route("/hls/<channel_id>/sub_<lang>.m3u8")
+def hls_sub_manifest(channel_id: str, lang: str):
+    """
+    Dynamic subtitle manifest — mirrors the video playlist's live media-sequence
+    so the player can match subtitle segments to video segments by sequence number.
+
+    Serves the same single VTT file for every sequence number.  The VTT uses
+    X-TIMESTAMP-MAP so players that support it align cues to video PTS.
+    Players that don't use TIMESTAMP-MAP still get cues with correct LOCAL
+    timestamps because we offset them from stream start (LOCAL=0).
+
+    No EXT-X-ENDLIST → player treats this as a live playlist and polls it,
+    matching the live behaviour of video.m3u8.
+    """
+    if channel_id not in _app_instance.channels:
+        abort(404)
+
+    hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
+    if not hls_dir:
+        abort(404)
+
+    vtt_name = f"sub_{lang}.vtt"
+    vtt_path = os.path.join(hls_dir, vtt_name)
+
+    # Wait up to 15s for the VTT to be written by the async subtitle thread
+    if not os.path.exists(vtt_path):
+        deadline = time.time() + 15
+        while not os.path.exists(vtt_path) and time.time() < deadline:
+            time.sleep(0.2)
+
+    if not os.path.exists(vtt_path):
+        abort(404)
+
+    # Mirror the video manifest exactly — same EXTINF durations, same media-sequence,
+    # but replace each segment filename with the VTT file.  This satisfies the HLS
+    # spec (TARGETDURATION ≥ all EXTINF values) and gives Televizo a proper live
+    # sliding-window subtitle playlist that maps 1:1 with video segments.
+    video_manifest = os.path.join(hls_dir, "video.m3u8")
+    out = []
+    try:
+        with open(video_manifest, "r") as f:
+            video_lines = f.readlines()
+        replace_next = False
+        for line in video_lines:
+            if line.startswith("#EXT-X-ENDLIST"):
+                continue  # no ENDLIST — keep live
+            elif line.startswith("#EXTINF:"):
+                out.append(line)
+                replace_next = True
+            elif replace_next:
+                out.append(f"{vtt_name}\n")
+                replace_next = False
+            else:
+                out.append(line)
+    except Exception:
+        abort(503)
+
+    content = "".join(out)
+
+    resp = Response(content, mimetype="application/x-mpegurl")
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/hls/<channel_id>/<path:segment>")
 def hls_segment(channel_id: str, segment: str):
     if channel_id not in _app_instance.channels:
@@ -193,6 +254,15 @@ def hls_segment(channel_id: str, segment: str):
         abort(404)
 
     seg_path = os.path.join(hls_dir, segment)
+
+    # VTT files may not be written yet when the player first requests them
+    # (async subtitle thread is still running).  Wait up to 15s for the file
+    # to appear before returning 404 — covers the ~6s subtitle generation time.
+    if segment.endswith(".vtt") and not os.path.exists(seg_path):
+        deadline = time.time() + 15
+        while not os.path.exists(seg_path) and time.time() < deadline:
+            time.sleep(0.2)
+
     if not os.path.exists(seg_path):
         abort(404)
 

@@ -26,8 +26,12 @@ from .scheduler import Channel, NowPlaying, ScheduleEntry, get_now_playing, get_
 
 log = logging.getLogger(__name__)
 
+# Limit concurrent NAS keyframe probes so simultaneous channel starts
+# (prewarm) don't thrash the NAS with 30+ ffprobe processes at once.
+_keyframe_probe_sem = threading.Semaphore(3)
+
 HLS_SEGMENT_SECONDS = 2
-HLS_LIST_SIZE = 30         # sliding window — keep 30 × 2s segments (~60s of buffer)
+HLS_LIST_SIZE = 15         # sliding window — keep 15 × 2s segments (~30s of buffer)
 CONCAT_HOURS = 4           # how many hours to pre-build in each concat file
 RESTART_DELAY = 1          # seconds to wait before restarting a dead process
 IDLE_TIMEOUT = 600         # stop ffmpeg after 10 min with no client requests (watched)
@@ -123,34 +127,37 @@ def _probe_keyframe_inpoint(path: str, inpoint: float) -> float:
     """
     if inpoint <= 0:
         return 0.0
-    try:
-        start = max(0.0, inpoint - 60)
-        r = subprocess.run([
-            "ffprobe", "-v", "quiet",
-            "-print_format", "json",
-            "-select_streams", "v:0",
-            "-show_entries", "packet=pts_time,flags",
-            "-read_intervals", f"{start:.3f}%{inpoint + 0.5:.3f}",
-            path,
-        ], capture_output=True, text=True, timeout=15)
-        packets = json.loads(r.stdout).get("packets", [])
-        kf_times = [
-            float(p["pts_time"])
-            for p in packets
-            if p.get("flags", "").startswith("K")
-            and p.get("pts_time") not in (None, "N/A")
-        ]
-        candidates = [k for k in kf_times if k <= inpoint]
-        if candidates:
-            actual = max(candidates)
-            if abs(actual - inpoint) > 0.1:
-                log.debug(
-                    "Subtitle inpoint adjusted %.3f → %.3f (keyframe snap %.3fs)",
-                    inpoint, actual, inpoint - actual,
-                )
-            return actual
-    except Exception as exc:
-        log.debug("_probe_keyframe_inpoint failed for %s @ %.3f: %s", path, inpoint, exc)
+    # Serialise concurrent probes to avoid thrashing the NAS when many
+    # channels start simultaneously (prewarm).  Max 3 probes at a time.
+    with _keyframe_probe_sem:
+        try:
+            start = max(0.0, inpoint - 30)
+            r = subprocess.run([
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-select_streams", "v:0",
+                "-show_entries", "packet=pts_time,flags",
+                "-read_intervals", f"{start:.3f}%{inpoint + 0.5:.3f}",
+                path,
+            ], capture_output=True, text=True, timeout=10)
+            packets = json.loads(r.stdout).get("packets", [])
+            kf_times = [
+                float(p["pts_time"])
+                for p in packets
+                if p.get("flags", "").startswith("K")
+                and p.get("pts_time") not in (None, "N/A")
+            ]
+            candidates = [k for k in kf_times if k <= inpoint]
+            if candidates:
+                actual = max(candidates)
+                if abs(actual - inpoint) > 0.1:
+                    log.debug(
+                        "Subtitle inpoint adjusted %.3f → %.3f (keyframe snap %.3fs)",
+                        inpoint, actual, inpoint - actual,
+                    )
+                return actual
+        except Exception as exc:
+            log.debug("_probe_keyframe_inpoint failed for %s @ %.3f: %s", path, inpoint, exc)
     return inpoint
 
 
@@ -171,8 +178,8 @@ class SubtitleStreamer:
         segment has been probed for its start PTS (typically ~2 s after launch).
 
     The server waits for a _subtitle_ready_event (set after Phase 2) before
-    serving the master playlist, but since wait_ready already blocks for 3
-    video segments (~6 s), the subtitle wait adds zero net startup delay.
+    serving the master playlist.  wait_ready blocks for ~2s (1 segment), and
+    subtitle write finishes at ~2.5s, so the net extra wait is minimal (~0.5s).
     """
 
     def __init__(self, channel: Channel, lang: str, hls_dir: str):
@@ -218,14 +225,22 @@ class SubtitleStreamer:
                 "#EXT-X-ENDLIST\n"
             )
 
+        # Always mark the track as valid — even with 0 cues for the current
+        # 4h window, the VTT file is written (just empty) so the master
+        # playlist can declare the language.  The player sees the track option
+        # and subs appear automatically once the channel reaches an episode
+        # that has them.
+        self._ok = True
         if cue_count > 0:
-            self._ok = True
             log.debug(
                 "Subtitle track %s (%s): files written, MPEGTS:%d (%.3fs)",
                 self.lang or "und", self._channel.id, start_pts, start_pts / 90000,
             )
         else:
-            self._ok = False
+            log.debug(
+                "Subtitle track %s (%s): no cues in current window — empty VTT written",
+                self.lang or "und", self._channel.id,
+            )
 
     def stop(self):
         self._ok = False
@@ -265,10 +280,13 @@ class SubtitleStreamer:
                 entries_with_subs += 1
                 raw = _read_srt(srt_path)
                 cues = _parse_srt_cues(raw)
-                # Some SRTs use disc/absolute timestamps (e.g. episode at 02:30:00
-                # on disc has cues starting at 02:30:04 rather than 00:00:04).
-                # Normalize by subtracting the minimum cue time.
-                srt_offset = min((s for s, e, t in cues), default=0.0)
+                # Disc-rip SRTs may use absolute disc timestamps (e.g. first cue at
+                # 02:30:04 because the episode starts at chapter 02:30:00 on the disc).
+                # Only subtract the offset when the first cue is clearly out-of-file
+                # (> 5 minutes).  Normal SRTs with a first cue at e.g. 50s must NOT
+                # be normalised — subtracting 50s would shift every subtitle 50s early.
+                first_cue_time = min((s for s, e, t in cues), default=0.0)
+                srt_offset = first_cue_time if first_cue_time > 300.0 else 0.0
                 entry_cues_added = 0
                 entry_cues_skipped = 0
                 for start, end, text in cues:
@@ -405,16 +423,16 @@ class ChannelStreamer:
         Block until subtitle VTTs have been written (or timeout expires).
         Returns True if ready.  Always returns True for channels without SRTs
         (event is set immediately in _launch()).  Called after wait_ready() so
-        the wait is typically already satisfied (subtitle write finishes in ~2s,
-        wait_ready blocks for ~6s).
+        the extra wait is typically ~0.5s (subtitle write finishes at ~2.5s,
+        wait_ready fires at ~2s on the first segment).
         """
         return self._subtitle_ready_event.wait(timeout=timeout)
 
     def _watch_ready(self):
-        """Background thread: set _ready_event once enough segments are buffered.
-        Waiting for MIN_READY_SEGMENTS before signalling avoids startup stutter —
-        if we fire on the first segment the client plays it and then has to wait
-        for the next one to be written, causing 1-2 visible stutters on channel switch.
+        """Background thread: set _ready_event once the HLS manifest exists and
+        at least _ready_segments segments have been written.  Defaults to 1 so
+        the manifest is served as soon as the first segment is available (~2s),
+        matching the original design.  Players buffer ahead so there is no stutter.
         """
         while not self._stop_event.is_set():
             if os.path.exists(self.manifest_path):
@@ -485,10 +503,14 @@ class ChannelStreamer:
     # ------------------------------------------------------------------
 
     def _get_subtitle_langs(self):
-        """Collect all external SRT languages available across this channel's entries."""
+        """Collect named external SRT language codes available across this channel's entries.
+
+        Excludes the empty-string key (unlabeled .srt files) — we can't know
+        the language, so advertising it as a track is misleading and unhelpful.
+        """
         langs = set()
         for entry in self.channel.entries:
-            langs.update(entry.subtitle_paths.keys())
+            langs.update(k for k in entry.subtitle_paths.keys() if k)
         return sorted(langs)
 
     def _launch(self):
@@ -550,40 +572,21 @@ class ChannelStreamer:
                 self.channel.id, subtitle_langs or "none",
             )
             if subtitle_langs:
-                # Phase 1 — synchronous: parse all SRT files, build cue lists in memory.
-                # Pure Python; completes in < 100ms regardless of NAS speed.
-                # Populates _subtitle_streamers so get_subtitle_languages() returns
-                # the correct set on the very first server request.
-                np_now = get_now_playing(self.channel)
-                nominal_inpoint = np_now.offset_sec if np_now else 0.0
-                pending: Dict[str, tuple] = {}   # lang → (SubtitleStreamer, cue_lines, cue_count)
+                # Register SubtitleStreamers immediately (no SRT I/O here).
+                # SRT reading (build_cues) runs in the async thread in parallel
+                # with ffmpeg startup, so _launch() returns without any NAS reads.
                 for lang in subtitle_langs:
                     sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
-                    try:
-                        cue_lines, cue_count = sub.build_cues(nominal_inpoint)
-                    except Exception:
-                        log.exception("SubtitleStreamer build_cues failed (%s, %s)",
-                                      self.channel.id, lang or "und")
-                        cue_lines, cue_count = [], 0
-                    pending[lang] = (sub, cue_lines, cue_count)
-                    self._subtitle_streamers[lang] = sub  # registered; _ok still False
+                    self._subtitle_streamers[lang] = sub
 
-                log.debug(
-                    "Channel %s: subtitle cue building done — langs: %s",
-                    self.channel.id, list(pending),
-                )
-
-                # Phase 2 — async: wait for first TS segment, probe start_pts,
-                # write VTT files with correct X-TIMESTAMP-MAP=MPEGTS:{start_pts}.
-                # Sets _subtitle_ready_event when done so the server can serve the
-                # master playlist with the correct subtitle tracks.
+                # Async thread: read SRTs, wait for first TS segment, probe
+                # start_pts, write VTT files, set _subtitle_ready_event.
                 threading.Thread(
                     target=self._write_subtitle_files_async,
-                    args=(pending,),
+                    args=(subtitle_langs,),
                     daemon=True,
                     name=f"sub-write-{self.channel.id}",
                 ).start()
-                # No embedded sub mapping — external SRTs cover subtitles
                 sub_opts = []
             else:
                 # No external SRTs: try embedded text subtitles via the video process.
@@ -592,7 +595,6 @@ class ChannelStreamer:
 
             seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
             cmd = [
-                "nice", "-n", "10",   # lower CPU priority — yields to other processes
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel", "error",
@@ -632,20 +634,59 @@ class ChannelStreamer:
             )
 
 
-    def _write_subtitle_files_async(self, pending: dict):
+    def _write_subtitle_files_async(self, subtitle_langs: list):
         """
-        Phase 2 of subtitle generation (background thread).
+        Combined subtitle build + write thread (runs entirely in background).
 
-        Waits for the first HLS TS segment to appear, probes its start_pts
-        (the actual MPEG-TS PTS at stream start — non-zero for HEVC with
-        B-frames even after -avoid_negative_ts make_zero), then writes all
-        VTT files with X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000.
+        Steps:
+          1. Probe actual keyframe inpoint for the first entry (corrects subtitle
+             timing when ffmpeg snaps to a keyframe before nominal_inpoint; can
+             be 10-30s off on long-GOP HEVC content).
+          2. Build cue lists from SRT files on NAS (2-3s, I/O bound).
+          3. Wait for the first HLS TS segment (~2s, parallel with step 2 in
+             effect because ffmpeg is already running).
+          4. Probe start_pts from the first segment (corrects TIMESTAMP-MAP for
+             HEVC B-frame streams where PTS doesn't start at 0).
+          5. Write VTT + m3u8 files; set _subtitle_ready_event.
 
-        Because wait_ready already blocks the server for ~6s (3 segments),
-        and the first segment appears at ~2s, this thread finishes well before
-        the server returns the first manifest.  Zero net startup delay.
+        Moving all I/O here (vs. synchronously in _launch) means _launch()
+        returns almost instantly, ffmpeg starts sooner, and the first segment
+        appears earlier — reducing total channel startup time.
         """
-        # Wait for the first TS segment (up to 30s)
+        # Step 1 — build cue lists (NAS reads, 2-3s)
+        np_now = get_now_playing(self.channel)
+        nominal_inpoint = np_now.offset_sec if np_now else 0.0
+
+        # Probe the actual keyframe inpoint for the first entry.  ffmpeg -c:v copy
+        # can only seek to keyframe boundaries, so the stream may start up to one
+        # GOP before nominal_inpoint.  For long-GOP HEVC content that drift can be
+        # 10-30s, causing subtitles to appear at the wrong position.
+        # The probe runs in this async thread so it never delays video startup.
+        actual_inpoint = nominal_inpoint
+        if nominal_inpoint > 0 and np_now is not None:
+            entry_path = np_now.entry.path if np_now.entry else None
+            if entry_path:
+                actual_inpoint = _probe_keyframe_inpoint(entry_path, nominal_inpoint)
+
+        pending: Dict[str, tuple] = {}
+        for lang in subtitle_langs:
+            sub = self._subtitle_streamers.get(lang)
+            if sub is None:
+                continue
+            try:
+                cue_lines, cue_count = sub.build_cues(actual_inpoint)
+            except Exception:
+                log.exception("SubtitleStreamer build_cues failed (%s, %s)",
+                              self.channel.id, lang or "und")
+                cue_lines, cue_count = [], 0
+            pending[lang] = (cue_lines, cue_count)
+
+        log.debug(
+            "Channel %s: subtitle cue building done — langs: %s",
+            self.channel.id, list(pending),
+        )
+
+        # Step 2 — wait for the first TS segment (up to 30s)
         deadline = time.time() + 30
         seg_path = None
         while time.time() < deadline and not self._stop_event.is_set():
@@ -656,11 +697,11 @@ class ChannelStreamer:
                     if f.endswith(".ts")
                 ]
                 if ts_files:
-                    # Pick the earliest-written segment (lowest mtime = seg0)
                     seg_path = min(ts_files, key=os.path.getmtime)
                     break
             time.sleep(0.1)
 
+        # Step 3 — probe start_pts
         if seg_path is None:
             log.warning("_write_subtitle_files_async: no TS segment for %s — using MPEGTS:0",
                         self.channel.id)
@@ -672,9 +713,12 @@ class ChannelStreamer:
                 self.channel.id, start_pts, start_pts / 90000,
             )
 
-        # Write VTT files now that we have the correct start_pts
+        # Step 4 — write VTT files
         ready_langs = []
-        for lang, (sub, cue_lines, cue_count) in pending.items():
+        for lang, (cue_lines, cue_count) in pending.items():
+            sub = self._subtitle_streamers.get(lang)
+            if sub is None:
+                continue
             sub.write_files(cue_lines, cue_count, start_pts)
             if sub.is_running():
                 ready_langs.append(lang)
@@ -726,7 +770,7 @@ class ChannelStreamer:
                 if ret is not None:
                     break
                 now = time.time()
-                if self._ready_event.is_set() and now - last_check >= STALL_TIMEOUT:
+                if now - last_check >= STALL_TIMEOUT:
                     mtime = self._get_manifest_mtime()
                     if mtime == last_mtime:
                         log.warning(
@@ -817,20 +861,29 @@ class StreamManager:
         Start the ffmpeg streamer for ch_id if it isn't already running.
         Returns False if the channel is unknown, True otherwise.
         Call this before waiting for is_ready().
+
+        s.start() is called OUTSIDE the lock because _launch() reads SRT files
+        from NAS (2-3s per channel).  Holding the lock during that would
+        serialise all concurrent prewarm/ensure_started calls, causing 30s+ delays.
+        The streamer is registered in _streamers before start() so a second
+        concurrent call for the same ch_id sees it and skips.
         """
+        new_streamer = None
         with self._lock:
             if ch_id not in self._channels:
                 return False
             if ch_id not in self._streamers:
-                s = ChannelStreamer(self._channels[ch_id], self._tmp_base, self._subtitles,
-                                   audio_copy=self._audio_copy,
-                                   prewarm_timeout=self._prewarm_timeout,
-                                   ready_segments=self._ready_segments)
-                s.start()
-                self._streamers[ch_id] = s
+                new_streamer = ChannelStreamer(self._channels[ch_id], self._tmp_base,
+                                              self._subtitles,
+                                              audio_copy=self._audio_copy,
+                                              prewarm_timeout=self._prewarm_timeout,
+                                              ready_segments=self._ready_segments)
+                self._streamers[ch_id] = new_streamer  # register before start()
             if self._session_mode:
                 self._last_global_touch = time.time()
-            return True
+        if new_streamer is not None:
+            new_streamer.start()  # outside lock — NAS I/O in _launch() runs in parallel
+        return True
 
     def touch(self, ch_id: str):
         """Signal that a client is actively fetching this channel."""
@@ -915,13 +968,25 @@ class StreamManager:
             self._channel_order = list(channels.keys())
 
     def get_subtitle_languages(self, ch_id: str):
-        """Return sorted list of subtitle language codes that have VTT files written."""
+        """
+        Return sorted list of subtitle language codes for ch_id.
+
+        Returns all languages registered for the channel (i.e. present in at
+        least one entry) — not just ones whose VTT has been written yet.  The
+        VTT endpoint independently waits up to 15s for the file to appear, so
+        it is safe to include a language in the master playlist before its VTT
+        is written.  This removes the need to block the manifest response on
+        subtitle readiness.
+        """
         s = self._streamers.get(ch_id)
         if s is None:
             return []
-        return sorted(
-            lang for lang, sub in s._subtitle_streamers.items() if sub.is_running()
-        )
+        # Prefer the registered _subtitle_streamers (populated in _launch)
+        # since they reflect the actual langs for the current concat window.
+        # Fall back to _get_subtitle_langs() if the streamer hasn't launched yet.
+        if s._subtitle_streamers:
+            return sorted(k for k in s._subtitle_streamers.keys() if k)
+        return s._get_subtitle_langs()
 
     def wait_subtitle_ready(self, ch_id: str, timeout: float = 10.0) -> bool:
         """

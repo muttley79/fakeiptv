@@ -78,6 +78,12 @@ Bitmap sub auto-disable still works (monitor detects "bitmap to bitmap" in stder
 - **video_codec not tracked** — `is_hdr` used as HEVC proxy. Future: add  
   `video_codec: str` to `Episode`/`Movie` for more precise BSF gating.
 
+- **Channels take very long to load** — regression vs. `main` branch.  
+  **Root cause found**: `ready_segments` was 3 (wait for 3×2s segments = 6s mandatory delay).  
+  **Fixed**: changed to 1 (fire on first segment, ~2s).  
+  Note: `HLS_LIST_SIZE=30` (60s window) was intentional — keeps mid-stream freeze fix intact.  
+  Note: `ready_segments` only gates the first manifest response; it does not affect mid-stream buffering.
+
 ## Architecture notes
 - `DEFAULT=NO, AUTOSELECT=NO` on subtitle tracks — user must select manually in Televizo.
 - SRT normalization: `srt_offset = min(cue start times)` handles disc-absolute timestamps.

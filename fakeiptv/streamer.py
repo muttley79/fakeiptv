@@ -240,9 +240,8 @@ def _he_bidi_fix(line: str) -> str:
     Two transforms applied to each cue line:
 
     1. Prepend U+200F (RLM, RIGHT-TO-LEFT MARK) — zero-width character that
-       forces the paragraph base direction to RTL.  Without it, ExoPlayer may
-       guess LTR when the line starts with a boundary-neutral char (dash, quote,
-       digit), which puts terminal punctuation on the wrong visual side.
+       forces the paragraph base direction to RTL via the P2/P3 first-strong
+       algorithm.  Fixes leading boundary-neutral chars (dash, quote, digit).
 
     2. Wrap each Latin run with U+2066 … U+2069 (LRI … PDI, Left-to-Right
        Isolate / Pop Directional Isolate).  English words inside Hebrew create
@@ -250,12 +249,18 @@ def _he_bidi_fix(line: str) -> str:
        splitting one subtitle cue across two visual lines.  LRI/PDI isolates
        the English segment so surrounding Hebrew sees it as a single opaque
        RTL unit, eliminating the rogue break points.
+
+    3. Append U+200F (RLM) — anchors trailing neutral characters (,  .  ?  "
+       …) to RTL via the N1 rule (both adjacent strong chars are RTL).  Without
+       this, ExoPlayer may fall back to LTR for trailing punctuation when it
+       doesn't implement P2/P3, making commas/ellipsis appear at the visual
+       start of the line instead of the end.
     """
     RLM = '\u200F'
     LRI = '\u2066'
     PDI = '\u2069'
     fixed = _LATIN_RUN_RE.sub(lambda m: LRI + m.group() + PDI, line)
-    return RLM + fixed
+    return RLM + fixed + RLM  # trailing RLM anchors terminal punctuation to RTL
 
 
 class SubtitleStreamer:

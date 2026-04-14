@@ -1,21 +1,19 @@
 # FakeIPTV
 
 Turns a NAS full of TV shows and movies into fake live IPTV channels.
-Generates a proper HLS live stream (sliding-window M3U8 + MPEG-TS segments), XMLTV EPG, and catch-up TV for each channel.
-No transcoding — just fast remux via `ffmpeg -c copy`.
+Generates a proper HLS live stream (sliding-window M3U8 + MPEG-TS segments), XMLTV EPG, and catch-up TV — no transcoding, just fast remux via `ffmpeg -c copy`.
 
 ## How it works
 
 - The NAS is scanned for shows and movies at startup and once a day at midnight (local time).
 - Channels are auto-discovered from your library — no per-show channels, only curated mixes:
-  - **Primetime** — all shows interleaved
+  - **Primetime** and **Mix 1–5** — all shows interleaved (six variants with distinct shuffles)
   - **{Genre}** — per-genre mix (e.g. Drama, Comedy) if ≥ 3 shows share the genre
-  - **Goldies** — shows older than a configurable year
+  - **Goldies** — shows older than a configurable year threshold
   - **Hits** — shows with a rating above a configurable threshold (from Sonarr/Radarr/TMDB/NFO)
-  - **Movies** — all movies; genre-specific movie channels if ≥ 3 movies share a genre
-- Every channel's schedule is **deterministic** — anchored to a fixed epoch. Restarting the server picks up exactly where it would have been.
+  - **{Genre} Movies**, **Movie Hits**, **Movies** — movie channels, genre-exclusive where possible
+- Every channel's schedule is **deterministic** — anchored to a fixed epoch (`2024-01-01 00:00:00` local). Restarting the server picks up exactly where it would have been.
 - One `ffmpeg -re -c copy` process per channel outputs 2-second HLS segments to a tmpfs directory.
-- All channels are **pre-warmed on first client connect** so channel switching is near-instant.
 - Flask serves the segments, XMLTV EPG, and catch-up manifests directly from tmpfs.
 
 ---
@@ -24,8 +22,8 @@ No transcoding — just fast remux via `ffmpeg -c copy`.
 
 ### Requirements
 
-- Docker + Docker Compose on the host (Raspberry Pi 4 or any Linux machine)
-- NAS mounted on the host (e.g. via SMB/CIFS at `/mnt/nas`)
+- Docker + Docker Compose on the host
+- NAS accessible over NFS or SMB from the host
 
 ### Setup
 
@@ -36,7 +34,7 @@ cd /opt/fakeiptv
 
 # 2. Configure
 cp .env.example .env
-nano .env          # set FAKEIPTV_RPI_IP, paths, API keys
+nano .env          # set FAKEIPTV_HOST_IP, paths, API keys
 
 # 3. Build and start
 docker compose up -d
@@ -62,56 +60,40 @@ docker exec -it fakeiptv bash   # shell into container
 docker compose restart          # restart without rebuild
 ```
 
----
-
-## Deployment — systemd (alternative)
-
-```bash
-# Install system deps
-sudo apt install ffmpeg python3-venv
-
-# Set up virtualenv
-python3 -m venv venv
-venv/bin/pip install -r requirements.txt
-
-cp .env.example .env && nano .env
-
-# Install and start the service
-sudo cp fakeiptv.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now fakeiptv
-journalctl -u fakeiptv -f
-```
+> **Windows / Docker Desktop note:** The container mounts the NAS as a Docker named NFS volume. In-container `mount.cifs` fails on Docker Desktop (errno 95); NFS works natively via the Linux VM kernel.
 
 ---
 
 ## Configuration
 
-All settings live in **`.env`** (preferred) or **`config.yaml`**.
-Environment variables always take precedence over `config.yaml`.
+All settings live in **`.env`** (preferred) or **`config.yaml`**. Environment variables always take precedence.
 
 | Variable | Default | Description |
 |---|---|---|
-| `FAKEIPTV_RPI_IP` | `127.0.0.1` | **LAN IP of this machine** — used in stream/EPG URLs |
+| `FAKEIPTV_HOST_IP` | `127.0.0.1` | **LAN IP of this machine** — used in all stream/EPG URLs |
 | `FAKEIPTV_PORT` | `8080` | HTTP port |
-| `FAKEIPTV_SHOWS_PATH` | `/mnt/nas/Shows` | Host path to TV shows |
-| `FAKEIPTV_MOVIES_PATH` | `/mnt/nas/Movies` | Host path to movies |
+| `FAKEIPTV_SHOWS_PATH` | `/mnt/nas/Shows` | Path to TV shows (inside container) |
+| `FAKEIPTV_MOVIES_PATH` | `/mnt/nas/Movies` | Path to movies (inside container) |
 | `FAKEIPTV_TMP_DIR` | `/tmp/fakeiptv` | Where HLS segments are written (use tmpfs) |
 | `FAKEIPTV_CACHE_DIR` | `~/.fakeiptv/` | SQLite cache for durations + TMDB metadata |
-| `FAKEIPTV_SUBTITLES` | `true` | Include subtitle tracks (SRT/ASS→WebVTT) |
-| `FAKEIPTV_PREWARM` | `false` | Start all channels on first client connect (smoother channel switching, higher CPU spike) |
-| `FAKEIPTV_PREWARM_TIMEOUT` | `120` | Seconds before a pre-warmed-but-never-watched channel is stopped (`0` = never stop) |
-| `FAKEIPTV_READY_SEGMENTS` | `3` | HLS segments buffered before a channel is declared ready (~2s each; higher = less startup stutter, more channel-switch delay) |
+| `FAKEIPTV_SUBTITLES` | `true` | Include subtitle tracks (SRT → WebVTT) |
+| `FAKEIPTV_AUDIO_COPY` | `true` | Copy audio codec; `false` = transcode to AAC 192k stereo |
+| `FAKEIPTV_PREFERRED_AUDIO_LANGUAGE` | `eng` | ISO 639-1 or 639-2 code for preferred audio track |
 | `FAKEIPTV_CATCHUP_DAYS` | `7` | Days of past programming available for catch-up |
+| `FAKEIPTV_PREWARM` | `false` | Start all channels on first client connect |
+| `FAKEIPTV_PREWARM_SESSION` | `false` | Keep all channels alive together (session mode) |
+| `FAKEIPTV_PREWARM_ADJACENT` | `0` | Also warm N channels on each side of the watched channel |
+| `FAKEIPTV_PREWARM_TIMEOUT` | `120` | Seconds before a prewarm-only channel is stopped |
+| `FAKEIPTV_READY_SEGMENTS` | `1` | HLS segments buffered before channel is declared ready |
 | `FAKEIPTV_TMDB_API_KEY` | _(empty)_ | Optional — TMDB metadata fallback |
 | `FAKEIPTV_SONARR_URL` | _(empty)_ | Optional — Sonarr integration for ratings/metadata |
 | `FAKEIPTV_SONARR_API_KEY` | _(empty)_ | |
 | `FAKEIPTV_RADARR_URL` | _(empty)_ | Optional — Radarr integration for ratings/metadata |
 | `FAKEIPTV_RADARR_API_KEY` | _(empty)_ | |
 | `FAKEIPTV_TMPFS_SIZE` | `1073741824` | tmpfs size in bytes for HLS segments (Docker only) |
-| `TZ` | `UTC` | Timezone for schedule and EPG (e.g. `Asia/Jerusalem`) |
+| `TZ` | `UTC` | Timezone for schedule and midnight refresh (e.g. `Asia/Jerusalem`) |
 
-### NAS layout expected
+### Expected NAS layout
 
 ```
 Shows/
@@ -126,11 +108,13 @@ Movies/
     └── Inception.nfo
 ```
 
+External subtitles: `<video_basename>.<lang>.srt` or `<video_basename>.srt` alongside the video file.
+
 ### Disabling or renaming channels (`config.yaml`)
 
 ```yaml
 channels:
-  goldies_before: 2010     # shows older than this go into "Goldies"
+  goldies_before: 2010     # shows older than this year go into "Goldies"
   hits_rating: 8.0         # minimum rating (0–10) for "Hits"
   disabled:
     - goldies
@@ -143,7 +127,7 @@ channels:
 ## Adding to Televizo
 
 1. **Add Playlist** → `http://<ip>:<port>/playlist.m3u8`
-2. The EPG URL is embedded in the playlist automatically — Televizo picks it up from `url-tvg=`
+2. The EPG URL is embedded in the playlist automatically via `url-tvg=` — Televizo picks it up on import
 3. Select any channel — it starts mid-show, just like real TV
 4. **Catch-up**: open the EPG guide, select a past programme, press play
 
@@ -152,8 +136,8 @@ channels:
 ## EPG
 
 - Available at `/epg.xml` (plain) and `/epg.xml.gz` (gzip — what Televizo fetches)
-- Covers 7 days back + 1 day forward
-- Timestamps are always UTC (`+0000`) for maximum player compatibility
+- Covers `catchup_days` days back + 1 day forward
+- Timestamps are always UTC (`+0000`) — required for Televizo's catch-up timestamp substitution
 - Regenerates automatically every hour
 
 ---
@@ -164,9 +148,9 @@ Catch-up uses `catchup="shift"` mode (required for Televizo — `catchup="defaul
 
 When a past programme is selected in Televizo's EPG:
 1. Televizo calls the live stream URL with `?utc=TIMESTAMP` appended
-2. The server detects the timestamp and spins up a temporary VOD ffmpeg session
-3. The session serves a finite HLS playlist (`#EXT-X-ENDLIST`) starting at the requested offset
-4. Sessions are reused for up to 60 seconds to handle Televizo's polling behaviour
+2. The server detects the timestamp and creates a temporary VOD ffmpeg session
+3. The session serves a finite HLS playlist (`-hls_list_size 0`) starting at the requested offset
+4. Sessions are reused for 60 seconds to handle Televizo's polling behaviour
 5. Sessions expire after 2 hours of inactivity
 
 ---
@@ -178,7 +162,9 @@ When a past programme is selected in Televizo's EPG:
 | `GET /playlist.m3u8` | IPTV channel list |
 | `GET /epg.xml` | XMLTV EPG (plain XML) |
 | `GET /epg.xml.gz` | XMLTV EPG (gzip) |
-| `GET /hls/<channel_id>/stream.m3u8` | Live HLS manifest (also catch-up entry point with `?utc=`) |
+| `GET /hls/<channel_id>/stream.m3u8` | Live HLS master manifest (also catch-up entry point with `?utc=`) |
+| `GET /hls/<channel_id>/video.m3u8` | Live HLS video-only manifest (ffmpeg output) |
+| `GET /hls/<channel_id>/sub_<lang>.m3u8` | Live HLS subtitle manifest |
 | `GET /hls/<channel_id>/<seg>.ts` | HLS MPEG-TS segment |
 | `GET /catchup/<channel_id>/<session_id>/stream.m3u8` | Catch-up VOD manifest |
 | `GET /catchup/<channel_id>/<session_id>/<seg>.ts` | Catch-up VOD segment |
@@ -195,26 +181,28 @@ When a past programme is selected in Televizo's EPG:
 - Check `/status` — `"ready": false` means ffmpeg hasn't produced its first segment yet.
 
 **Bitmap subtitle crash loop (PGS/VOBSUB)**
-- The monitor thread detects "bitmap to bitmap" in ffmpeg stderr and automatically disables subtitles for that channel. It self-heals after one restart.
+- The monitor thread detects "bitmap to bitmap" in ffmpeg stderr and automatically disables subtitles for that channel. Self-heals after one restart.
 
-**eac3 / unspecified sample rate error**
+**eac3 / unspecified sample rate**
 - Some MKV files lose eac3 codec parameters when muxed into MPEG-TS with `-c copy`. The monitor detects this and automatically falls back to `-c:a aac -b:a 192k` for that channel.
 
 **EPG not showing in Televizo**
-- Make sure the playlist was re-imported after changes (Televizo caches the playlist).
-- The EPG URL is auto-embedded via `url-tvg=` in the playlist header — no manual EPG URL needed in Televizo.
+- Re-import the playlist in Televizo (it caches the playlist and EPG URL).
+- The EPG URL is auto-embedded via `url-tvg=` in the playlist header.
 
 **Catch-up not working**
-- Catch-up requires `catchup="shift"` mode — `catchup="default"` does not substitute timestamps in Televizo.
-- EPG must be loaded and working first — Televizo needs programme times to trigger catch-up.
-- Check `/status` to confirm the channel exists and has entries.
+- EPG must be loaded first — Televizo needs programme times to trigger catch-up.
+- Check that `catchup="shift"` is in use (not `"default"`).
+- Verify EPG timestamps are UTC — any local offset breaks Televizo's timestamp parsing.
 
 **Wrong episode playing / schedule seems off**
-- The schedule epoch is `2024-01-01 00:00:00` local time. All offsets are computed from that. Consistent across restarts and container rebuilds.
+- The schedule epoch is `2024-01-01 00:00:00` local time. Consistent across restarts and rebuilds.
 
-**Cache re-probing everything after Docker setup**
-- The SQLite cache is keyed by file path. If the in-container path (`/shows/...`) differs from the original path (`/mnt/nas/Shows/...`), all files are re-probed once. This is normal on first Docker run.
-- Mount `~/.fakeiptv` as the cache volume to persist across rebuilds.
+**All files re-probed after first Docker run**
+- Normal on first run: the SQLite cache is keyed by file path. If the in-container mount path differs from the original cache path, everything re-probes once.
 
 **Docker build not picking up code changes**
-- If `docker compose up -d --build` uses cached layers, `touch` the changed `.py` files first, or run `docker compose build --no-cache && docker compose up -d --force-recreate`.
+- `touch` the changed `.py` files before rebuilding, or run:
+  ```bash
+  docker compose build --no-cache && docker compose up -d --force-recreate
+  ```

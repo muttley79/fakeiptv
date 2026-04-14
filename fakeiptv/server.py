@@ -15,6 +15,7 @@ Endpoints:
 import gzip
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -29,6 +30,9 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 _app_instance: "FakeIPTV" = None  # set by app.py before server starts
 _prewarm_done = False              # pre-warm all channels on first manifest request
+
+# Matches HLS segment filenames like "seg42.ts" → group(1) = "42"
+_SEG_RE = re.compile(r"^seg(\d+)\.ts$")
 
 
 def set_app(instance: "FakeIPTV"):
@@ -203,12 +207,10 @@ def hls_sub_manifest(channel_id: str, lang: str):
     vtt_name = f"sub_{lang}.vtt"
     vtt_path = os.path.join(hls_dir, vtt_name)
 
-    # Wait up to 15s for the VTT to be written by the async subtitle thread
-    if not os.path.exists(vtt_path):
-        deadline = time.time() + 15
-        while not os.path.exists(vtt_path) and time.time() < deadline:
-            time.sleep(0.2)
-
+    # A placeholder VTT is written immediately at launch (write_placeholder),
+    # so this should almost always exist.  The async subtitle thread overwrites
+    # it with real cues once extraction completes; the player picks up the
+    # update on its next poll (live playlist — no EXT-X-ENDLIST).
     if not os.path.exists(vtt_path):
         abort(404)
 
@@ -264,7 +266,16 @@ def hls_segment(channel_id: str, segment: str):
             time.sleep(0.2)
 
     if not os.path.exists(seg_path):
-        abort(404)
+        # On-demand regen: live .ts segment was deleted by ffmpeg's sliding window.
+        # Reconstruct it from the source file using get_playing_at().
+        if segment.endswith(".ts"):
+            m = _SEG_RE.match(segment)
+            if m and _app_instance.stream_manager.regenerate_segment(channel_id, int(m.group(1))):
+                pass  # file now exists, fall through to serve
+            else:
+                abort(404)
+        else:
+            abort(404)
 
     _app_instance.stream_manager.touch(channel_id)
     resp = send_from_directory(hls_dir, segment)
@@ -334,6 +345,66 @@ def catchup_manifest(channel_id: str, session_id: str):
     return resp
 
 
+@app.route("/catchup/<channel_id>/<session_id>/sub_<lang>.m3u8")
+def catchup_sub_manifest(channel_id: str, session_id: str, lang: str):
+    """
+    Dynamic subtitle manifest for catchup VOD sessions.
+    Mirrors the video playlist structure (many small EXTINF entries all pointing
+    to the same VTT file) so Televizo keeps polling for updated cues — same
+    pattern as hls_sub_manifest() but for catchup.  EXT-X-ENDLIST is preserved
+    because catchup is VOD (once ffmpeg finishes, the stream is done).
+    """
+    session = _app_instance.catchup_manager.get_session(session_id)
+    if session is None:
+        abort(404)
+
+    session_dir = session.session_dir
+    vtt_name = f"sub_{lang}.vtt"
+    vtt_path = os.path.join(session_dir, vtt_name)
+    if not os.path.exists(vtt_path):
+        abort(404)
+
+    video_manifest = os.path.join(session_dir, "video.m3u8")
+    try:
+        with open(video_manifest, "r") as f:
+            video_lines = f.readlines()
+    except Exception:
+        abort(503)
+
+    # Catchup video.m3u8 uses hls_list_size=0 (full VOD) — MEDIA-SEQUENCE is
+    # always 0 and never increments.  Mirroring it verbatim would give Televizo
+    # a static MEDIA-SEQUENCE, so it would fetch the VTT once and stop.
+    # Instead, build a sliding-window manifest: take the last WINDOW EXTINF
+    # entries and set MEDIA-SEQUENCE = total_segments - WINDOW.  This advances
+    # each time ffmpeg writes a new segment, forcing a VTT re-fetch.
+    WINDOW = 15
+    extinfs = [l for l in video_lines if l.startswith("#EXTINF:")]
+    total = len(extinfs)
+    window_extinfs = extinfs[max(0, total - WINDOW):]
+    seq = max(0, total - WINDOW)
+
+    # Copy header lines (EXTM3U, TARGETDURATION, VERSION) but replace the
+    # existing MEDIA-SEQUENCE line with our computed sliding-window value.
+    out = []
+    for line in video_lines:
+        if line.startswith("#EXTINF:") or (line.strip() and not line.startswith("#")):
+            break  # stop before segment data
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE"):
+            out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq}\n")
+        elif not line.startswith("#EXT-X-ENDLIST"):
+            out.append(line)
+    for extinf in window_extinfs:
+        out.append(extinf)
+        out.append(f"{vtt_name}\n")
+    # No EXT-X-ENDLIST: player keeps polling until video ends naturally.
+
+    content = "".join(out)
+    resp = Response(content, mimetype="application/x-mpegurl")
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
 @app.route("/catchup/<channel_id>/<session_id>/<path:segment>")
 def catchup_segment(channel_id: str, session_id: str, segment: str):
     session = _app_instance.catchup_manager.get_session(session_id)
@@ -341,8 +412,24 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
         abort(404)
 
     seg_path = os.path.join(session.session_dir, segment)
-    if not os.path.exists(seg_path):
+
+    # Sub manifests are served dynamically by catchup_sub_manifest(), not from
+    # static files — this handler only serves .ts and .vtt files.
+
+    if not os.path.exists(seg_path) and segment.endswith(".ts"):
+        # On-demand regen: segment was deleted by rolling cleanup (player rewound).
+        m = _SEG_RE.match(segment)
+        if not m or not session.regenerate_segment(int(m.group(1))):
+            abort(404)
+
+    elif not os.path.exists(seg_path):
         abort(404)
+
+    # Advance rolling-delete high-water mark after successful serve.
+    if segment.endswith(".ts"):
+        m = _SEG_RE.match(segment)
+        if m:
+            session.mark_fetched(int(m.group(1)))
 
     resp = send_from_directory(session.session_dir, segment)
     resp.headers["Cache-Control"] = "no-cache, no-store"

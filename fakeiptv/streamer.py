@@ -328,11 +328,44 @@ def _probe_audio_stream_index(path: str, preferred_lang: str = "eng") -> int:
     return 0
 
 
-def _extract_embedded_srt(path: str, lang: str) -> str:
+def _probe_subtitle_stream_indices(path: str, langs: list) -> dict:
+    """
+    Quick ffprobe to map language codes to subtitle stream indices.
+    Returns {lang: stream_idx} for text subtitle streams only (skips bitmap).
+    Used to build ffmpeg SRT side-output arguments.
+    """
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "s", path,
+        ], capture_output=True, text=True, timeout=10)
+        streams = json.loads(r.stdout).get("streams", [])
+    except Exception as exc:
+        log.debug("Subtitle stream probe failed for %s: %s", os.path.basename(path), exc)
+        return {}
+    result = {}
+    for lang in langs:
+        for i, s in enumerate(streams):
+            if _lang_matches(s.get("tags", {}).get("language", ""), lang):
+                codec = s.get("codec_name", "").lower()
+                if codec not in ("hdmv_pgs_subtitle", "dvd_subtitle", "vobsub"):
+                    result[lang] = i
+                break
+    return result
+
+
+def _extract_embedded_srt(path: str, lang: str, start_sec: float = 0.0,
+                          duration_sec: float = 0.0, timeout: int = 30) -> str:
     """
     Extract the subtitle stream matching `lang` (2- or 3-letter ISO code) from
     a video file and return its content as SRT text.  Returns "" on any failure
     (no matching stream, bitmap sub, extraction error, etc.).
+
+    start_sec: input-seek to this position before extracting.  Output timestamps
+    are relative to the seek point and shifted back to absolute below.
+    duration_sec: if > 0, stop reading after this many seconds (output -t).
+    Limits how much data ffmpeg reads on large files — critical for catchup on
+    4K files where reading to end-of-file over NFS exceeds the 30s timeout.
     """
     try:
         r = subprocess.run([
@@ -356,18 +389,49 @@ def _extract_embedded_srt(path: str, lang: str) -> str:
                 break
         if stream_idx is None:
             return ""
-        r2 = subprocess.run([
-            "ffmpeg", "-v", "quiet",
-            "-i", path,
-            "-map", f"0:s:{stream_idx}",
-            "-f", "srt", "pipe:1",
-        ], capture_output=True, text=True, timeout=60)
-        if r2.returncode == 0 and r2.stdout.strip():
+
+        cmd = ["ffmpeg", "-v", "quiet"]
+        if start_sec > 1.0:
+            # Input seek: jump near the inpoint so ffmpeg doesn't scan the
+            # entire file from byte 0.  Without -copyts, output timestamps are
+            # relative to the seek point — we shift them back to absolute below.
+            cmd += ["-ss", f"{start_sec:.3f}"]
+        cmd += ["-i", path]
+        if duration_sec > 0:
+            # Limit output to the session duration — stops ffmpeg from reading
+            # the rest of the file over NFS, which can easily exceed 30s for
+            # large 4K files even when a seek index is present.
+            cmd += ["-t", f"{duration_sec:.3f}"]
+        cmd += ["-map", f"0:s:{stream_idx}", "-f", "srt", "pipe:1"]
+
+        r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        raw = r2.stdout
+        if r2.returncode == 0 and raw.strip():
+            if start_sec > 1.0:
+                # Timestamps are relative to seek point; add start_sec back so
+                # callers receive absolute file-position timestamps as always.
+                def _shift(m):
+                    def p(ts):
+                        h, mn, s = ts.split(":")
+                        s, ms = s.split(",")
+                        return int(h)*3600 + int(mn)*60 + int(s) + int(ms)/1000
+                    def f(sec):
+                        sec = max(0.0, sec)
+                        h = int(sec // 3600)
+                        mn = int((sec % 3600) // 60)
+                        s = int(sec % 60)
+                        ms = int(round((sec % 1) * 1000))
+                        return f"{h:02d}:{mn:02d}:{s:02d},{ms:03d}"
+                    return f"{f(p(m.group(1)) + start_sec)} --> {f(p(m.group(2)) + start_sec)}"
+                raw = re.sub(
+                    r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})",
+                    _shift, raw,
+                )
             log.debug(
-                "Embedded sub extraction: got %d bytes from %s [%s]",
-                len(r2.stdout), os.path.basename(path), lang,
+                "Embedded sub extraction: got %d bytes from %s [%s] (seek=%.1fs)",
+                len(raw), os.path.basename(path), lang, start_sec,
             )
-        return r2.stdout
+        return raw
     except Exception as exc:
         log.debug(
             "Embedded SRT extraction failed for %s [%s]: %s",
@@ -469,6 +533,20 @@ class SubtitleStreamer:
         self.vtt_path = os.path.join(hls_dir, f"sub_{lang_label}.vtt")
         self.manifest_path = os.path.join(hls_dir, f"sub_{lang_label}.m3u8")
         self._ok = False
+        # Set True by ChannelStreamer when ffmpeg writes an SRT side-output for
+        # this lang — causes _generate() to skip blocking embedded extraction.
+        self.has_ffmpeg_srt = False
+
+    def write_placeholder(self):
+        """
+        Write an empty VTT immediately so hls_sub_manifest can return without
+        blocking.  Overwritten by write_files() once extraction completes.
+        """
+        os.makedirs(self.hls_dir, exist_ok=True)
+        with open(self.vtt_path, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n")
+        log.debug("Subtitle %s (%s): placeholder VTT written — awaiting extraction",
+                  self.lang or "und", self._channel.id)
 
     def is_running(self) -> bool:
         """True when the subtitle files have been written with a correct TIMESTAMP-MAP."""
@@ -523,13 +601,13 @@ class SubtitleStreamer:
         # that has them.
         self._ok = True
         if cue_count > 0:
-            log.debug(
-                "Subtitle track %s (%s): files written, MPEGTS:%d (%.3fs)",
-                self.lang or "und", self._channel.id, start_pts, start_pts / 90000,
+            log.info(
+                "Subtitle %s (%s): placeholder replaced — %d cues written (MPEGTS:%d)",
+                self.lang or "und", self._channel.id, cue_count, start_pts,
             )
         else:
-            log.debug(
-                "Subtitle track %s (%s): no cues in current window — empty VTT written",
+            log.info(
+                "Subtitle %s (%s): placeholder replaced — no cues in current window",
                 self.lang or "und", self._channel.id,
             )
 
@@ -620,7 +698,20 @@ class SubtitleStreamer:
                 # NAS pages; running ffmpeg on them blocks _subtitle_ready_event
                 # for several seconds per file.  They'll be extracted when they
                 # become the current entry on the next concat rebuild.
-                raw = _extract_embedded_srt(entry.path, self.lang) if is_current_entry else ""
+                if is_current_entry and self.has_ffmpeg_srt:
+                    # ffmpeg is writing an SRT side-output for this lang (piggyback
+                    # on the live ffmpeg read — zero extra NAS I/O).  Skip blocking
+                    # extraction here; _watch_live_srt() will update the VTT async.
+                    log.debug(
+                        "  [%s] entry %d (%s): ffmpeg SRT piggyback active"
+                        " — skipping blocking embedded extraction",
+                        self.lang or "und", idx % n, entry.title,
+                    )
+                    raw = ""
+                else:
+                    remaining = max(0.0, entry.duration_sec - inpoint)
+                    raw = _extract_embedded_srt(entry.path, self.lang, inpoint,
+                                                duration_sec=remaining) if is_current_entry else ""
                 if raw:
                     entries_with_subs += 1
                     cues = _parse_srt_cues(raw)
@@ -687,6 +778,7 @@ class ChannelStreamer:
         self._monitor_thread: Optional[threading.Thread] = None
         self._last_accessed: float = 0.0
         self._started_at: float = 0.0
+        self._last_launch_wall_time: float = 0.0  # wall time when _launch() last ran
         self._ever_watched: bool = False  # True once a client touches this channel
         self.hls_dir = os.path.join(tmp_base, f"ch_{channel.id}")
         # Video manifest — named "video.m3u8" so the server can serve a master
@@ -698,6 +790,10 @@ class ChannelStreamer:
         # The server waits on this before serving the master playlist so the player
         # always gets a VTT that has the right MPEGTS anchor (never MPEGTS:0).
         self._subtitle_ready_event = threading.Event()
+        # Langs whose subs are written as SRT side outputs by the main ffmpeg process.
+        # Populated in _launch() for the current entry; cleared on each restart.
+        self._live_srt_langs: set = set()
+        self._live_srt_indices: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -758,6 +854,45 @@ class ChannelStreamer:
         wait_ready fires at ~2s on the first segment).
         """
         return self._subtitle_ready_event.wait(timeout=timeout)
+
+    def regenerate_segment(self, seg_num: int) -> bool:
+        """
+        Recreate a live segment that was deleted by ffmpeg's sliding-window
+        cleanup.  Uses get_playing_at() with the approximate wall-clock time
+        when that segment was produced to find the source file and offset.
+        Returns True if the segment file was successfully written.
+        """
+        if self._last_launch_wall_time == 0.0:
+            return False
+        approx_ts = self._last_launch_wall_time + seg_num * HLS_SEGMENT_SECONDS
+        result = get_playing_at(self.channel, datetime.fromtimestamp(approx_ts))
+        if result is None:
+            return False
+        entry, offset_sec = result
+        seg_path = os.path.join(self.hls_dir, f"seg{seg_num}.ts")
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-ss", str(offset_sec),
+            "-t", str(HLS_SEGMENT_SECONDS),
+            "-i", entry.path,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+            "-map", "0:v:0", "-map", "0:a:0",
+            "-f", "mpegts", seg_path,
+        ]
+        try:
+            log.debug("Live regen seg%d for %s: %s", seg_num, self.channel.id, " ".join(cmd))
+            subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            return os.path.exists(seg_path) and os.path.getsize(seg_path) > 0
+        except Exception:
+            log.exception("Live regen failed for %s seg%d", self.channel.id, seg_num)
+            return False
 
     def _watch_ready(self):
         """Background thread: set _ready_event once the HLS manifest exists and
@@ -845,6 +980,7 @@ class ChannelStreamer:
         return sorted(langs)
 
     def _launch(self):
+        self._last_launch_wall_time = time.time()
         self._ready_event.clear()
         threading.Thread(
             target=self._watch_ready, daemon=True, name=f"ready-{self.channel.id}"
@@ -857,8 +993,10 @@ class ChannelStreamer:
 
             # Remove stale HLS segments and manifest from any previous run so the
             # player doesn't get confused by timestamp mismatches on restart.
+            # Also remove stale SRT side-output files so the new run starts fresh.
             for fname in os.listdir(self.hls_dir) if os.path.isdir(self.hls_dir) else []:
-                if fname.endswith(".ts") or fname.endswith(".m3u8") or fname.endswith(".vtt"):
+                if fname.endswith(".ts") or fname.endswith(".m3u8") \
+                        or fname.endswith(".vtt") or fname.endswith(".srt"):
                     try:
                         os.remove(os.path.join(self.hls_dir, fname))
                     except OSError:
@@ -898,16 +1036,48 @@ class ChannelStreamer:
             # --- Subtitles ---
             subtitle_langs = self._get_subtitle_langs()
             self._subtitle_ready_event.clear()
+            self._live_srt_langs = set()
+            self._live_srt_indices = {}
             log.debug(
                 "Channel %s: subtitle langs from entries: %s",
                 self.channel.id, subtitle_langs or "none",
             )
+
+            # Get now-playing early so we can probe the current entry for embedded subs.
+            np = get_now_playing(self.channel)
+
             if subtitle_langs:
+                # For langs that have no external SRT on the *current* entry, probe
+                # for an embedded subtitle stream.  The main ffmpeg process will write
+                # it as an SRT side-output (piggyback — zero extra NAS I/O), and a
+                # background watcher thread will update the VTT progressively.
+                # External SRT always wins: only probe langs with no file on disk.
+                current_entry = np.entry if np else None
+                if current_entry:
+                    embedded_for_probe = [
+                        l for l in subtitle_langs
+                        if not (current_entry.subtitle_paths.get(l)
+                                and os.path.exists(current_entry.subtitle_paths[l]))
+                    ]
+                    if embedded_for_probe:
+                        self._live_srt_indices = _probe_subtitle_stream_indices(
+                            current_entry.path, embedded_for_probe
+                        )
+                        self._live_srt_langs = set(self._live_srt_indices.keys())
+                        if self._live_srt_langs:
+                            log.info(
+                                "Channel %s: ffmpeg SRT side outputs for langs=%s",
+                                self.channel.id, sorted(self._live_srt_langs),
+                            )
+
                 # Register SubtitleStreamers immediately (no SRT I/O here).
                 # SRT reading (build_cues) runs in the async thread in parallel
                 # with ffmpeg startup, so _launch() returns without any NAS reads.
                 for lang in subtitle_langs:
                     sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
+                    sub.write_placeholder()
+                    if lang in self._live_srt_langs:
+                        sub.has_ffmpeg_srt = True
                     self._subtitle_streamers[lang] = sub
 
                 # Async thread: read SRTs, wait for first TS segment, probe
@@ -931,7 +1101,6 @@ class ChannelStreamer:
             # ffmpeg.  Without this, cold-cache seeks to deep positions (e.g.
             # 83 min into a 30 GB BluRay) take 5-10s over SMB, exhausting the
             # STARTUP_TIMEOUT and causing a needless restart from entry beginning.
-            np = get_now_playing(self.channel)
             if np and np.offset_sec > 0 and np.entry:
                 _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
 
@@ -976,6 +1145,15 @@ class ChannelStreamer:
                 "-hls_segment_filename", seg_pattern,
                 self.manifest_path,
             ]
+            # SRT side outputs: one per embedded-subtitle lang, written at -re rate.
+            # Piggybacks on the main ffmpeg read — zero extra NAS I/O.
+            # -flush_packets 1: force packet-level flushing so the watcher thread
+            # sees data immediately rather than waiting for the 32 KB avio buffer.
+            for lang, idx in self._live_srt_indices.items():
+                lang_label = lang or "und"
+                srt_out = os.path.join(self.hls_dir, f"sub_{lang_label}.srt")
+                cmd += ["-vn", "-an", "-map", f"0:s:{idx}",
+                        "-flush_packets", "1", "-c:s", "srt", srt_out]
             log.debug("ffmpeg cmd: %s", " ".join(cmd))
             self._process = subprocess.Popen(
                 cmd,
@@ -1052,22 +1230,36 @@ class ChannelStreamer:
             os.path.basename(entry_path) if entry_path else "?",
         )
 
-        # Step 4 — build cue lists with the correct inpoint (single pass)
+        # Step 4 — build cue lists with the correct inpoint (parallel, one thread per lang)
         pending: Dict[str, tuple] = {}
-        for lang in subtitle_langs:
+        pending_lock = threading.Lock()
+
+        def _build_one(lang):
             sub = self._subtitle_streamers.get(lang)
             if sub is None:
-                continue
+                return
             try:
                 cue_lines, cue_count = sub.build_cues(actual_inpoint)
             except Exception:
                 log.exception("SubtitleStreamer build_cues failed (%s, %s)",
                               self.channel.id, lang or "und")
                 cue_lines, cue_count = [], 0
-            pending[lang] = (cue_lines, cue_count)
+            with pending_lock:
+                pending[lang] = (cue_lines, cue_count)
 
-        # Step 5 — write VTT files
+        build_threads = [
+            threading.Thread(target=_build_one, args=(lang,), daemon=True)
+            for lang in subtitle_langs
+        ]
+        for t in build_threads:
+            t.start()
+        for t in build_threads:
+            t.join()
+
+        # Step 5 — write VTT files (with whatever cues we have from external SRTs)
+        # and start live SRT watcher threads for embedded langs.
         ready_langs = []
+        launch_time = self._last_launch_wall_time
         for lang, (cue_lines, cue_count) in pending.items():
             sub = self._subtitle_streamers.get(lang)
             if sub is None:
@@ -1076,12 +1268,134 @@ class ChannelStreamer:
             if sub.is_running():
                 ready_langs.append(lang)
 
+            # For langs where ffmpeg writes an SRT side-output, start a watcher
+            # thread that polls the growing file and updates the VTT progressively.
+            # The player keeps re-fetching the VTT (live sub playlist has no
+            # EXT-X-ENDLIST) and picks up new cues on each poll.
+            if lang in self._live_srt_langs:
+                lang_label = lang or "und"
+                srt_path = os.path.join(self.hls_dir, f"sub_{lang_label}.srt")
+                threading.Thread(
+                    target=self._watch_live_srt,
+                    args=(lang, srt_path, sub.vtt_path, start_pts,
+                          cue_lines, launch_time),
+                    daemon=True,
+                    name=f"live-srt-{self.channel.id}-{lang_label}",
+                ).start()
+                log.info("Channel %s: started live SRT watcher for [%s]",
+                         self.channel.id, lang_label)
+
         log.info(
             "Channel %s: subtitle tracks ready: %s (no cues: %s)",
             self.channel.id, ready_langs or "none",
             [l for l in pending if l not in ready_langs] or "none",
         )
         self._subtitle_ready_event.set()
+
+    def _watch_live_srt(self, lang: str, srt_path: str, vtt_path: str,
+                        start_pts: int, existing_cue_lines: list,
+                        launch_time: float):
+        """
+        Poll the ffmpeg SRT side-output file as it grows and rewrite the VTT.
+
+        ffmpeg writes the SRT at -re (realtime) rate.  We poll every 2s and
+        overwrite the VTT with:
+          - SRT cues from ffmpeg (current entry, timestamps start at 0 = LOCAL:0)
+          - Existing cues from external SRTs (future entries in the concat window)
+
+        The live subtitle manifest (served by hls_sub_manifest) has no
+        EXT-X-ENDLIST, so the player keeps polling and picks up the updated VTT
+        on its next manifest cycle (~4s for Televizo).
+
+        Stops when:
+          - The channel is stopped (_stop_event set).
+          - A newer _launch() runs (launch_time differs from _last_launch_wall_time).
+          - The SRT file doesn't grow for 30 × 2s = 60s (e.g. entry has no subs).
+        """
+        lang_label = lang or "und"
+        cue_style = (
+            "  background-color: transparent;\n"
+            "  text-shadow: 1px 0 0 #000, -1px 0 0 #000,"
+            " 0 1px 0 #000, 0 -1px 0 #000;\n"
+        )
+        if lang == "he":
+            cue_style += "  direction: rtl;\n  unicode-bidi: isolate;\n"
+
+        last_size = 0
+        stall_count = 0
+
+        while not self._stop_event.is_set():
+            # Check if a newer _launch() superseded this watcher.
+            if self._last_launch_wall_time != launch_time:
+                return
+
+            time.sleep(2)
+
+            if self._stop_event.is_set() or self._last_launch_wall_time != launch_time:
+                return
+
+            if not os.path.exists(srt_path):
+                stall_count += 1
+                if stall_count >= 30:   # 60s with no file
+                    log.debug(
+                        "live SRT watcher %s [%s]: file never appeared — stopping",
+                        self.channel.id, lang_label,
+                    )
+                    return
+                continue
+
+            size = os.path.getsize(srt_path)
+            if size <= last_size:
+                stall_count += 1
+                if stall_count >= 30:   # 60s with no growth
+                    log.debug(
+                        "live SRT watcher %s [%s]: no growth after %d B — stopping",
+                        self.channel.id, lang_label, size,
+                    )
+                    return
+                continue
+
+            stall_count = 0
+            last_size = size
+
+            try:
+                raw = _read_srt(srt_path)
+                cues = _parse_srt_cues(raw)
+                if not cues:
+                    continue
+
+                # Timestamps from ffmpeg SRT (avoid_negative_ts make_zero applied)
+                # start at 0 = LOCAL:00:00:00.000.  X-TIMESTAMP-MAP=MPEGTS:{start_pts}
+                # maps LOCAL:0 to the correct MPEGTS offset.  No adjustment needed.
+                ffmpeg_cue_lines = []
+                for cue_start, cue_end, text in cues:
+                    if lang == "he":
+                        text = "\n".join(_he_bidi_fix(_l) for _l in text.split("\n"))
+                    ffmpeg_cue_lines.append(
+                        f"{_sec_to_vtt_ts(cue_start)} --> {_sec_to_vtt_ts(cue_end)}\n"
+                        f"{text}\n\n"
+                    )
+
+                with open(vtt_path, "w", encoding="utf-8") as f:
+                    f.write("WEBVTT\n")
+                    f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
+                    f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
+                    # Current-entry cues first (stream start = 0)
+                    f.writelines(ffmpeg_cue_lines)
+                    # Future-entry cues from external SRTs (non-zero stream_pos timestamps)
+                    f.writelines(existing_cue_lines)
+
+                log.info(
+                    "live SRT watcher %s [%s]: updated VTT — %d ffmpeg cues"
+                    " + %d external cues",
+                    self.channel.id, lang_label,
+                    len(ffmpeg_cue_lines), len(existing_cue_lines),
+                )
+            except Exception as exc:
+                log.debug(
+                    "live SRT watcher %s [%s]: error: %s",
+                    self.channel.id, lang_label, exc,
+                )
 
     def _kill(self):
         with self._lock:
@@ -1381,6 +1695,11 @@ class StreamManager:
         """True if any channel is currently running."""
         return bool(self._streamers)
 
+    def regenerate_segment(self, ch_id: str, seg_num: int) -> bool:
+        """Re-create a deleted live segment on demand. Returns True if successful."""
+        s = self._streamers.get(ch_id)
+        return s.regenerate_segment(seg_num) if s else False
+
     def _reap_loop(self):
         """Background thread: stop ffmpeg for channels with no recent client activity."""
         while True:
@@ -1415,6 +1734,10 @@ class StreamManager:
 # How long (seconds) to keep a catchup session alive after last manifest request.
 CATCHUP_SESSION_TTL = 7200   # 2 hours
 
+# Trailing segment buffer for rolling delete.  Segments behind HWM - KEEP are
+# deleted immediately; on-demand regen recreates them if the player rewinds.
+CATCHUP_KEEP_SEGMENTS = 30   # 30 × 2s = 60s trailing buffer
+
 
 class CatchupSession:
     """
@@ -1435,6 +1758,12 @@ class CatchupSession:
         self.manifest_path = os.path.join(session_dir, "stream.m3u8")
         self._process: Optional[subprocess.Popen] = None
         self._last_accessed = time.time()
+        self._audio_idx: int = 0          # probed in start(), reused by regenerate_segment
+        self._hwm: int = -1               # highest segment number fetched by a client
+        self._last_deleted: int = -1      # highest segment number already deleted
+        self._regen_events: Dict[int, threading.Event] = {}
+        self._regen_lock = threading.Lock()
+        self._subs_ready = threading.Event()  # set after VTTs are written with real content
 
     def touch(self):
         self._last_accessed = time.time()
@@ -1446,16 +1775,49 @@ class CatchupSession:
         os.makedirs(self.session_dir, exist_ok=True)
         _nas_prewarm(self.entry.path, self.offset_sec, self.entry.duration_sec)
         audio_idx = _probe_audio_stream_index(self.entry.path, self._preferred_audio_language)
+        self._audio_idx = audio_idx
         seg_pattern = os.path.join(self.session_dir, "seg%d.ts")
         video_manifest = os.path.join(self.session_dir, "video.m3u8")
 
-        # ffmpeg produces video+audio only; subtitles are handled by
-        # _write_subs_and_master (avoids the multi-stream WebVTT muxer error).
+        # Probe subtitle stream indices for langs that have no external SRT.
+        # These will be written as SRT side outputs by the main ffmpeg process
+        # (piggyback on the -re read — zero extra NAS I/O).
+        # External SRT always wins: skip any lang that already has a file on disk.
+        self._sub_stream_indices: dict = {}
+        if self.subtitles:
+            always_langs = list(self._ALWAYS_SUBTITLE_LANGS)
+            for lang in self.entry.subtitle_paths:
+                if lang not in always_langs:
+                    always_langs.append(lang)
+            embedded_langs = [
+                l for l in always_langs
+                if l and not (self.entry.subtitle_paths.get(l) and
+                              os.path.exists(self.entry.subtitle_paths[l]))
+            ]
+            if embedded_langs:
+                self._sub_stream_indices = _probe_subtitle_stream_indices(
+                    self.entry.path, embedded_langs
+                )
+                if self._sub_stream_indices:
+                    log.debug(
+                        "Catchup %s: SRT side outputs for langs=%s",
+                        self.session_id, list(self._sub_stream_indices),
+                    )
+
+        # ffmpeg produces video+audio + optional SRT side outputs.
+        # Subtitles as WebVTT are handled separately by _write_subs_and_master.
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "error",
             "-ss", str(self.offset_sec),
+            # Real-time rate limiting: write segments at playback speed so
+            # ffmpeg never gets more than a few segments ahead of the player.
+            # Without -re, ffmpeg writes all segments instantly (full NAS I/O
+            # speed), filling the tmpfs before the rolling delete can keep up.
+            # Must be an input option (before -i), not output.
+            "-re",
+            "-avoid_negative_ts", "make_zero",
             "-i", self.entry.path,
             "-t", str(self.duration_sec),
             "-c:v", "copy",
@@ -1468,6 +1830,15 @@ class CatchupSession:
             "-hls_segment_filename", seg_pattern,
             video_manifest,
         ]
+        # SRT side outputs: one per embedded-subtitle lang, written at -re rate.
+        # No extra NAS reads — ffmpeg is already reading the file for video.
+        # -flush_packets 1: force packet-level flushing so the watcher sees data
+        # immediately rather than waiting for the 32 KB avio write buffer.
+        for lang, idx in self._sub_stream_indices.items():
+            lang_label = lang or "und"
+            srt_out = os.path.join(self.session_dir, f"sub_{lang_label}.srt")
+            cmd += ["-vn", "-an", "-map", f"0:s:{idx}",
+                    "-flush_packets", "1", "-c:s", "srt", srt_out]
         log.debug("Catchup ffmpeg: %s", " ".join(cmd))
         self._process = subprocess.Popen(
             cmd,
@@ -1538,14 +1909,16 @@ class CatchupSession:
 
     def _write_subs_and_master(self):
         """
-        Background thread: convert SRT(s) to WebVTT (time-shifted to the
-        actual keyframe seek position), then write the HLS master playlist.
+        Background thread: write HLS master playlist and subtitle VTTs.
 
-        Always declares _ALWAYS_SUBTITLE_LANGS tracks so the player always
-        shows both options.  Languages with no SRT get an empty VTT.
-
-        Uses start_pts/90000 (not offset_sec) as the cue shift so subtitles
-        stay in sync even when ffmpeg snaps to a keyframe before the seek point.
+        Non-blocking design — mirrors the live channel approach:
+          1. Wait for seg0.ts (ffmpeg started writing).
+          2. Probe start_pts + actual keyframe inpoint.
+          3. Write placeholder VTTs + stream.m3u8 immediately → is_ready() fires,
+             server redirects the player, video starts.
+          4. Fire per-lang threads to extract/parse subs, overwrite VTTs.
+             Player fetches sub_he.vtt via catchup_segment which waits on
+             _subs_ready so the final content is served on first fetch.
         """
         seg0 = os.path.join(self.session_dir, "seg0.ts")
         deadline = time.time() + 35
@@ -1554,82 +1927,248 @@ class CatchupSession:
                 self._process and self._process.poll() is not None
             ):
                 if self.subtitles:
-                    self._write_master(self._ALWAYS_SUBTITLE_LANGS)
+                    self._write_placeholder_vtts_and_master(
+                        self._ALWAYS_SUBTITLE_LANGS, 0
+                    )
                 else:
                     self._write_master([])
+                self._subs_ready.set()
                 return
             time.sleep(0.2)
 
-        # X-TIMESTAMP-MAP needs the MPEGTS PTS of the first output frame.
+        # Probe the actual first video PTS from seg0.ts (90kHz units).
+        # With avoid_negative_ts make_zero + B-frame encoding, the minimum DTS
+        # (video DTS, which precedes PTS for B-frames) is shifted to 0, so the
+        # first video PTS lands at start_pts > 0 (~B-frame DTS offset).
+        # This value must be used in two places:
+        #   1. TIMESTAMP-MAP MPEGTS:{start_pts}=LOCAL:0  (player alignment)
+        #   2. Path B cue offset = start_pts/90000  (cancel the extra shift
+        #      that make_zero adds to the SRT output timestamps)
+        # Path A (external SRT) already uses actual_start_sec which is correct.
         start_pts = _probe_segment_start_pts(seg0) or 0
-
-        # Cue shift: use the actual keyframe position in the source file,
-        # not offset_sec and not start_pts/90000.
-        # ffmpeg snaps -ss to the nearest keyframe before offset_sec, AND
-        # resets output PTS to ~0, so start_pts/90000 ≈ 0 (wrong).
-        # _probe_keyframe_inpoint finds the exact keyframe ffmpeg landed on,
-        # which is the true t=0 of the output stream.
         actual_start_sec = _probe_keyframe_inpoint(
             self.entry.path, self.offset_sec, self.entry.duration_sec
+        )
+        log.info(
+            "Catchup %s subtitle timing: offset_sec=%.3f actual_start=%.3f "
+            "start_pts=%d (%.3fs) pts_minus_actual=%.3fs",
+            self.session_id, self.offset_sec, actual_start_sec,
+            start_pts, start_pts / 90000.0,
+            start_pts / 90000.0 - (self.offset_sec - actual_start_sec),
         )
 
         if not self.subtitles:
             self._write_master([])
+            self._subs_ready.set()
             return
 
-        # Collect all languages to declare: always-set + any extras in subtitle_paths
+        # Collect all languages to declare
         langs = list(self._ALWAYS_SUBTITLE_LANGS)
         for lang in self.entry.subtitle_paths:
             if lang not in langs:
                 langs.append(lang)
 
-        for lang in langs:
-            lang_label = lang or "und"
-            srt_path = self.entry.subtitle_paths.get(lang, "")
-            cue_lines = []
-            if srt_path and os.path.exists(srt_path):
-                try:
-                    raw = _read_srt(srt_path)
-                    cues = _parse_srt_cues(raw)
-                    for cue_start, cue_end, text in cues:
-                        s = cue_start - actual_start_sec
-                        e = cue_end - actual_start_sec
-                        if e <= 0:
-                            continue
-                        s = max(0.0, s)
-                        if lang == "he":
-                            text = "\n".join(
-                                _he_bidi_fix(line) for line in text.split("\n")
-                            )
-                        cue_lines.append(
-                            f"{_sec_to_vtt_ts(s)} --> {_sec_to_vtt_ts(e)}\n"
-                            f"{text}\n\n"
-                        )
-                except Exception:
-                    log.exception(
-                        "Catchup %s: SRT parse failed for lang=%s",
-                        self.session_id, lang_label,
-                    )
+        # Step 3 — placeholder VTTs + master immediately so player can start
+        self._write_placeholder_vtts_and_master(langs, start_pts)
 
-            cue_style = (
+        # Step 4 — extract real cues per lang, overwrite VTTs.
+        #
+        # Two paths per language:
+        #   A) External SRT or no-SRT-side-output: _extract_one (blocking, may call
+        #      _extract_embedded_srt as last resort).
+        #   B) Ffmpeg SRT side output available: _poll_ffmpeg_srt — daemon thread
+        #      that reads the growing SRT every 15s and updates VTT + manifest.
+        #      Zero extra NAS I/O — ffmpeg is already reading the file for video.
+
+        def _cue_style(lang):
+            s = (
                 "  background-color: transparent;\n"
                 "  text-shadow: 1px 0 0 #000, -1px 0 0 #000,"
                 " 0 1px 0 #000, 0 -1px 0 #000;\n"
             )
             if lang == "he":
-                cue_style += "  direction: rtl;\n  unicode-bidi: isolate;\n"
+                s += "  direction: rtl;\n  unicode-bidi: isolate;\n"
+            return s
 
+        def _write_vtt(lang, lang_label, cue_lines):
+            vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
+            try:
+                with open(vtt_path, "w", encoding="utf-8") as f:
+                    f.write("WEBVTT\n")
+                    f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
+                    f.write(f"STYLE\n::cue {{\n{_cue_style(lang)}}}\n\n")
+                    f.writelines(cue_lines)
+            except OSError as exc:
+                log.error("Catchup %s: VTT write failed lang=%s: %s",
+                          self.session_id, lang_label, exc)
+
+        def _bump_manifest(lang_label, seq, endlist=False):
+            sub_m3u8 = os.path.join(self.session_dir, f"sub_{lang_label}.m3u8")
+            try:
+                with open(sub_m3u8, "w", encoding="utf-8") as f:
+                    f.write(
+                        "#EXTM3U\n"
+                        "#EXT-X-TARGETDURATION:99999\n"
+                        "#EXT-X-VERSION:3\n"
+                        f"#EXT-X-MEDIA-SEQUENCE:{seq}\n"
+                        f"#EXTINF:{self.duration_sec:.1f},\n"
+                        f"sub_{lang_label}.vtt\n"
+                    )
+                    if endlist:
+                        f.write("#EXT-X-ENDLIST\n")
+            except OSError:
+                pass
+
+        def _build_cues_from_raw(raw, lang, offset):
+            """Parse SRT raw text and return VTT cue lines. offset subtracted from timestamps."""
+            cue_lines = []
+            try:
+                for cue_start, cue_end, text in _parse_srt_cues(raw):
+                    s = cue_start - offset
+                    e = cue_end - offset
+                    if e <= 0:
+                        continue
+                    s = max(0.0, s)
+                    if lang == "he":
+                        text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
+                    cue_lines.append(
+                        f"{_sec_to_vtt_ts(s)} --> {_sec_to_vtt_ts(e)}\n{text}\n\n"
+                    )
+            except Exception:
+                log.exception("Catchup %s: cue parse failed lang=%s",
+                              self.session_id, lang or "und")
+            return cue_lines
+
+        def _extract_one(lang):
+            """Path A: external SRT (instant) or subprocess fallback (blocking)."""
+            lang_label = lang or "und"
+            srt_path = self.entry.subtitle_paths.get(lang, "")
+            raw = ""
+            if srt_path and os.path.exists(srt_path):
+                try:
+                    raw = _read_srt(srt_path)
+                except Exception:
+                    log.exception("Catchup %s: SRT read failed lang=%s",
+                                  self.session_id, lang_label)
+            elif lang and lang not in self._sub_stream_indices:
+                # No ffmpeg SRT side output — fall back to standalone subprocess.
+                raw = _extract_embedded_srt(self.entry.path, lang, actual_start_sec,
+                                             self.duration_sec, timeout=120)
+            cue_lines = _build_cues_from_raw(raw, lang, actual_start_sec) if raw else []
+            log.debug("Catchup %s: wrote %d cues lang=%s (external/fallback)",
+                      self.session_id, len(cue_lines), lang_label)
+            _write_vtt(lang, lang_label, cue_lines)
+
+        def _poll_ffmpeg_srt(lang):
+            """Path B: read the SRT written by the main ffmpeg every 15s, update VTT."""
+            lang_label = lang or "und"
+            srt_path = os.path.join(self.session_dir, f"sub_{lang_label}.srt")
+            seq = 0
+            last_size = 0
+
+            while True:
+                # Sleep 2 s (in 0.5s steps so we notice process exit quickly).
+                for _ in range(4):
+                    time.sleep(0.5)
+                    if self._process and self._process.poll() is not None:
+                        break
+
+                if not os.path.exists(srt_path):
+                    if self._process and self._process.poll() is not None:
+                        break
+                    continue
+
+                size = os.path.getsize(srt_path)
+                if size == last_size:
+                    if self._process and self._process.poll() is not None:
+                        break
+                    continue  # no new data yet
+                last_size = size
+
+                try:
+                    raw = _read_srt(srt_path)
+                except Exception:
+                    if self._process and self._process.poll() is not None:
+                        break
+                    continue
+
+                # make_zero shifts all output PTS by the minimum DTS (B-frame DTS,
+                # which precedes the first video PTS by start_pts/90000 seconds).
+                # Subtract that same amount from the SRT timestamps so the cues
+                # align with the video timeline (same correction used in TIMESTAMP-MAP).
+                cue_lines = _build_cues_from_raw(raw, lang, start_pts / 90000.0)
+                if not cue_lines:
+                    if self._process and self._process.poll() is not None:
+                        break
+                    continue
+
+                if seq == 0:
+                    # Log first cue raw SRT timestamp for timing diagnosis
+                    try:
+                        first_cues = list(_parse_srt_cues(raw))
+                        if first_cues:
+                            raw_first = first_cues[0][0]
+                            log.info(
+                                "Catchup %s SRT first cue: raw_ts=%.3fs "
+                                "after_offset=%.3fs (offset=%.3fs) lang=%s",
+                                self.session_id, raw_first,
+                                raw_first - start_pts / 90000.0,
+                                start_pts / 90000.0, lang_label,
+                            )
+                    except Exception:
+                        pass
+
+                seq += 1
+                done = (self._process and self._process.poll() is not None)
+                _write_vtt(lang, lang_label, cue_lines)
+                _bump_manifest(lang_label, seq, endlist=done)
+                log.debug(
+                    "Catchup %s: SRT poll — %d cues lang=%s seq=%d%s",
+                    self.session_id, len(cue_lines), lang_label, seq,
+                    " [final]" if done else "",
+                )
+                if done:
+                    return
+
+        # Launch Path-A threads (external SRT or subprocess fallback).
+        ext_threads = [
+            threading.Thread(target=_extract_one, args=(lang,), daemon=True)
+            for lang in langs
+        ]
+        for t in ext_threads:
+            t.start()
+
+        # Launch Path-B daemon threads (ffmpeg SRT polling) — do not join.
+        for lang in langs:
+            if lang in self._sub_stream_indices:
+                threading.Thread(
+                    target=_poll_ffmpeg_srt, args=(lang,), daemon=True,
+                    name=f"srt-poll-{self.session_id}-{lang or 'und'}",
+                ).start()
+
+        # Wait for Path-A threads, then bump their manifests.
+        for t in ext_threads:
+            t.join()
+
+        # Bump manifest for langs handled by Path A (external SRT / subprocess).
+        # Path B manages its own manifest bumps from within _poll_ffmpeg_srt.
+        for lang in langs:
+            if lang not in self._sub_stream_indices:
+                _bump_manifest(lang or "und", seq=1, endlist=True)
+
+        self._subs_ready.set()
+        log.info("Catchup %s: subtitle extraction complete — VTTs ready for langs=%s",
+                 self.session_id, langs)
+
+    def _write_placeholder_vtts_and_master(self, langs, start_pts):
+        """Write empty VTTs + sub manifests + stream.m3u8 so is_ready() fires immediately."""
+        for lang in langs:
+            lang_label = lang or "und"
             vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
             sub_m3u8 = os.path.join(self.session_dir, f"sub_{lang_label}.m3u8")
-
             with open(vtt_path, "w", encoding="utf-8") as f:
                 f.write("WEBVTT\n")
-                f.write(
-                    f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n"
-                )
-                f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
-                f.writelines(cue_lines)
-
+                f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
             with open(sub_m3u8, "w", encoding="utf-8") as f:
                 f.write(
                     "#EXTM3U\n"
@@ -1638,14 +2177,11 @@ class CatchupSession:
                     "#EXT-X-MEDIA-SEQUENCE:0\n"
                     f"#EXTINF:{self.duration_sec:.1f},\n"
                     f"sub_{lang_label}.vtt\n"
-                    "#EXT-X-ENDLIST\n"
+                    # No EXT-X-ENDLIST — player keeps polling so it picks up
+                    # the updated VTT once async extraction completes.
                 )
-            log.debug(
-                "Catchup %s: wrote %d cues for lang=%s (MPEGTS:%d, shift=%.3fs)",
-                self.session_id, len(cue_lines), lang_label,
-                start_pts, actual_start_sec,
-            )
-
+        log.debug("Catchup %s: placeholder VTTs written for langs=%s — awaiting extraction",
+                  self.session_id, langs)
         self._write_master(langs)
 
     def _write_master(self, sub_langs):
@@ -1678,6 +2214,81 @@ class CatchupSession:
             and self._process.poll() is not None
             and not os.path.exists(self.manifest_path)
         )
+
+    def mark_fetched(self, seg_num: int):
+        """
+        Called after a .ts segment is served.  Advances the high-water mark and
+        deletes segments more than CATCHUP_KEEP_SEGMENTS behind the HWM so
+        4K VOD sessions don't fill the tmpfs.
+
+        Deleted segments are regenerated on demand if the player rewinds
+        (see regenerate_segment).
+        """
+        with self._regen_lock:
+            if seg_num > self._hwm:
+                self._hwm = seg_num
+            delete_before = self._hwm - CATCHUP_KEEP_SEGMENTS
+            if delete_before > self._last_deleted:
+                for n in range(self._last_deleted + 1, delete_before + 1):
+                    try:
+                        os.remove(os.path.join(self.session_dir, f"seg{n}.ts"))
+                    except OSError:
+                        pass
+                self._last_deleted = delete_before
+
+    def regenerate_segment(self, seg_num: int) -> bool:
+        """
+        Recreate a deleted segment on demand (player rewound past rolling-delete
+        window).  Deduplicates concurrent requests for the same segment number.
+        Returns True if the segment file exists and is non-empty after regen.
+        """
+        with self._regen_lock:
+            if seg_num in self._regen_events:
+                evt = self._regen_events[seg_num]
+                is_initiator = False
+            else:
+                evt = threading.Event()
+                self._regen_events[seg_num] = evt
+                is_initiator = True
+
+        if not is_initiator:
+            evt.wait(timeout=15)
+            seg_path = os.path.join(self.session_dir, f"seg{seg_num}.ts")
+            return os.path.exists(seg_path) and os.path.getsize(seg_path) > 0
+
+        seg_path = os.path.join(self.session_dir, f"seg{seg_num}.ts")
+        try:
+            start_sec = self.offset_sec + seg_num * HLS_SEGMENT_SECONDS
+            cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-ss", str(start_sec),
+                "-t", str(HLS_SEGMENT_SECONDS),
+                "-i", self.entry.path,
+                "-c:v", "copy", "-c:a", "copy",
+                "-map", "0:v:0", "-map", f"0:a:{self._audio_idx}",
+                "-f", "mpegts", seg_path,
+            ]
+            log.debug("Catchup regen seg%d: %s", seg_num, " ".join(cmd))
+            subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            result = os.path.exists(seg_path) and os.path.getsize(seg_path) > 0
+            if result:
+                log.debug("Catchup %s: regenerated seg%d", self.session_id, seg_num)
+            else:
+                log.warning("Catchup %s: regen failed for seg%d", self.session_id, seg_num)
+            return result
+        except Exception:
+            log.exception("Catchup %s: regen exception for seg%d", self.session_id, seg_num)
+            return False
+        finally:
+            evt.set()
+            with self._regen_lock:
+                self._regen_events.pop(seg_num, None)
 
 
 class CatchupManager:
@@ -1730,6 +2341,19 @@ class CatchupManager:
                     if abs(existing_ts - ts) <= REUSE_TOLERANCE:
                         s.touch()
                         return s
+
+            # Evict any old sessions for this channel outside the reuse window.
+            # Without this, skipping forward/backward spawns a new session per
+            # seek while the old (potentially multi-GB) sessions sit idle until
+            # the 2h reaper runs.
+            stale = [
+                sid for sid, s in self._sessions.items()
+                if sid.startswith(prefix) and abs(int(sid.rsplit("_", 1)[1]) - ts) > REUSE_TOLERANCE
+            ]
+            for sid in stale:
+                log.info("Evicting stale catchup session %s (new session for same channel)", sid)
+                self._sessions[sid].stop()
+                del self._sessions[sid]
 
             session_id = f"{channel.id}_{ts}"
             session_dir = os.path.join(self._tmp_base, "catchup", session_id)

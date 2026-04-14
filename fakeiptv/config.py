@@ -21,7 +21,7 @@ class MediaConfig:
 class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8080
-    rpi_ip: str = "127.0.0.1"
+    host_ip: str = "127.0.0.1"
     tmp_dir: str = "/dev/shm/fakeiptv"
     subtitles: bool = True
     audio_copy: bool = True   # False = always transcode audio to AAC (fixes DTS/incompatible codecs)
@@ -100,7 +100,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     server = ServerConfig(
         host=_env("FAKEIPTV_HOST", server_raw.get("host", "0.0.0.0")),
         port=_env_int("FAKEIPTV_PORT", int(server_raw.get("port", 8080))),
-        rpi_ip=_env("FAKEIPTV_RPI_IP", server_raw.get("rpi_ip", "127.0.0.1")),
+        host_ip=_env("FAKEIPTV_HOST_IP", server_raw.get("host_ip", "127.0.0.1")),
         tmp_dir=_env("FAKEIPTV_TMP_DIR", server_raw.get("tmp_dir", "/tmp/fakeiptv")),
         subtitles=_env_bool("FAKEIPTV_SUBTITLES", server_raw.get("subtitles", True)),
         audio_copy=_env_bool("FAKEIPTV_AUDIO_COPY", server_raw.get("audio_copy", True)),

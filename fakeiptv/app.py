@@ -57,7 +57,7 @@ class FakeIPTV:
         self.refresh()
         self._schedule_midnight_refresh()
         self._schedule_hourly_epg()
-        log.info("FakeIPTV ready on http://%s:%d", self.config.server.rpi_ip, self.config.server.port)
+        log.info("FakeIPTV ready on http://%s:%d", self.config.server.host_ip, self.config.server.port)
 
     def stop(self):
         if self._refresh_timer:
@@ -107,7 +107,7 @@ class FakeIPTV:
         )
 
     def _rebuild_cache(self):
-        base_url = f"http://{self.config.server.rpi_ip}:{self.config.server.port}"
+        base_url = f"http://{self.config.server.host_ip}:{self.config.server.port}"
         epg_url = f"{base_url}/epg.xml.gz"
         catchup_days = self.config.server.catchup_days
 

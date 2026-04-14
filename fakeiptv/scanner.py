@@ -387,13 +387,21 @@ def _find_subtitle_files(video_path: str) -> Dict[str, str]:
     base = os.path.splitext(video_path)[0]
     result: Dict[str, str] = {}
     for lang in sorted(_LANG_CODES):
-        candidate = f"{base}.{lang}.srt"
-        if os.path.exists(candidate):
-            result[lang] = candidate
-    # Unlabeled .srt — only if not already covered by a lang-specific file
+        # Match <base>.<lang>.srt and <base>.<lang>.<tag>.srt (e.g. .he.hi.srt)
+        for candidate in [f"{base}.{lang}.srt", f"{base}.{lang}.hi.srt"]:
+            if os.path.exists(candidate):
+                result[lang] = candidate
+                break
+    # Unlabeled .srt handling:
+    # If any lang-specific .srt was found alongside it (e.g. .en.srt), treat
+    # the bare .srt as Hebrew — this is the common Israeli release pattern.
+    # Otherwise keep it unlabeled ("") as a fallback.
     plain = f"{base}.srt"
-    if os.path.exists(plain) and "" not in result:
-        result[""] = plain
+    if os.path.exists(plain):
+        if result and "he" not in result:
+            result["he"] = plain
+        elif not result:
+            result[""] = plain
     if result:
         log.debug("Subtitle files found for %s: %s", os.path.basename(video_path), list(result.keys()))
     return result

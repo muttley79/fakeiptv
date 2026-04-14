@@ -113,9 +113,9 @@ def hls_manifest(channel_id: str):
         session = _app_instance.catchup_manager.get_or_create(channel, at)
         if session is None:
             abort(404)
-        deadline = time.time() + 15
+        deadline = time.time() + 30
         while not session.is_ready():
-            if time.time() > deadline:
+            if session.is_failed() or time.time() > deadline:
                 abort(503)
             time.sleep(0.5)
         return redirect(f"/catchup/{channel_id}/{session.session_id}/stream.m3u8")
@@ -311,10 +311,10 @@ def catchup_start(channel_id: str):
     if session is None:
         abort(404)
 
-    # Wait up to 15s for the first segment
-    deadline = time.time() + 15
+    # Wait up to 30s for the first segment (cold NAS can take >15s to open a file)
+    deadline = time.time() + 30
     while not session.is_ready():
-        if time.time() > deadline:
+        if session.is_failed() or time.time() > deadline:
             abort(503)
         time.sleep(0.5)
 

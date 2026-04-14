@@ -1444,29 +1444,29 @@ class CatchupSession:
 
     def start(self):
         os.makedirs(self.session_dir, exist_ok=True)
+        _nas_prewarm(self.entry.path, self.offset_sec, self.entry.duration_sec)
         audio_idx = _probe_audio_stream_index(self.entry.path, self._preferred_audio_language)
         seg_pattern = os.path.join(self.session_dir, "seg%d.ts")
+        video_manifest = os.path.join(self.session_dir, "video.m3u8")
+
+        # ffmpeg produces video+audio only; subtitles are handled by
+        # _write_subs_and_master (avoids the multi-stream WebVTT muxer error).
         cmd = [
             "ffmpeg",
             "-hide_banner",
             "-loglevel", "error",
-            # Seek within the source file to the programme start offset
             "-ss", str(self.offset_sec),
-            # Limit output to the programme's remaining duration
-            "-t", str(self.duration_sec),
             "-i", self.entry.path,
+            "-t", str(self.duration_sec),
             "-c:v", "copy",
             "-c:a", "copy",
             "-map", "0:v:0",
             "-map", f"0:a:{audio_idx}",
-            *(["-map", "0:s?", "-c:s", "webvtt"] if self.subtitles else []),
             "-f", "hls",
             "-hls_time", str(HLS_SEGMENT_SECONDS),
-            # No list_size limit — serve all segments (VOD)
             "-hls_list_size", "0",
-            # No delete_segments, no omit_endlist — write #EXT-X-ENDLIST when done
             "-hls_segment_filename", seg_pattern,
-            self.manifest_path,
+            video_manifest,
         ]
         log.debug("Catchup ffmpeg: %s", " ".join(cmd))
         self._process = subprocess.Popen(
@@ -1476,6 +1476,39 @@ class CatchupSession:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        threading.Thread(
+            target=self._monitor_stderr,
+            daemon=True,
+            name=f"catchup-stderr-{self.session_id}",
+        ).start()
+        threading.Thread(
+            target=self._write_subs_and_master,
+            daemon=True,
+            name=f"catchup-subs-{self.session_id}",
+        ).start()
+
+    def _monitor_stderr(self):
+        """Read ffmpeg stderr and log it; detect bitmap subtitle errors."""
+        proc = self._process
+        if not proc:
+            return
+        stderr_lines = []
+        try:
+            for raw in proc.stderr:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    stderr_lines.append(line)
+        except Exception:
+            pass
+        ret = proc.wait()
+        if ret != 0 or stderr_lines:
+            level = log.warning if ret != 0 else log.debug
+            for line in stderr_lines:
+                level("Catchup %s ffmpeg: %s", self.session_id, line)
+            if ret != 0:
+                log.warning(
+                    "Catchup %s ffmpeg exited with code %d", self.session_id, ret
+                )
 
     def stop(self):
         if self._process and self._process.poll() is None:
@@ -1491,8 +1524,160 @@ class CatchupSession:
         if os.path.isdir(self.session_dir):
             shutil.rmtree(self.session_dir, ignore_errors=True)
 
+    # Language display names for the HLS master playlist SUBTITLES group.
+    _LANG_NAMES = {
+        "he": "Hebrew", "en": "English", "es": "Spanish", "fr": "French",
+        "de": "German", "ar": "Arabic", "ru": "Russian", "pt": "Portuguese",
+        "it": "Italian", "nl": "Dutch", "pl": "Polish", "cs": "Czech",
+        "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "": "Subtitles",
+    }
+
+    # Subtitle languages always declared in the catchup master playlist,
+    # even when no SRT exists (empty VTT keeps the track option visible).
+    _ALWAYS_SUBTITLE_LANGS = ["he", "en"]
+
+    def _write_subs_and_master(self):
+        """
+        Background thread: convert SRT(s) to WebVTT (time-shifted to the
+        actual keyframe seek position), then write the HLS master playlist.
+
+        Always declares _ALWAYS_SUBTITLE_LANGS tracks so the player always
+        shows both options.  Languages with no SRT get an empty VTT.
+
+        Uses start_pts/90000 (not offset_sec) as the cue shift so subtitles
+        stay in sync even when ffmpeg snaps to a keyframe before the seek point.
+        """
+        seg0 = os.path.join(self.session_dir, "seg0.ts")
+        deadline = time.time() + 35
+        while not os.path.exists(seg0):
+            if time.time() > deadline or (
+                self._process and self._process.poll() is not None
+            ):
+                if self.subtitles:
+                    self._write_master(self._ALWAYS_SUBTITLE_LANGS)
+                else:
+                    self._write_master([])
+                return
+            time.sleep(0.2)
+
+        # X-TIMESTAMP-MAP needs the MPEGTS PTS of the first output frame.
+        start_pts = _probe_segment_start_pts(seg0) or 0
+
+        # Cue shift: use the actual keyframe position in the source file,
+        # not offset_sec and not start_pts/90000.
+        # ffmpeg snaps -ss to the nearest keyframe before offset_sec, AND
+        # resets output PTS to ~0, so start_pts/90000 ≈ 0 (wrong).
+        # _probe_keyframe_inpoint finds the exact keyframe ffmpeg landed on,
+        # which is the true t=0 of the output stream.
+        actual_start_sec = _probe_keyframe_inpoint(
+            self.entry.path, self.offset_sec, self.entry.duration_sec
+        )
+
+        if not self.subtitles:
+            self._write_master([])
+            return
+
+        # Collect all languages to declare: always-set + any extras in subtitle_paths
+        langs = list(self._ALWAYS_SUBTITLE_LANGS)
+        for lang in self.entry.subtitle_paths:
+            if lang not in langs:
+                langs.append(lang)
+
+        for lang in langs:
+            lang_label = lang or "und"
+            srt_path = self.entry.subtitle_paths.get(lang, "")
+            cue_lines = []
+            if srt_path and os.path.exists(srt_path):
+                try:
+                    raw = _read_srt(srt_path)
+                    cues = _parse_srt_cues(raw)
+                    for cue_start, cue_end, text in cues:
+                        s = cue_start - actual_start_sec
+                        e = cue_end - actual_start_sec
+                        if e <= 0:
+                            continue
+                        s = max(0.0, s)
+                        if lang == "he":
+                            text = "\n".join(
+                                _he_bidi_fix(line) for line in text.split("\n")
+                            )
+                        cue_lines.append(
+                            f"{_sec_to_vtt_ts(s)} --> {_sec_to_vtt_ts(e)}\n"
+                            f"{text}\n\n"
+                        )
+                except Exception:
+                    log.exception(
+                        "Catchup %s: SRT parse failed for lang=%s",
+                        self.session_id, lang_label,
+                    )
+
+            cue_style = (
+                "  background-color: transparent;\n"
+                "  text-shadow: 1px 0 0 #000, -1px 0 0 #000,"
+                " 0 1px 0 #000, 0 -1px 0 #000;\n"
+            )
+            if lang == "he":
+                cue_style += "  direction: rtl;\n  unicode-bidi: isolate;\n"
+
+            vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
+            sub_m3u8 = os.path.join(self.session_dir, f"sub_{lang_label}.m3u8")
+
+            with open(vtt_path, "w", encoding="utf-8") as f:
+                f.write("WEBVTT\n")
+                f.write(
+                    f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n"
+                )
+                f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
+                f.writelines(cue_lines)
+
+            with open(sub_m3u8, "w", encoding="utf-8") as f:
+                f.write(
+                    "#EXTM3U\n"
+                    "#EXT-X-TARGETDURATION:99999\n"
+                    "#EXT-X-VERSION:3\n"
+                    "#EXT-X-MEDIA-SEQUENCE:0\n"
+                    f"#EXTINF:{self.duration_sec:.1f},\n"
+                    f"sub_{lang_label}.vtt\n"
+                    "#EXT-X-ENDLIST\n"
+                )
+            log.debug(
+                "Catchup %s: wrote %d cues for lang=%s (MPEGTS:%d, shift=%.3fs)",
+                self.session_id, len(cue_lines), lang_label,
+                start_pts, actual_start_sec,
+            )
+
+        self._write_master(langs)
+
+    def _write_master(self, sub_langs):
+        """Write stream.m3u8 master playlist pointing to video.m3u8."""
+        lines = ["#EXTM3U\n"]
+        if sub_langs:
+            for lang in sub_langs:
+                lang_label = lang or "und"
+                name = self._LANG_NAMES.get(lang, lang.upper() or "Subtitles")
+                lines.append(
+                    f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",'
+                    f'LANGUAGE="{lang_label}",NAME="{name}",'
+                    f'DEFAULT=NO,AUTOSELECT=NO,'
+                    f'URI="sub_{lang_label}.m3u8"\n'
+                )
+            lines.append('#EXT-X-STREAM-INF:BANDWIDTH=8000000,SUBTITLES="subs"\n')
+        else:
+            lines.append("#EXT-X-STREAM-INF:BANDWIDTH=8000000\n")
+        lines.append("video.m3u8\n")
+        with open(self.manifest_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
     def is_ready(self) -> bool:
         return os.path.exists(self.manifest_path)
+
+    def is_failed(self) -> bool:
+        """True if ffmpeg exited without producing the manifest (crashed or errored)."""
+        return (
+            self._process is not None
+            and self._process.poll() is not None
+            and not os.path.exists(self.manifest_path)
+        )
 
 
 class CatchupManager:
@@ -1527,7 +1712,7 @@ class CatchupManager:
             return None
 
         entry, offset_sec = result
-        duration_sec = entry.duration_sec - offset_sec
+        duration_sec = max(entry.duration_sec - offset_sec, 5.0)
         ts = int(at.timestamp())
 
         with self._lock:

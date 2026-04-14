@@ -337,10 +337,12 @@ def _he_bidi_fix(line: str) -> str:
         leading_tags = m.group(1)  # e.g. '<i>' or ''
         punct = m.group(2)         # e.g. '.', '!', ',', '...'
         rest = line[m.end():]      # remainder after the punctuation
-        # Insert punct before any trailing continuation dash so '?-' not '-?'
+        # If there's a trailing dialogue dash, swap it to logical-first so that
+        # RTL rendering gives:  - sentence ?  (not  sentence ?-  or  sentence -?)
         trail = rest.rstrip()
         if trail.endswith('-'):
-            rest = rest[:rest.rfind('-')] + punct + '-'
+            rest_body = rest[:rest.rfind('-')].strip()
+            rest = '-' + rest_body + punct
         else:
             rest = rest + punct
         line = leading_tags + rest

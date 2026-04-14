@@ -296,36 +296,65 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
 
 
 _LATIN_RUN_RE = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[ \'-][A-Za-z][A-Za-z0-9]*)*')
+# Matches an optional run of leading HTML tags, then terminal/continuation
+# punctuation that Hebrew SRT authors place at logical position 0 to compensate
+# for LTR-rendering players (it appears at visual-left = end, by accident).
+_HTML_TAG_RE = re.compile(r'(<[^>]*>)')
+_LEADING_PUNCT_RE = re.compile(r'^((?:<[^>]*>)*)([.!?,\u2026]+)')
 
 
 def _he_bidi_fix(line: str) -> str:
     """
     Fix Hebrew RTL display in ExoPlayer-based players (Televizo, Stremio Android).
 
-    Two transforms applied to each cue line:
+    1. Move leading terminal/continuation punctuation to logical end.
+       Hebrew SRT files store . ! ? , … at logical position 0 to compensate
+       for broken LTR rendering (the punctuation lands at visual-left by
+       accident, which is correct for RTL end-of-sentence).  With proper RTL
+       rendering via RLI the same character would appear at visual-right
+       (wrong — looks like it's at the start).  Moving it to the logical end
+       lets RLI put it at visual-left where it belongs.
 
-    1. Prepend U+200F (RLM, RIGHT-TO-LEFT MARK) — zero-width character that
-       forces the paragraph base direction to RTL via the P2/P3 first-strong
-       algorithm.  Fixes leading boundary-neutral chars (dash, quote, digit).
+    2. Wrap line with U+2067 … U+2069 (RLI … PDI, Right-to-Left Isolate).
+       Explicit RTL isolate — cannot be overridden by surrounding view context.
 
-    2. Wrap each Latin run with U+2066 … U+2069 (LRI … PDI, Left-to-Right
-       Isolate / Pop Directional Isolate).  English words inside Hebrew create
-       LTR bidi runs; ExoPlayer treats run boundaries as word-wrap points,
-       splitting one subtitle cue across two visual lines.  LRI/PDI isolates
-       the English segment so surrounding Hebrew sees it as a single opaque
-       RTL unit, eliminating the rogue break points.
+    3. Wrap each Latin run (in text nodes only, not inside HTML tags) with
+       U+2066 … U+2069 (LRI … PDI).  Prevents ExoPlayer from breaking lines at
+       LTR/RTL bidi run boundaries when English words appear inside Hebrew text.
+       Processing only text nodes avoids corrupting <i> / <b> tag names.
 
-    3. Append U+200F (RLM) — anchors trailing neutral characters (,  .  ?  "
-       …) to RTL via the N1 rule (both adjacent strong chars are RTL).  Without
-       this, ExoPlayer may fall back to LTR for trailing punctuation when it
-       doesn't implement P2/P3, making commas/ellipsis appear at the visual
-       start of the line instead of the end.
+    4. Append U+200F (RLM) before closing PDI — anchors genuinely trailing
+       neutral characters (e.g. a comma at logical end) to RTL via N1.
     """
-    RLM = '\u200F'
+    RLI = '\u2067'
     LRI = '\u2066'
+    RLM = '\u200F'
     PDI = '\u2069'
-    fixed = _LATIN_RUN_RE.sub(lambda m: LRI + m.group() + PDI, line)
-    return RLM + fixed + RLM  # trailing RLM anchors terminal punctuation to RTL
+
+    # Step 1: relocate leading terminal/continuation punctuation to logical end.
+    m = _LEADING_PUNCT_RE.match(line)
+    if m:
+        leading_tags = m.group(1)  # e.g. '<i>' or ''
+        punct = m.group(2)         # e.g. '.', '!', ',', '...'
+        rest = line[m.end():]      # remainder after the punctuation
+        # Insert punct before any trailing continuation dash so '?-' not '-?'
+        trail = rest.rstrip()
+        if trail.endswith('-'):
+            rest = rest[:rest.rfind('-')] + punct + '-'
+        else:
+            rest = rest + punct
+        line = leading_tags + rest
+
+    # Step 2: wrap Latin runs in text nodes only (tags are passed through raw).
+    parts = _HTML_TAG_RE.split(line)
+    result = ''
+    for i, part in enumerate(parts):
+        if i % 2 == 0:  # text node
+            result += _LATIN_RUN_RE.sub(lambda mo: LRI + mo.group() + PDI, part)
+        else:           # HTML tag — preserve unchanged
+            result += part
+
+    return RLI + result + RLM + PDI
 
 
 class SubtitleStreamer:
@@ -388,7 +417,7 @@ class SubtitleStreamer:
                 # Explicit RTL direction for ExoPlayer versions that respect
                 # ::cue CSS — belt-and-suspenders alongside the RLM prepend in
                 # _he_bidi_fix.
-                cue_style += "  direction: rtl;\n"
+                cue_style += "  direction: rtl;\n  unicode-bidi: isolate;\n"
             f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
             f.writelines(cue_lines)
 

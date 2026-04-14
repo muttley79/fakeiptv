@@ -229,9 +229,14 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
     # channels start simultaneously (prewarm).  Max 3 probes at a time.
     with _keyframe_probe_sem:
         try:
-            # Search up to 60s before inpoint — covers long-GOP HEVC (GOP can
-            # be 30+ s).  NAS cache is warm so this completes in <1s.
-            start = max(0.0, inpoint - 60)
+            # Search back only as far as needed: gop_size*2 guarantees ≥1 full
+            # GOP while staying within the NAS SMB cache range.  ffmpeg has
+            # been reading from ~inpoint for ~2s, so the cache covers roughly
+            # [inpoint-gop_size, inpoint+ε].  The old fixed 60s window reached
+            # well outside that range on H.264 content (gop≈5s), forcing a
+            # cold NAS fetch → timeout → GOP fallback → subtitle drift.
+            # For HEVC (gop_size≈30s) this stays at 60s — same as before.
+            start = max(0.0, inpoint - max(gop_size * 2, 10.0))
             r = subprocess.run([
                 "ffprobe", "-v", "quiet",
                 "-print_format", "json",

@@ -38,10 +38,12 @@ class FakeIPTV:
             ready_segments=config.server.ready_segments,
             session_mode=config.server.prewarm_session,
             prewarm_adjacent=config.server.prewarm_adjacent,
+            preferred_audio_language=config.server.preferred_audio_language,
         )
         self.catchup_manager = CatchupManager(
             tmp_base=config.server.tmp_dir,
             subtitles=config.server.subtitles,
+            preferred_audio_language=config.server.preferred_audio_language,
         )
         self._refresh_timer: threading.Timer = None
         self._epg_timer: threading.Timer = None

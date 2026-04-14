@@ -25,6 +25,7 @@ class ServerConfig:
     tmp_dir: str = "/dev/shm/fakeiptv"
     subtitles: bool = True
     audio_copy: bool = True   # False = always transcode audio to AAC (fixes DTS/incompatible codecs)
+    preferred_audio_language: str = "eng"  # ISO 639-2 (3-letter) code; 2-letter also accepted
     catchup_days: int = 7
     prewarm: bool = False
     prewarm_session: bool = False  # keep all channels alive until X seconds after last activity
@@ -103,6 +104,8 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         tmp_dir=_env("FAKEIPTV_TMP_DIR", server_raw.get("tmp_dir", "/tmp/fakeiptv")),
         subtitles=_env_bool("FAKEIPTV_SUBTITLES", server_raw.get("subtitles", True)),
         audio_copy=_env_bool("FAKEIPTV_AUDIO_COPY", server_raw.get("audio_copy", True)),
+        preferred_audio_language=_env("FAKEIPTV_PREFERRED_AUDIO_LANGUAGE",
+                                      server_raw.get("preferred_audio_language", "eng")),
         catchup_days=_env_int("FAKEIPTV_CATCHUP_DAYS", int(server_raw.get("catchup_days", 7))),
         prewarm=_env_bool("FAKEIPTV_PREWARM", server_raw.get("prewarm", False)),
         prewarm_session=_env_bool("FAKEIPTV_PREWARM_SESSION", server_raw.get("prewarm_session", False)),

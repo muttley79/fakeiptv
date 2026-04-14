@@ -276,6 +276,106 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
     return fallback
 
 
+# ISO 639-1 (2-letter) → ISO 639-2 (3-letter) map for common languages.
+# Used when matching ffprobe language tags (which may be 2- or 3-letter) against
+# config.preferred_audio_language and subtitle lang codes.
+_LANG2_TO_LANG3: Dict[str, str] = {
+    "en": "eng", "he": "heb", "fr": "fra", "de": "deu",
+    "es": "spa", "ar": "ara", "ru": "rus", "pt": "por",
+    "it": "ita", "nl": "nld", "pl": "pol", "cs": "ces",
+    "ja": "jpn", "ko": "kor", "zh": "zho",
+}
+_LANG3_TO_LANG2: Dict[str, str] = {v: k for k, v in _LANG2_TO_LANG3.items()}
+
+
+def _lang_matches(tag: str, preferred: str) -> bool:
+    """Return True if ffprobe language tag `tag` matches `preferred` (2- or 3-letter)."""
+    tag = tag.lower().strip()
+    preferred = preferred.lower().strip()
+    if not tag:
+        return False
+    if tag == preferred:
+        return True
+    # Normalise both to 3-letter and compare
+    tag3 = _LANG2_TO_LANG3.get(tag, tag)
+    pref3 = _LANG2_TO_LANG3.get(preferred, preferred)
+    return tag3 == pref3
+
+
+def _probe_audio_stream_index(path: str, preferred_lang: str = "eng") -> int:
+    """
+    Return the index of the first audio stream whose language tag matches
+    preferred_lang (accepts both 2- and 3-letter ISO codes).  Returns 0 if no
+    match is found or the probe fails.
+    """
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "a", path,
+        ], capture_output=True, text=True, timeout=10)
+        streams = json.loads(r.stdout).get("streams", [])
+        for i, s in enumerate(streams):
+            lang = s.get("tags", {}).get("language", "")
+            if _lang_matches(lang, preferred_lang):
+                if i != 0:
+                    log.info(
+                        "Audio track probe: using stream %d (%s) for %s",
+                        i, lang, os.path.basename(path),
+                    )
+                return i
+    except Exception as exc:
+        log.debug("Audio stream probe failed for %s: %s", os.path.basename(path), exc)
+    return 0
+
+
+def _extract_embedded_srt(path: str, lang: str) -> str:
+    """
+    Extract the subtitle stream matching `lang` (2- or 3-letter ISO code) from
+    a video file and return its content as SRT text.  Returns "" on any failure
+    (no matching stream, bitmap sub, extraction error, etc.).
+    """
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "s", path,
+        ], capture_output=True, text=True, timeout=10)
+        streams = json.loads(r.stdout).get("streams", [])
+        stream_idx = None
+        for i, s in enumerate(streams):
+            slang = s.get("tags", {}).get("language", "")
+            if _lang_matches(slang, lang):
+                # Skip bitmap subtitle formats — ffmpeg can't export them as SRT
+                codec = s.get("codec_name", "").lower()
+                if codec in ("hdmv_pgs_subtitle", "dvd_subtitle", "vobsub"):
+                    log.debug(
+                        "Embedded sub extraction: skipping bitmap codec %s for %s [%s]",
+                        codec, os.path.basename(path), lang,
+                    )
+                    return ""
+                stream_idx = i
+                break
+        if stream_idx is None:
+            return ""
+        r2 = subprocess.run([
+            "ffmpeg", "-v", "quiet",
+            "-i", path,
+            "-map", f"0:s:{stream_idx}",
+            "-f", "srt", "pipe:1",
+        ], capture_output=True, text=True, timeout=60)
+        if r2.returncode == 0 and r2.stdout.strip():
+            log.debug(
+                "Embedded sub extraction: got %d bytes from %s [%s]",
+                len(r2.stdout), os.path.basename(path), lang,
+            )
+        return r2.stdout
+    except Exception as exc:
+        log.debug(
+            "Embedded SRT extraction failed for %s [%s]: %s",
+            os.path.basename(path), lang, exc,
+        )
+    return ""
+
+
 _LATIN_RUN_RE = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[ \'-][A-Za-z][A-Za-z0-9]*)*')
 # Matches an optional run of leading HTML tags, then terminal/continuation
 # punctuation that Hebrew SRT authors place at logical position 0 to compensate
@@ -438,8 +538,8 @@ class SubtitleStreamer:
 
     def _generate(self, inpoint: float = None):
         """
-        Parse SRT files and return (cue_lines, cue_count).
-        Pure in-memory — no file I/O.  Called by build_cues().
+        Parse SRT / embedded subtitle streams and return (cue_lines, cue_count).
+        Called by build_cues().
         """
         now_playing: Optional[NowPlaying] = get_now_playing(self._channel)
         if now_playing is None:
@@ -457,6 +557,7 @@ class SubtitleStreamer:
         cue_count = 0
         entries_with_subs = 0
         entries_without_subs = 0
+        is_current_entry = True   # only True for the first (currently playing) entry
 
         log.debug(
             "SubtitleStreamer._generate: channel=%s lang=%s entry_index=%d inpoint=%.3fs",
@@ -504,22 +605,58 @@ class SubtitleStreamer:
                         srt_offset, len(cues), entry_cues_added, entry_cues_skipped, stream_pos,
                     )
             else:
-                entries_without_subs += 1
                 if not srt_path:
                     log.debug(
-                        "  [%s] entry %d (%s): no srt for this lang",
+                        "  [%s] entry %d (%s): no srt for this lang — trying embedded",
                         self.lang or "und", idx % n, entry.title,
                     )
                 elif not os.path.exists(srt_path):
                     log.warning(
-                        "  [%s] entry %d (%s): srt path missing on disk: %s",
+                        "  [%s] entry %d (%s): srt path missing on disk: %s — trying embedded",
                         self.lang or "und", idx % n, entry.title, srt_path,
+                    )
+                # Fall back to embedded subtitle stream — only for the currently
+                # playing entry.  Future entries in the concat window are on cold
+                # NAS pages; running ffmpeg on them blocks _subtitle_ready_event
+                # for several seconds per file.  They'll be extracted when they
+                # become the current entry on the next concat rebuild.
+                raw = _extract_embedded_srt(entry.path, self.lang) if is_current_entry else ""
+                if raw:
+                    entries_with_subs += 1
+                    cues = _parse_srt_cues(raw)
+                    entry_cues_added = 0
+                    for start, end, text in cues:
+                        s_adj = start - inpoint + stream_pos
+                        e_adj = end   - inpoint + stream_pos
+                        if e_adj <= 0:
+                            continue
+                        s_adj = max(0.0, s_adj)
+                        if s_adj >= total_seconds:
+                            break
+                        if self.lang == "he":
+                            text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
+                        cue_lines.append(
+                            f"{_sec_to_vtt_ts(s_adj)} --> {_sec_to_vtt_ts(e_adj)}\n"
+                            f"{text}\n\n"
+                        )
+                        cue_count += 1
+                        entry_cues_added += 1
+                    log.debug(
+                        "  [%s] entry %d (%s): embedded sub — %d cues added",
+                        self.lang or "und", idx % n, entry.title, entry_cues_added,
+                    )
+                else:
+                    entries_without_subs += 1
+                    log.debug(
+                        "  [%s] entry %d (%s): no srt and no embedded sub",
+                        self.lang or "und", idx % n, entry.title,
                     )
 
             remaining = entry.duration_sec - inpoint
             stream_pos += remaining
             inpoint = 0.0
             idx += 1
+            is_current_entry = False
 
         log.info(
             "Subtitle track %s (%s): %d cues built "
@@ -535,11 +672,12 @@ class ChannelStreamer:
 
     def __init__(self, channel: Channel, tmp_base: str, subtitles: bool = True,
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
-                 ready_segments: int = 3):
+                 ready_segments: int = 3, preferred_audio_language: str = "eng"):
         self.channel = channel
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._audio_copy = audio_copy   # False → transcode audio to AAC
+        self._preferred_audio_language = preferred_audio_language
         self._prewarm_timeout = prewarm_timeout
         self._ready_segments = ready_segments
         self._process: Optional[subprocess.Popen] = None
@@ -784,7 +922,10 @@ class ChannelStreamer:
             else:
                 # No external SRTs: try embedded text subtitles via the video process.
                 self._subtitle_ready_event.set()   # no subs → immediately ready
-                sub_opts = ["-map", "0:s:0?", "-c:s", "webvtt"] if self._subtitles else []
+                # Map ALL subtitle streams (not just s:0) so players can choose
+                # language.  Bitmap subs (PGS/VOBSUB) trigger the monitor's
+                # "bitmap to bitmap" detection and disable subs cleanly on restart.
+                sub_opts = ["-map", "0:s?", "-c:s", "webvtt"] if self._subtitles else []
 
             # Pre-warm the NAS disk cache at the seek target before starting
             # ffmpeg.  Without this, cold-cache seeks to deep positions (e.g.
@@ -793,6 +934,16 @@ class ChannelStreamer:
             np = get_now_playing(self.channel)
             if np and np.offset_sec > 0 and np.entry:
                 _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
+
+            # Probe the current file for the preferred audio track.  Files with
+            # multiple audio languages (e.g. French + English) often store the
+            # non-English track first; probing ensures we select the right one.
+            # We probe after the NAS prewarm so the file header is already cached.
+            audio_idx = 0
+            if np and np.entry:
+                audio_idx = _probe_audio_stream_index(
+                    np.entry.path, self._preferred_audio_language
+                )
 
             seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
             cmd = [
@@ -813,7 +964,7 @@ class ChannelStreamer:
                 *audio_opts,
                 *video_bsf_opts,
                 "-map", "0:v:0",
-                "-map", "0:a:0",
+                "-map", f"0:a:{audio_idx}",
                 # Subtitles: convert embedded SRT/ASS to WebVTT in-stream.
                 # Only used when no external SRT files are available.
                 # The '?' makes the map optional — no error if a file has no subs.
@@ -1052,10 +1203,11 @@ class StreamManager:
     def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True,
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
                  ready_segments: int = 3, session_mode: bool = False,
-                 prewarm_adjacent: int = 0):
+                 prewarm_adjacent: int = 0, preferred_audio_language: str = "eng"):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._audio_copy = audio_copy
+        self._preferred_audio_language = preferred_audio_language
         self._prewarm_timeout = prewarm_timeout
         self._ready_segments = ready_segments
         self._session_mode = session_mode
@@ -1098,7 +1250,8 @@ class StreamManager:
                                               self._subtitles,
                                               audio_copy=self._audio_copy,
                                               prewarm_timeout=self._prewarm_timeout,
-                                              ready_segments=self._ready_segments)
+                                              ready_segments=self._ready_segments,
+                                              preferred_audio_language=self._preferred_audio_language)
                 if ch_id in self._watched_channels:
                     new_streamer._ever_watched = True  # restore 600s timeout after idle stop
                 self._streamers[ch_id] = new_streamer  # register before start()
@@ -1183,6 +1336,7 @@ class StreamManager:
                         subtitles=kept_subs, audio_copy=kept_audio,
                         prewarm_timeout=self._prewarm_timeout,
                         ready_segments=self._ready_segments,
+                        preferred_audio_language=self._preferred_audio_language,
                     )
                     s.start()
                     self._streamers[ch_id] = s
@@ -1269,13 +1423,15 @@ class CatchupSession:
     """
 
     def __init__(self, session_id: str, entry: ScheduleEntry, offset_sec: float,
-                 duration_sec: float, session_dir: str, subtitles: bool):
+                 duration_sec: float, session_dir: str, subtitles: bool,
+                 preferred_audio_language: str = "eng"):
         self.session_id = session_id
         self.entry = entry
         self.offset_sec = offset_sec
         self.duration_sec = duration_sec   # how much to serve (programme length - offset)
         self.session_dir = session_dir
         self.subtitles = subtitles
+        self._preferred_audio_language = preferred_audio_language
         self.manifest_path = os.path.join(session_dir, "stream.m3u8")
         self._process: Optional[subprocess.Popen] = None
         self._last_accessed = time.time()
@@ -1288,6 +1444,7 @@ class CatchupSession:
 
     def start(self):
         os.makedirs(self.session_dir, exist_ok=True)
+        audio_idx = _probe_audio_stream_index(self.entry.path, self._preferred_audio_language)
         seg_pattern = os.path.join(self.session_dir, "seg%d.ts")
         cmd = [
             "ffmpeg",
@@ -1301,8 +1458,8 @@ class CatchupSession:
             "-c:v", "copy",
             "-c:a", "copy",
             "-map", "0:v:0",
-            "-map", "0:a:0",
-            *(["-map", "0:s:0?", "-c:s", "webvtt"] if self.subtitles else []),
+            "-map", f"0:a:{audio_idx}",
+            *(["-map", "0:s?", "-c:s", "webvtt"] if self.subtitles else []),
             "-f", "hls",
             "-hls_time", str(HLS_SEGMENT_SECONDS),
             # No list_size limit — serve all segments (VOD)
@@ -1344,9 +1501,11 @@ class CatchupManager:
     A background thread evicts expired sessions.
     """
 
-    def __init__(self, tmp_base: str, subtitles: bool = True):
+    def __init__(self, tmp_base: str, subtitles: bool = True,
+                 preferred_audio_language: str = "eng"):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
+        self._preferred_audio_language = preferred_audio_language
         self._sessions: Dict[str, CatchupSession] = {}
         self._lock = threading.Lock()
         self._reaper = threading.Thread(
@@ -1396,6 +1555,7 @@ class CatchupManager:
                 duration_sec=duration_sec,
                 session_dir=session_dir,
                 subtitles=self._subtitles,
+                preferred_audio_language=self._preferred_audio_language,
             )
             session.start()
             self._sessions[session_id] = session

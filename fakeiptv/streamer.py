@@ -204,7 +204,8 @@ def _probe_gop_size(path: str) -> float:
 
 
 def _probe_keyframe_inpoint(path: str, inpoint: float,
-                            entry_duration: float = 0.0) -> float:
+                            entry_duration: float = 0.0,
+                            timeout: int = 15) -> float:
     """
     Return the timestamp of the last video keyframe at or before `inpoint`.
 
@@ -262,7 +263,7 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
                 "-show_entries", "packet=pts_time,flags",
                 "-read_intervals", f"{start:.3f}%{inpoint + 0.5:.3f}",
                 path,
-            ], capture_output=True, text=True, timeout=15)
+            ], capture_output=True, text=True, timeout=timeout)
             packets = json.loads(r.stdout).get("packets", [])
             kf_times = [
                 float(p["pts_time"])
@@ -950,6 +951,28 @@ class ChannelStreamer:
         # case is ~30s when many channels start simultaneously.
         probe_thread.join(timeout=35.0)
         actual_inpoint = probe_result[0]
+
+        # Step 3c — warm-NAS retry.  If the initial probe timed out (file is
+        # in _keyframe_probe_failures), ffmpeg has now been running for ~15-20s
+        # and the NAS SMB cache is warm.  Retry with a short timeout — the
+        # seek index / cluster data is already in cache so ffprobe completes
+        # in <1s rather than timing out.  This corrects the subtitle offset
+        # dynamically without any hardcoded GOP assumption.
+        if entry_path and entry_path in _keyframe_probe_failures:
+            log.info(
+                "Channel %s: initial probe timed out — retrying now (NAS warm)",
+                self.channel.id,
+            )
+            _keyframe_probe_failures.pop(entry_path, None)  # allow retry
+            retry = _probe_keyframe_inpoint(
+                entry_path, nominal_inpoint, entry_duration, timeout=5
+            )
+            if abs(retry - actual_inpoint) > 0.5:
+                log.info(
+                    "Channel %s: warm retry corrected inpoint %.3fs → %.3fs (Δ=%.3fs)",
+                    self.channel.id, actual_inpoint, retry, actual_inpoint - retry,
+                )
+                actual_inpoint = retry
 
         log.info(
             "Channel %s: subtitle inpoint nominal=%.3fs actual=%.3fs "

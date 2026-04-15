@@ -1032,7 +1032,7 @@ class ChannelStreamer:
             # Also remove stale SRT side-output files so the new run starts fresh.
             for fname in os.listdir(self.hls_dir) if os.path.isdir(self.hls_dir) else []:
                 if fname.endswith(".ts") or fname.endswith(".m3u8") \
-                        or fname.endswith(".vtt") or fname.endswith(".srt"):
+                        or fname.endswith(".srt"):
                     try:
                         os.remove(os.path.join(self.hls_dir, fname))
                     except OSError:
@@ -1778,6 +1778,7 @@ class StreamManager:
 
 # How long (seconds) to keep a catchup session alive after last manifest request.
 CATCHUP_SESSION_TTL = 7200   # 2 hours
+CATCHUP_FFMPEG_IDLE = 120    # stop ffmpeg after 120s with no segment fetches
 
 # Trailing segment buffer for rolling delete.  Segments behind HWM - KEEP are
 # deleted immediately; on-demand regen recreates them if the player rewinds.
@@ -1803,6 +1804,7 @@ class CatchupSession:
         self.manifest_path = os.path.join(session_dir, "stream.m3u8")
         self._process: Optional[subprocess.Popen] = None
         self._last_accessed = time.time()
+        self._last_fetch_time = time.time()  # updated only when a .ts segment is served
         self._audio_idx: int = 0          # probed in start(), reused by regenerate_segment
         self._hwm: int = -1               # highest segment number fetched by a client
         self._last_deleted: int = -1      # highest segment number already deleted
@@ -1815,6 +1817,26 @@ class CatchupSession:
 
     def is_expired(self) -> bool:
         return (time.time() - self._last_accessed) > CATCHUP_SESSION_TTL
+
+    def is_ffmpeg_idle(self) -> bool:
+        """True if ffmpeg is running but no segment has been fetched recently."""
+        return (self._process is not None
+                and self._process.poll() is None
+                and (time.time() - self._last_fetch_time) > CATCHUP_FFMPEG_IDLE)
+
+    def stop_ffmpeg(self):
+        """Terminate the ffmpeg process without deleting session files."""
+        if self._process and self._process.poll() is None:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+        self._process = None
+        log.info("Catchup %s: ffmpeg idle — process stopped, session kept", self.session_id)
 
     def start(self):
         os.makedirs(self.session_dir, exist_ok=True)
@@ -2326,6 +2348,7 @@ class CatchupSession:
         Deleted segments are regenerated on demand if the player rewinds
         (see regenerate_segment).
         """
+        self._last_fetch_time = time.time()
         with self._regen_lock:
             if seg_num > self._hwm:
                 self._hwm = seg_num
@@ -2427,8 +2450,24 @@ class CatchupManager:
         entry, offset_sec = result
         remaining = entry.duration_sec - offset_sec
 
+        # Detect "start over": utc is in the future, meaning Televizo sent the
+        # stop_time of the currently-airing episode instead of its start_time.
+        # In that case, find what's actually playing NOW and start it from 0.
+        now = datetime.now()
+        if at > now:
+            log.info(
+                "Catchup %s: utc %s is in the future (now=%s) — treating as start-over",
+                channel.id, at.isoformat(), now.isoformat(),
+            )
+            live_result = get_playing_at(channel, now)
+            if live_result is None:
+                return None
+            entry, _ = live_result
+            offset_sec = 0.0
+            remaining = entry.duration_sec
+
         # If the utc timestamp falls within the last 30 seconds of an episode
-        # (Televizo shift mode sometimes sends stop_time instead of start_time),
+        # (Televizo shift mode sometimes sends stop_time - ε instead of start_time),
         # snap back to the beginning so the user sees the full episode.
         SNAP_THRESHOLD = 30.0
         if remaining < SNAP_THRESHOLD:
@@ -2505,10 +2544,14 @@ class CatchupManager:
 
     def _reap_loop(self):
         while True:
-            time.sleep(300)  # check every 5 minutes
+            time.sleep(60)  # check every minute
             with self._lock:
                 expired = [sid for sid, s in self._sessions.items() if s.is_expired()]
                 for sid in expired:
                     log.info("Expiring catchup session: %s", sid)
                     self._sessions[sid].stop()
                     del self._sessions[sid]
+                idle = [sid for sid, s in self._sessions.items()
+                        if sid not in expired and s.is_ffmpeg_idle()]
+                for sid in idle:
+                    self._sessions[sid].stop_ffmpeg()

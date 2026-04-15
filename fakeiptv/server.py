@@ -113,10 +113,13 @@ def hls_manifest(channel_id: str):
             at = datetime.fromtimestamp(int(utc_str))
         except (ValueError, TypeError):
             abort(400)
+        log.info("Catchup: channel=%s utc=%s → local=%s", channel_id, utc_str, at.isoformat())
         channel = _app_instance.channels[channel_id]
         session = _app_instance.catchup_manager.get_or_create(channel, at)
         if session is None:
             abort(404)
+        log.info("Catchup: resolved entry='%s' offset=%.1fs session=%s",
+                 session.entry.title, session.offset_sec, session.session_id)
         deadline = time.time() + 30
         while not session.is_ready():
             if session.is_failed() or time.time() > deadline:
@@ -316,11 +319,14 @@ def catchup_start(channel_id: str):
     except (ValueError, TypeError):
         log.warning("Catchup for %s — bad utc value: %r", channel_id, utc_str)
         abort(400)
+    log.info("Catchup: channel=%s utc=%s → local=%s", channel_id, utc_str, at.isoformat())
 
     channel = _app_instance.channels[channel_id]
     session = _app_instance.catchup_manager.get_or_create(channel, at)
     if session is None:
         abort(404)
+    log.info("Catchup: resolved entry='%s' offset=%.1fs session=%s",
+             session.entry.title, session.offset_sec, session.session_id)
 
     # Wait up to 30s for the first segment (cold NAS can take >15s to open a file)
     deadline = time.time() + 30

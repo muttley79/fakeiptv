@@ -377,6 +377,17 @@ def probe_file_info(path: str):
         return 0.0, "", False, False, 0, 0
 
 
+def _is_likely_hebrew(path: str) -> bool:
+    """Return True if the file contains Hebrew Unicode characters (U+0590–U+05FF)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(2048)
+        text = raw.decode("utf-8", errors="ignore")
+        return any('\u0590' <= c <= '\u05FF' for c in text)
+    except Exception:
+        return False
+
+
 def _find_subtitle_files(video_path: str) -> Dict[str, str]:
     """
     Return {lang: path} for external subtitle files alongside the video file.
@@ -398,7 +409,7 @@ def _find_subtitle_files(video_path: str) -> Dict[str, str]:
     # Otherwise keep it unlabeled ("") as a fallback.
     plain = f"{base}.srt"
     if os.path.exists(plain):
-        if result and "he" not in result:
+        if result and "he" not in result and _is_likely_hebrew(plain):
             result["he"] = plain
         elif not result:
             result[""] = plain

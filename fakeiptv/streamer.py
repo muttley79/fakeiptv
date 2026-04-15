@@ -118,6 +118,35 @@ def _probe_segment_start_pts(seg_path: str) -> Optional[int]:
     return None
 
 
+def _probe_stream_start_time(path: str, stream_spec: str) -> float:
+    """
+    Return the start_time (seconds) of the first stream matching stream_spec.
+
+    Used to detect cross-stream PTS offsets: some MKVs have video PTS starting
+    at e.g. +3s while the subtitle stream starts at 0s.  The difference must be
+    added as a correction when building VTT cues from ffmpeg SRT side-output, so
+    that cues align with the video rather than the subtitle track's origin.
+
+    Returns 0.0 on any error or when start_time is not reported.
+    """
+    try:
+        r = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-select_streams", stream_spec,
+            "-show_entries", "stream=start_time",
+            path,
+        ], capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout)
+        streams = data.get("streams", [])
+        if streams:
+            st = streams[0].get("start_time")
+            if st not in (None, "N/A"):
+                return float(st)
+    except Exception as exc:
+        log.debug("_probe_stream_start_time(%s, %s) failed: %s", path, stream_spec, exc)
+    return 0.0
+
+
 def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
     """
     Prime the NAS SMB disk cache for a seek to `inpoint` in `path`.
@@ -952,6 +981,13 @@ class ChannelStreamer:
             path = re.sub(r"([ \t'\"])", r"\\\1", path)
             lines.append(f"file {path}\n")
             if first and offset > 0:
+                if offset >= entry.duration_sec:
+                    log.warning(
+                        "Channel %s: inpoint %.1fs >= cached duration %.1fs for '%s' — "
+                        "duration cache may be stale (file shorter than expected); "
+                        "stream may skip to next entry",
+                        self.channel.id, offset, entry.duration_sec, entry.title,
+                    )
                 lines.append(f"inpoint {offset:.3f}\n")
                 accumulated += entry.duration_sec - offset
                 first = False
@@ -1335,24 +1371,22 @@ class ChannelStreamer:
                 return
 
             if not os.path.exists(srt_path):
-                stall_count += 1
-                if stall_count >= 30:   # 60s with no file
-                    log.debug(
-                        "live SRT watcher %s [%s]: file never appeared — stopping",
-                        self.channel.id, lang_label,
-                    )
-                    return
+                # SRT not yet created — entry may have no embedded subs, or
+                # ffmpeg hasn't started writing yet.  Keep waiting; a future
+                # entry in the concat window may produce one.
                 continue
 
             size = os.path.getsize(srt_path)
             if size <= last_size:
+                # No growth — SRT hasn't changed.  Don't exit: a future entry
+                # in the same concat window may start writing cues later.
+                # Only log occasionally so we know the watcher is alive.
                 stall_count += 1
-                if stall_count >= 30:   # 60s with no growth
+                if stall_count % 150 == 0:  # every ~5 min
                     log.debug(
-                        "live SRT watcher %s [%s]: no growth after %d B — stopping",
-                        self.channel.id, lang_label, size,
+                        "live SRT watcher %s [%s]: no SRT growth for %ds",
+                        self.channel.id, lang_label, stall_count * 2,
                     )
-                    return
                 continue
 
             stall_count = 0
@@ -1376,7 +1410,10 @@ class ChannelStreamer:
                         f"{text}\n\n"
                     )
 
-                with open(vtt_path, "w", encoding="utf-8") as f:
+                # Atomic write: write to tmp then rename so the player never
+                # reads a partially-written VTT.
+                tmp_path = vtt_path + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
                     f.write("WEBVTT\n")
                     f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
                     f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
@@ -1384,6 +1421,7 @@ class ChannelStreamer:
                     f.writelines(ffmpeg_cue_lines)
                     # Future-entry cues from external SRTs (non-zero stream_pos timestamps)
                     f.writelines(existing_cue_lines)
+                os.replace(tmp_path, vtt_path)
 
                 log.info(
                     "live SRT watcher %s [%s]: updated VTT — %d ffmpeg cues"
@@ -1654,6 +1692,13 @@ class StreamManager:
                     )
                     s.start()
                     self._streamers[ch_id] = s
+                else:
+                    # Paths unchanged but metadata (durations, ratings, etc.) may
+                    # have been re-probed at refresh time.  Update the channel
+                    # reference so the next _build_concat() uses correct durations
+                    # and stays in sync with the EPG.  The running ffmpeg process
+                    # is unaffected — it continues from its current concat file.
+                    self._streamers[ch_id].channel = channels[ch_id]
 
             # Replace channel registry (new channels are NOT started here)
             self._channels = dict(channels)
@@ -1946,16 +1991,6 @@ class CatchupSession:
         #      that make_zero adds to the SRT output timestamps)
         # Path A (external SRT) already uses actual_start_sec which is correct.
         start_pts = _probe_segment_start_pts(seg0) or 0
-        actual_start_sec = _probe_keyframe_inpoint(
-            self.entry.path, self.offset_sec, self.entry.duration_sec
-        )
-        log.info(
-            "Catchup %s subtitle timing: offset_sec=%.3f actual_start=%.3f "
-            "start_pts=%d (%.3fs) pts_minus_actual=%.3fs",
-            self.session_id, self.offset_sec, actual_start_sec,
-            start_pts, start_pts / 90000.0,
-            start_pts / 90000.0 - (self.offset_sec - actual_start_sec),
-        )
 
         if not self.subtitles:
             self._write_master([])
@@ -1968,8 +2003,43 @@ class CatchupSession:
             if lang not in langs:
                 langs.append(lang)
 
-        # Step 3 — placeholder VTTs + master immediately so player can start
+        # Step 3 — placeholder VTTs + master BEFORE the keyframe probe so
+        # is_ready() fires immediately after seg0.ts appears (~0.5s after
+        # ffmpeg starts).  The keyframe probe takes ~2s and is only needed
+        # for subtitle timing; video playback is unaffected by it.
         self._write_placeholder_vtts_and_master(langs, start_pts)
+
+        # Step 3b — keyframe probe (now runs without blocking the manifest).
+        # actual_start_sec is used only by subtitle extraction below.
+        actual_start_sec = _probe_keyframe_inpoint(
+            self.entry.path, self.offset_sec, self.entry.duration_sec
+        )
+
+        # Probe cross-stream PTS offset: some MKVs have video PTS starting at
+        # e.g. +3s while subtitle streams start at 0s.  The delta is added to
+        # the cue-offset when building VTTs from ffmpeg SRT side-output (Path B),
+        # so cues align with the video track rather than the subtitle origin.
+        video_start_time = _probe_stream_start_time(self.entry.path, "v:0")
+        sub_pts_corrections = {}  # lang → correction_sec (add to effective offset)
+        for lang, idx in self._sub_stream_indices.items():
+            sub_start = _probe_stream_start_time(self.entry.path, f"s:{idx}")
+            correction = video_start_time - sub_start
+            sub_pts_corrections[lang] = correction
+            if abs(correction) > 0.05:
+                log.info(
+                    "Catchup %s: sub stream %s (idx %d) start_time=%.3fs vs "
+                    "video start_time=%.3fs → correction=%.3fs",
+                    self.session_id, lang or "und", idx, sub_start,
+                    video_start_time, correction,
+                )
+
+        log.info(
+            "Catchup %s subtitle timing: offset_sec=%.3f actual_start=%.3f "
+            "start_pts=%d (%.3fs) pts_minus_actual=%.3fs",
+            self.session_id, self.offset_sec, actual_start_sec,
+            start_pts, start_pts / 90000.0,
+            start_pts / 90000.0 - (self.offset_sec - actual_start_sec),
+        )
 
         # Step 4 — extract real cues per lang, overwrite VTTs.
         #
@@ -2092,11 +2162,29 @@ class CatchupSession:
                         break
                     continue
 
-                # make_zero shifts all output PTS by the minimum DTS (B-frame DTS,
-                # which precedes the first video PTS by start_pts/90000 seconds).
-                # Subtract that same amount from the SRT timestamps so the cues
-                # align with the video timeline (same correction used in TIMESTAMP-MAP).
-                cue_lines = _build_cues_from_raw(raw, lang, start_pts / 90000.0)
+                # The HLS video output and the SRT side-output each have their
+                # own make_zero anchor.
+                #
+                # HLS output make_zero: anchored to the video stream's minimum
+                #   DTS (the B-frame DTS preceding the keyframe).
+                #   Result: first video PTS = start_pts = B_frame_lead * 90k
+                #
+                # SRT output make_zero: per-output, anchored to offset_sec
+                #   (the -ss seek point), because the subtitle stream has no
+                #   packet at the video keyframe position and ffmpeg uses the
+                #   seek timestamp as the normalization reference.
+                #   Result: SRT_ts = T_source_sub - offset_sec
+                #
+                # To convert SRT_ts to a LOCAL time that the player can match
+                # against video PTS (using X-TIMESTAMP-MAP):
+                #   LOCAL = T_source_sub - actual_start_sec
+                #         = (SRT_ts + offset_sec) - actual_start_sec
+                #         = SRT_ts - (actual_start_sec - offset_sec)
+                #
+                # effective_offset = actual_start_sec - offset_sec  (negative
+                # when the keyframe is before the requested seek point, as usual)
+                effective_offset = actual_start_sec - self.offset_sec
+                cue_lines = _build_cues_from_raw(raw, lang, effective_offset)
                 if not cue_lines:
                     if self._process and self._process.poll() is not None:
                         break
@@ -2110,9 +2198,8 @@ class CatchupSession:
                             raw_first = first_cues[0][0]
                             log.info(
                                 "Catchup %s SRT first cue: raw_ts=%.3fs "
-                                "after_offset=%.3fs (offset=%.3fs) lang=%s",
+                                "(no offset subtracted, start_pts=%.3fs) lang=%s",
                                 self.session_id, raw_first,
-                                raw_first - start_pts / 90000.0,
                                 start_pts / 90000.0, lang_label,
                             )
                     except Exception:
@@ -2214,6 +2301,21 @@ class CatchupSession:
             and self._process.poll() is not None
             and not os.path.exists(self.manifest_path)
         )
+
+    def is_done(self) -> bool:
+        """True once ffmpeg has finished and video.m3u8 has EXT-X-ENDLIST."""
+        if self._process is None or self._process.poll() is None:
+            return False
+        video_path = os.path.join(self.session_dir, "video.m3u8")
+        try:
+            with open(video_path) as f:
+                return "#EXT-X-ENDLIST" in f.read()
+        except Exception:
+            return False
+
+    def has_been_watched(self) -> bool:
+        """True if the player has fetched at least one segment."""
+        return self._hwm >= 0
 
     def mark_fetched(self, seg_num: int):
         """
@@ -2323,7 +2425,21 @@ class CatchupManager:
             return None
 
         entry, offset_sec = result
-        duration_sec = max(entry.duration_sec - offset_sec, 5.0)
+        remaining = entry.duration_sec - offset_sec
+
+        # If the utc timestamp falls within the last 30 seconds of an episode
+        # (Televizo shift mode sometimes sends stop_time instead of start_time),
+        # snap back to the beginning so the user sees the full episode.
+        SNAP_THRESHOLD = 30.0
+        if remaining < SNAP_THRESHOLD:
+            log.info(
+                "Catchup %s: utc maps to last %.1fs of '%s' — snapping to start",
+                channel.id, remaining, entry.title,
+            )
+            offset_sec = 0.0
+            remaining = entry.duration_sec
+
+        duration_sec = max(remaining, 5.0)
         ts = int(at.timestamp())
 
         with self._lock:

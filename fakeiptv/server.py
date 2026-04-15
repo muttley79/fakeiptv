@@ -333,76 +333,78 @@ def catchup_start(channel_id: str):
     return redirect(manifest_url)
 
 
-@app.route("/catchup/<channel_id>/<session_id>/stream.m3u8")
-def catchup_manifest(channel_id: str, session_id: str):
-    session = _app_instance.catchup_manager.get_session(session_id)
-    if session is None or not session.is_ready():
-        abort(404)
-
-    resp = send_from_directory(session.session_dir, "stream.m3u8")
-    resp.headers["Cache-Control"] = "no-cache, no-store"
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    return resp
-
-
 @app.route("/catchup/<channel_id>/<session_id>/sub_<lang>.m3u8")
 def catchup_sub_manifest(channel_id: str, session_id: str, lang: str):
     """
-    Dynamic subtitle manifest for catchup VOD sessions.
-    Mirrors the video playlist structure (many small EXTINF entries all pointing
-    to the same VTT file) so Televizo keeps polling for updated cues — same
-    pattern as hls_sub_manifest() but for catchup.  EXT-X-ENDLIST is preserved
-    because catchup is VOD (once ffmpeg finishes, the stream is done).
+    Dynamic subtitle manifest for catchup sessions.
+
+    Mirrors video.m3u8 entry-by-entry (EXTINF:2.0 per segment, MEDIA-SEQUENCE=0,
+    no EXT-X-ENDLIST), replacing every segment filename with sub_{lang}.vtt.
+    As ffmpeg writes new video segments the list grows and the player downloads
+    sub_{lang}.vtt again, picking up the latest cues.  The VTT contains all cues
+    with X-TIMESTAMP-MAP so the player shows the right ones at any playback position
+    regardless of how far it has buffered ahead.
     """
     session = _app_instance.catchup_manager.get_session(session_id)
     if session is None:
         abort(404)
 
-    session_dir = session.session_dir
     vtt_name = f"sub_{lang}.vtt"
-    vtt_path = os.path.join(session_dir, vtt_name)
+    vtt_path = os.path.join(session.session_dir, vtt_name)
     if not os.path.exists(vtt_path):
         abort(404)
 
-    video_manifest = os.path.join(session_dir, "video.m3u8")
+    video_manifest = os.path.join(session.session_dir, "video.m3u8")
     try:
         with open(video_manifest, "r") as f:
             video_lines = f.readlines()
     except Exception:
         abort(503)
 
-    # Catchup video.m3u8 uses hls_list_size=0 (full VOD) — MEDIA-SEQUENCE is
-    # always 0 and never increments.  Mirroring it verbatim would give Televizo
-    # a static MEDIA-SEQUENCE, so it would fetch the VTT once and stop.
-    # Instead, build a sliding-window manifest: take the last WINDOW EXTINF
-    # entries and set MEDIA-SEQUENCE = total_segments - WINDOW.  This advances
-    # each time ffmpeg writes a new segment, forcing a VTT re-fetch.
-    WINDOW = 15
-    extinfs = [l for l in video_lines if l.startswith("#EXTINF:")]
-    total = len(extinfs)
-    window_extinfs = extinfs[max(0, total - WINDOW):]
-    seq = max(0, total - WINDOW)
-
-    # Copy header lines (EXTM3U, TARGETDURATION, VERSION) but replace the
-    # existing MEDIA-SEQUENCE line with our computed sliding-window value.
+    # Mirror video.m3u8 header + all EXTINF entries, replacing filenames with
+    # the VTT.  Omit EXT-X-ENDLIST so Televizo keeps polling and re-fetches the
+    # VTT as new cues are written.
     out = []
+    replace_next = False
     for line in video_lines:
-        if line.startswith("#EXTINF:") or (line.strip() and not line.startswith("#")):
-            break  # stop before segment data
-        if line.startswith("#EXT-X-MEDIA-SEQUENCE"):
-            out.append(f"#EXT-X-MEDIA-SEQUENCE:{seq}\n")
-        elif not line.startswith("#EXT-X-ENDLIST"):
+        if line.startswith("#EXT-X-ENDLIST"):
+            continue
+        elif line.startswith("#EXTINF:"):
             out.append(line)
-    for extinf in window_extinfs:
-        out.append(extinf)
-        out.append(f"{vtt_name}\n")
-    # No EXT-X-ENDLIST: player keeps polling until video ends naturally.
+            replace_next = True
+        elif replace_next:
+            out.append(f"{vtt_name}\n")
+            replace_next = False
+        else:
+            out.append(line)
 
     content = "".join(out)
     resp = Response(content, mimetype="application/x-mpegurl")
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
+
+
+@app.route("/catchup/<channel_id>/<session_id>/stream.m3u8")
+def catchup_manifest(channel_id: str, session_id: str):
+    session = _app_instance.catchup_manager.get_session(session_id)
+    if session is None or not session.is_ready():
+        abort(404)
+
+    # Once catchup ffmpeg has finished AND the player has fetched at least one
+    # segment, redirect back to live so Televizo seamlessly resumes.
+    # Guard: only redirect if a segment was actually fetched (hwm >= 0) to
+    # avoid firing before the player has received any content.
+    if session.is_done() and session.has_been_watched():
+        log.debug("Catchup %s done — redirecting to live channel %s",
+                  session_id, channel_id)
+        return redirect(f"/hls/{channel_id}/stream.m3u8", code=302)
+
+    resp = send_from_directory(session.session_dir, "stream.m3u8")
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 
 
 @app.route("/catchup/<channel_id>/<session_id>/<path:segment>")
@@ -413,15 +415,18 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
 
     seg_path = os.path.join(session.session_dir, segment)
 
-    # Sub manifests are served dynamically by catchup_sub_manifest(), not from
-    # static files — this handler only serves .ts and .vtt files.
+    # VTT files may not exist immediately (async extraction).
+    # Wait up to 15s so the player gets real cues on first fetch.
+    if segment.endswith(".vtt") and not os.path.exists(seg_path):
+        deadline = time.time() + 15
+        while not os.path.exists(seg_path) and time.time() < deadline:
+            time.sleep(0.2)
 
     if not os.path.exists(seg_path) and segment.endswith(".ts"):
         # On-demand regen: segment was deleted by rolling cleanup (player rewound).
         m = _SEG_RE.match(segment)
         if not m or not session.regenerate_segment(int(m.group(1))):
             abort(404)
-
     elif not os.path.exists(seg_path):
         abort(404)
 

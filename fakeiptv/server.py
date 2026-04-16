@@ -31,7 +31,7 @@ app = Flask(__name__)
 _app_instance: "FakeIPTV" = None  # set by app.py before server starts
 _prewarm_done = False              # pre-warm all channels on first manifest request
 _bumper_served_channels: set = set()   # live channels that last received a bumper manifest
-_discontinuity_pending: set = set()    # subtitle channels: inject discontinuity into next video.m3u8
+_discontinuity_pending: set = set()    # channels: inject #EXT-X-DISCONTINUITY into next video.m3u8
 
 # Matches HLS segment filenames like "seg42.ts" → group(1) = "42"
 _SEG_RE = re.compile(r"^seg(\d+)\.ts$")
@@ -105,8 +105,11 @@ def _bumper_manifest_content(bumper) -> str:
 def _inject_discontinuity(content: str) -> str:
     """Insert #EXT-X-DISCONTINUITY before the first #EXTINF line.
 
-    Signals to ExoPlayer that the PTS timeline / codec changed (bumper → real
-    content), preventing the ~6s rebuffer stall on the transition.
+    Resets ExoPlayer's TimestampAdjuster for all tracks simultaneously so that
+    the subtitle X-TIMESTAMP-MAP anchor aligns with the video adjuster after the
+    bumper→real channel transition.  Without this, the subtitle adjuster anchors
+    to presentation:0 while the video adjuster keeps the bumper offset, causing
+    subtitles to appear ~start_pts/90000 seconds early (~1.5s).
     """
     lines = content.splitlines(keepends=True)
     for i, line in enumerate(lines):
@@ -220,9 +223,9 @@ def hls_manifest(channel_id: str):
     _app_instance.stream_manager.touch(channel_id)
 
     # If the channel isn't ready yet, serve the bumper loading screen.
-    # 2 segments (4s) is enough for ExoPlayer to start smoothly after the
-    # discontinuity without stalling — matching the old wait_ready behaviour.
-    if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=2):
+    # 3 segments (6s) pre-buffered before the discontinuity fires: the
+    # player's download thread fills the buffer during the flush — no visible stall.
+    if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=3):
         if has_bumper:
             # Channel warming — return master pointing to video.m3u8 immediately.
             # hls_segment() serves bumper content from video.m3u8 while not ready,
@@ -336,7 +339,7 @@ def hls_segment(channel_id: str, segment: str):
     # Must run BEFORE seg_path / file-existence checks so we can serve bumper content
     # even when video.m3u8 doesn't exist on disk yet (ffmpeg still starting up).
     if segment == "video.m3u8":
-        if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=2):
+        if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=3):
             bumper = _app_instance.stream_manager.get_random_bumper()
             if bumper is not None and bumper.is_ready():
                 content = _bumper_manifest_content(bumper)
@@ -350,8 +353,10 @@ def hls_segment(channel_id: str, segment: str):
             # No bumper or unreadable — fall through; video.m3u8 may not exist yet
             # which will 404 cleanly below.
         elif channel_id in _bumper_served_channels:
-            # First real video.m3u8 after bumper: inject discontinuity so ExoPlayer
-            # resets its PTS/codec state and avoids the ~6s rebuffer stall.
+            # First real video.m3u8 after bumper: inject discontinuity so that
+            # ExoPlayer resets both video and subtitle TimestampAdjusters together.
+            # Without this, the subtitle adjuster anchors to presentation:0 while
+            # the video adjuster keeps the bumper offset → subtitles ~1.5s early.
             _bumper_served_channels.discard(channel_id)
             _discontinuity_pending.add(channel_id)
 

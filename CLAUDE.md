@@ -35,9 +35,10 @@ If Docker build uses cached layers and changes aren't picked up, `touch` the cha
 | `fakeiptv/server.py` | Flask app. HLS manifest handler doubles as catchup router for shift-mode requests. |
 | `fakeiptv/app.py` | `FakeIPTV` class — wires everything, owns refresh + prewarm lifecycle. |
 | `run.py` | Entry point. Loads `.env`, config, starts app + Flask. |
-| `Dockerfile` | `python:3.9-slim` + ffmpeg apt package + pip install. |
+| `Dockerfile` | `python:3.9-slim` + ffmpeg apt package + pip install. Copies `bumpers/` into image at `/app/bumpers`. |
 | `docker-compose.yml` | Port mapping, tmpfs for segments, host-mounted cache, NFS volume for NAS. |
 | `.env.example` | Template for all `FAKEIPTV_*` env vars. |
+| `bumpers/` | Directory of bumper video files (MP4 etc.) baked into the Docker image. |
 
 ## Key design decisions
 
@@ -65,6 +66,11 @@ If Docker build uses cached layers and changes aren't picked up, `touch` the cha
 - **`start_new_session=True` + `stdin=DEVNULL`** on all Popen calls — isolates ffmpeg from the container process group.
 - **Preferred audio language.** `_probe_audio_stream_index()` probes all audio streams and picks the one matching `preferred_audio_language` (ISO 639-1 or 639-2). Falls back to stream 0.
 - **Async subtitle thread.** After ffmpeg starts, a separate thread: waits for first TS segment (NAS warms), probes start PTS + actual keyframe inpoint, generates WebVTT from SRT, writes files. Channel declared "subtitle-ready" via event.
+- **Bumper loading screen.** `BumperStreamer` runs a continuous looped HLS stream for each video file in `bumpers_path`. `BumperManager` owns all bumpers; `StreamManager` holds a `BumperManager` if `bumpers_path` is set. When a channel is cold (no segments yet), `hls_manifest()` returns the master playlist immediately and `hls_segment(video.m3u8)` serves bumper content until `is_transition_ready()`. The channel's ffmpeg is started in a daemon thread (`background=True`) so NAS probes run in parallel with bumper display — no blocking wait.
+- **Bumper → real channel handoff.** `seq_offset`: when a bumper covers startup, the channel's `EXT-X-MEDIA-SEQUENCE` is bumped above the bumper's sequence number (bumper_seq + 100). Without this the player sees a backward jump and stalls 6–10 s waiting for an ABR re-check. On first real `video.m3u8` after a bumper, `#EXT-X-DISCONTINUITY` is injected to signal a PTS/codec boundary to the player.
+- **Bumper transcoding.** Bumpers use `-c:v libx264 -preset ultrafast -crf 28 -force_key_frames expr:gte(t,n_forced*2)` to guarantee 2-second segments. `-c:v copy` is unreliable when the source has a long GOP — ffmpeg can't cut at non-keyframe boundaries and produces 10 s segments, preventing a prompt switch to real content.
+- **Bumper suppressed for scrubbing.** `CatchupSession.is_seek=True` when the user seeks within the same episode (prior session for same channel+file existed). The bumper loading screen is suppressed for seeks to avoid a flash mid-scrub.
+- **Hebrew SRT encoding auto-detect.** `_read_srt()` tries utf-8-sig → utf-8 → cp1255 → iso-8859-8 → latin-1 in order, accepting the first decode that succeeds.
 
 ## Configuration hierarchy
 
@@ -89,6 +95,7 @@ Key env vars:
 | `FAKEIPTV_PREWARM_ADJACENT` | `0` | Warm N channels on each side of watched channel |
 | `FAKEIPTV_PREWARM_TIMEOUT` | `120` | Idle timeout (sec) for prewarm-only channels |
 | `FAKEIPTV_READY_SEGMENTS` | `1` | Segments buffered before channel declared ready |
+| `FAKEIPTV_BUMPERS_PATH` | `/app/bumpers` | Directory of bumper video files baked into the Docker image; set to empty string to disable |
 | `FAKEIPTV_TMDB_API_KEY` | _(empty)_ | Optional TMDB metadata fallback |
 | `FAKEIPTV_SONARR_URL` | _(empty)_ | Optional Sonarr endpoint |
 | `FAKEIPTV_SONARR_API_KEY` | _(empty)_ | |
@@ -180,6 +187,24 @@ ffmpeg -hide_banner -loglevel error \
   {tmp_dir}/ch_{id}/video.m3u8
 ```
 
+## ffmpeg command (bumper loop)
+
+```bash
+ffmpeg -hide_banner -loglevel error \
+  -stream_loop -1 -re \
+  -i {bumper_path} \
+  -c:v libx264 -preset ultrafast -crf 28 \
+  -sc_threshold 0 \
+  -force_key_frames expr:gte(t,n_forced*2) \
+  -c:a aac -b:a 128k -ac 2 \
+  -f hls -hls_time 2 -hls_list_size 15 \
+  -hls_flags delete_segments+omit_endlist+append_list \
+  -hls_segment_filename {tmp_dir}/bumper_{id}/seg%d.ts \
+  {tmp_dir}/bumper_{id}/video.m3u8
+```
+
+Bumpers are re-encoded (not copied) to guarantee 2-second segments regardless of GOP size.
+
 ## ffmpeg command (catch-up VOD)
 
 ```bash
@@ -208,6 +233,7 @@ ffmpeg -hide_banner -loglevel error \
 - **Docker build cache**: if `COPY fakeiptv/` step is cached after editing Python files, `touch` the changed files or use `--no-cache` to force rebuild.
 - **MKVs without a seek index (Cues element)**: seeks take 2–10s on cold NAS. `_nas_prewarm()` mitigates this; real fix is mkvmerge/ffmpeg remux with seek index.
 - **Hebrew RTL subtitles**: use `_he_bidi_fix()` (RLM + RLI/PDI + LRI/PDI Unicode bidi controls). Do not use the old pre-inversion hack — it breaks bidirectional runs.
+- **Bumper directory baked into image**: `bumpers/` is `COPY`-ed into the Docker image at build time (`/app/bumpers`). To update bumpers, rebuild the image. The directory is not a mounted volume.
 
 ## User / dev preferences
 

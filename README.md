@@ -14,6 +14,7 @@ Generates a proper HLS live stream (sliding-window M3U8 + MPEG-TS segments), XML
   - **{Genre} Movies**, **Movie Hits**, **Movies** — movie channels, genre-exclusive where possible
 - Every channel's schedule is **deterministic** — anchored to a fixed epoch (`2024-01-01 00:00:00` local). Restarting the server picks up exactly where it would have been.
 - One `ffmpeg -re -c copy` process per channel outputs 2-second HLS segments to a tmpfs directory.
+- A **bumper loading screen** plays while a channel's ffmpeg is warming up, so switching channels feels instant instead of showing a spinner.
 - Flask serves the segments, XMLTV EPG, and catch-up manifests directly from tmpfs.
 
 ---
@@ -85,6 +86,7 @@ All settings live in **`.env`** (preferred) or **`config.yaml`**. Environment va
 | `FAKEIPTV_PREWARM_ADJACENT` | `0` | Also warm N channels on each side of the watched channel |
 | `FAKEIPTV_PREWARM_TIMEOUT` | `120` | Seconds before a prewarm-only channel is stopped |
 | `FAKEIPTV_READY_SEGMENTS` | `1` | HLS segments buffered before channel is declared ready |
+| `FAKEIPTV_BUMPERS_PATH` | `/app/bumpers` | Directory of bumper video files (baked into the image); set to empty to disable |
 | `FAKEIPTV_TMDB_API_KEY` | _(empty)_ | Optional — TMDB metadata fallback |
 | `FAKEIPTV_SONARR_URL` | _(empty)_ | Optional — Sonarr integration for ratings/metadata |
 | `FAKEIPTV_SONARR_API_KEY` | _(empty)_ | |
@@ -92,6 +94,12 @@ All settings live in **`.env`** (preferred) or **`config.yaml`**. Environment va
 | `FAKEIPTV_RADARR_API_KEY` | _(empty)_ | |
 | `FAKEIPTV_TMPFS_SIZE` | `1073741824` | tmpfs size in bytes for HLS segments (Docker only) |
 | `TZ` | `UTC` | Timezone for schedule and midnight refresh (e.g. `Asia/Jerusalem`) |
+
+### Bumper loading screen
+
+Drop any number of video files (`.mp4`, `.mkv`, `.mov`, `.avi`, `.webm`) into the `bumpers/` directory at the repo root before building. They are baked into the Docker image at `/app/bumpers`. When a channel starts cold, a randomly-chosen bumper loops until the real stream has buffered enough segments to play, then the player switches seamlessly.
+
+To disable bumpers entirely, set `FAKEIPTV_BUMPERS_PATH=` (empty) in `.env`.
 
 ### Expected NAS layout
 
@@ -163,9 +171,10 @@ When a past programme is selected in Televizo's EPG:
 | `GET /epg.xml` | XMLTV EPG (plain XML) |
 | `GET /epg.xml.gz` | XMLTV EPG (gzip) |
 | `GET /hls/<channel_id>/stream.m3u8` | Live HLS master manifest (also catch-up entry point with `?utc=`) |
-| `GET /hls/<channel_id>/video.m3u8` | Live HLS video-only manifest (ffmpeg output) |
+| `GET /hls/<channel_id>/video.m3u8` | Live HLS video-only manifest (serves bumper content while channel warms up) |
 | `GET /hls/<channel_id>/sub_<lang>.m3u8` | Live HLS subtitle manifest |
 | `GET /hls/<channel_id>/<seg>.ts` | HLS MPEG-TS segment |
+| `GET /hls/_loading/<bumper_id>/<seg>.ts` | Bumper loading screen segment |
 | `GET /catchup/<channel_id>/<session_id>/stream.m3u8` | Catch-up VOD manifest |
 | `GET /catchup/<channel_id>/<session_id>/<seg>.ts` | Catch-up VOD segment |
 | `GET /refresh` | Trigger immediate library rescan |
@@ -194,6 +203,11 @@ When a past programme is selected in Televizo's EPG:
 - EPG must be loaded first — Televizo needs programme times to trigger catch-up.
 - Check that `catchup="shift"` is in use (not `"default"`).
 - Verify EPG timestamps are UTC — any local offset breaks Televizo's timestamp parsing.
+
+**Channel shows bumper forever / never switches to real content**
+- Check `docker logs fakeiptv` for ffmpeg errors on the channel.
+- If bumpers were updated, rebuild the image — they are baked in, not mounted.
+- If `FAKEIPTV_BUMPERS_PATH` points to an empty or missing directory, bumpers are disabled and channels fall back to blocking startup.
 
 **Wrong episode playing / schedule seems off**
 - The schedule epoch is `2024-01-01 00:00:00` local time. Consistent across restarts and rebuilds.

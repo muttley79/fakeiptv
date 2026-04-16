@@ -39,6 +39,7 @@ class FakeIPTV:
             session_mode=config.server.prewarm_session,
             prewarm_adjacent=config.server.prewarm_adjacent,
             preferred_audio_language=config.server.preferred_audio_language,
+            bumpers_path=config.server.bumpers_path,
         )
         self.catchup_manager = CatchupManager(
             tmp_base=config.server.tmp_dir,

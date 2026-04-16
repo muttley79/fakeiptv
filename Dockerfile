@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY fakeiptv/ ./fakeiptv/
+COPY bumpers/ ./bumpers/
 COPY run.py config.yaml entrypoint.sh ./
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
 

@@ -1,0 +1,6 @@
+# Ignore actual video files — only .gitkeep is tracked
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm

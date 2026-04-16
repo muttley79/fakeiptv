@@ -1093,6 +1093,13 @@ class ChannelStreamer:
             # Get now-playing early so we can probe the current entry for embedded subs.
             np = get_now_playing(self.channel)
 
+            # Pre-warm the NAS disk cache FIRST — puts the file header, Cues element,
+            # and seek cluster into NAS RAM.  Running this before any ffprobe call
+            # means subtitle and audio probes hit warm cache (< 200ms) instead of
+            # cold disk (2-10s each), which is the main driver of slow cold-start.
+            if np and np.offset_sec > 0 and np.entry:
+                _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
+
             if subtitle_langs:
                 # For langs that have no external SRT on the *current* entry, probe
                 # for an embedded subtitle stream.  The main ffmpeg process will write
@@ -1144,17 +1151,10 @@ class ChannelStreamer:
                 # "bitmap to bitmap" detection and disable subs cleanly on restart.
                 sub_opts = ["-map", "0:s?", "-c:s", "webvtt"] if self._subtitles else []
 
-            # Pre-warm the NAS disk cache at the seek target before starting
-            # ffmpeg.  Without this, cold-cache seeks to deep positions (e.g.
-            # 83 min into a 30 GB BluRay) take 5-10s over SMB, exhausting the
-            # STARTUP_TIMEOUT and causing a needless restart from entry beginning.
-            if np and np.offset_sec > 0 and np.entry:
-                _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
-
             # Probe the current file for the preferred audio track.  Files with
             # multiple audio languages (e.g. French + English) often store the
             # non-English track first; probing ensures we select the right one.
-            # We probe after the NAS prewarm so the file header is already cached.
+            # NAS prewarm already ran above, so the file header is cached.
             audio_idx = 0
             if np and np.entry:
                 audio_idx = _probe_audio_stream_index(
@@ -1640,7 +1640,17 @@ class BumperStreamer:
             "-stream_loop", "-1",
             "-re",
             "-i", self._bumper_path,
-            "-c:v", "copy",
+            # Transcode video with forced 2-second keyframes so -hls_time 2 is
+            # honoured.  -c:v copy is unreliable here: if the source has large
+            # GOP intervals (e.g. 10 s), ffmpeg can only cut at existing keyframes
+            # and produces 10-second segments regardless of -hls_time.  Long
+            # segments mean the player buffers many seconds of bumper and cannot
+            # be interrupted promptly when the real channel becomes ready.
+            # ultrafast + crf 28 is imperceptible for a loading animation and
+            # costs negligible CPU (single short clip on a server-class machine).
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+            "-sc_threshold", "0",                   # no extra cuts at scene changes
+            "-force_key_frames", "expr:gte(t,n_forced*2)",  # I-frame every 2 s
             "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-f", "hls",
             "-hls_time", "2",
@@ -1834,6 +1844,15 @@ class StreamManager:
                 if ch_id in self._watched_channels:
                     new_streamer._ever_watched = True  # restore 600s timeout after idle stop
                 self._streamers[ch_id] = new_streamer  # register before start()
+            elif hls_start > 0:
+                # Channel already running (prewarmed). Apply seq_offset now so the
+                # bumper→real manifest hand-off doesn't produce a backward
+                # MEDIA-SEQUENCE jump.  A backward jump makes ExoPlayer think it
+                # already saw those segments and it stalls until its ABR re-check
+                # fires (~30s), which is exactly the "4 loops" symptom.
+                existing = self._streamers[ch_id]
+                if existing._seq_offset == 0:
+                    existing._seq_offset = hls_start
             if self._session_mode:
                 self._last_global_touch = time.time()
         if new_streamer is not None:
@@ -1899,14 +1918,12 @@ class StreamManager:
         s = self._streamers.get(ch_id)
         return s.is_ready() if s else False
 
-    def is_transition_ready(self, ch_id: str, min_segments: int = 4) -> bool:
+    def is_transition_ready(self, ch_id: str, min_segments: int = 2) -> bool:
         """
         True when the channel has at least min_segments TS files on disk.
 
-        ExoPlayer's bufferForPlaybackAfterRebufferMs is 5s; 4 × 2s segments = 8s
-        gives a comfortable margin so the player can fill its initial buffer
-        immediately from pre-written disk files rather than waiting for new writes.
-        Keeps bumper play-time to ~2 loops (~14–20s total) vs 3–4 with 8 segments.
+        2 segments (4s) is enough for ExoPlayer to start smoothly after the
+        #EXT-X-DISCONTINUITY that separates the bumper from real content.
         """
         s = self._streamers.get(ch_id)
         if not s or not s.is_ready():

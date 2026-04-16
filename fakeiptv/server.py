@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 _app_instance: "FakeIPTV" = None  # set by app.py before server starts
 _prewarm_done = False              # pre-warm all channels on first manifest request
+_bumper_served_channels: set = set()   # live channels that last received a bumper manifest
+_discontinuity_pending: set = set()    # subtitle channels: inject discontinuity into next video.m3u8
 
 # Matches HLS segment filenames like "seg42.ts" → group(1) = "42"
 _SEG_RE = re.compile(r"^seg(\d+)\.ts$")
@@ -75,12 +77,69 @@ _LANG_NAMES = {
 }
 
 
-def _build_master_playlist(subtitle_langs) -> str:
+def _bumper_manifest_content(bumper) -> str:
     """
-    Build an HLS master playlist that references the video stream (video.m3u8)
+    Read the bumper's video.m3u8 and rewrite it for serving as a loading screen:
+    - Segment lines are rewritten to absolute /hls/_loading/{bumper_id}/ paths.
+    - #EXT-X-START:TIME-OFFSET=-4.0 is inserted so the player joins near the live
+      edge of the looping bumper instead of the oldest (30s-old) segment.
+    """
+    manifest_path = os.path.join(bumper.hls_dir, "video.m3u8")
+    try:
+        with open(manifest_path, "r") as f:
+            content = f.read()
+    except OSError:
+        return ""
+    lines = []
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        if stripped == "#EXTM3U":
+            lines.append(line)
+            lines.append("#EXT-X-START:TIME-OFFSET=-4.0,PRECISE=NO\n")
+        elif re.match(r"seg\d+\.ts\s*$", stripped):
+            lines.append(f"/hls/_loading/{bumper.bumper_id}/{stripped}\n")
+        else:
+            lines.append(line)
+    return "".join(lines)
+
+
+def _inject_discontinuity(content: str) -> str:
+    """Insert #EXT-X-DISCONTINUITY before the first #EXTINF line.
+
+    Signals to ExoPlayer that the PTS timeline / codec changed (bumper → real
+    content), preventing the ~6s rebuffer stall on the transition.
+    """
+    lines = content.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("#EXTINF:"):
+            lines.insert(i, "#EXT-X-DISCONTINUITY\n")
+            break
+    return "".join(lines)
+
+
+def _bumper_response(channel_id, bumper):
+    """Return a Flask Response serving the bumper manifest.
+
+    channel_id should be the live channel ID (str) so the discontinuity flag is
+    set for the next real manifest poll.  Pass None for catchup sessions.
+    """
+    content = _bumper_manifest_content(bumper)
+    if not content:
+        return None
+    if channel_id is not None:
+        _bumper_served_channels.add(channel_id)
+    resp = Response(content, mimetype="application/x-mpegurl")
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
+
+def _build_master_playlist(subtitle_langs, variant_uri="video.m3u8") -> str:
+    """
+    Build an HLS master playlist referencing variant_uri (default video.m3u8)
     and one subtitle track per language (sub_{lang}.m3u8).
     DEFAULT=NO / AUTOSELECT=NO so a missing or slow subtitle track never
-    blocks video playback — the player will load subs opportunistically.
+    blocks video playback — the player loads subs opportunistically.
     """
     lines = [
         "#EXTM3U\n",
@@ -95,8 +154,11 @@ def _build_master_playlist(subtitle_langs) -> str:
             f'DEFAULT=NO,AUTOSELECT=NO,'
             f'URI="sub_{lang_label}.m3u8"\n'
         )
-    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=8000000,SUBTITLES="subs"\n')
-    lines.append("video.m3u8\n")
+    if subtitle_langs:
+        lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH=8000000,SUBTITLES="subs"\n')
+    else:
+        lines.append("#EXT-X-STREAM-INF:BANDWIDTH=8000000\n")
+    lines.append(f"{variant_uri}\n")
     return "".join(lines)
 
 
@@ -120,11 +182,15 @@ def hls_manifest(channel_id: str):
             abort(404)
         log.info("Catchup: resolved entry='%s' offset=%.1fs session=%s",
                  session.entry.title, session.offset_sec, session.session_id)
-        deadline = time.time() + 30
-        while not session.is_ready():
-            if session.is_failed() or time.time() > deadline:
-                abort(503)
-            time.sleep(0.5)
+        # If a bumper is available, redirect immediately — catchup_manifest() will
+        # serve the bumper while the session warms up.  Without a bumper, keep the
+        # original behaviour: wait here so the player always gets a valid manifest.
+        if _app_instance.stream_manager.get_random_bumper() is None:
+            deadline = time.time() + 30
+            while not session.is_ready():
+                if session.is_failed() or time.time() > deadline:
+                    abort(503)
+                time.sleep(0.5)
         return redirect(f"/catchup/{channel_id}/{session.session_id}/stream.m3u8")
 
     # Pre-warm all channels on first request of each "session" (if enabled via FAKEIPTV_PREWARM).
@@ -139,47 +205,47 @@ def hls_manifest(channel_id: str):
             # All channels went idle since last pre-warm — reset so next session warms up
             _prewarm_done = False
 
-    # Start ffmpeg lazily on first client request for this channel
-    if not _app_instance.stream_manager.ensure_started(channel_id):
+    # Check bumper availability before starting the channel so we can use
+    # background=True when a bumper is ready — this lets start() run its NAS
+    # probes and prewarm in a daemon thread while the bumper is served immediately.
+    bumper = _app_instance.stream_manager.get_random_bumper()
+    has_bumper = bumper is not None and bumper.is_ready()
+
+    # Start ffmpeg lazily on first client request for this channel.
+    # background=True when a bumper covers the gap: the streamer is registered
+    # synchronously (instant) but start() — including NAS prewarm — runs in a
+    # daemon thread so ffmpeg warmup happens in parallel with bumper display.
+    if not _app_instance.stream_manager.ensure_started(channel_id, background=has_bumper):
         abort(404)
 
     _app_instance.stream_manager.touch(channel_id)
 
-    # Wait (up to 30s) for ffmpeg to produce enough segments (READY_SEGMENTS).
-    # Uses threading.Event — all concurrent requests for the same channel share
-    # one event, so this does not create one thread per request.
-    if not _app_instance.stream_manager.wait_ready(channel_id, timeout=60):
-        abort(503)
+    # If the channel isn't ready yet (or doesn't have enough buffered segments
+    # for a smooth ExoPlayer cold-start), serve the bumper loading screen.
+    # We wait until is_transition_ready() (default 8 TS files = ~16s of content)
+    # so ExoPlayer can fill its mandatory ~8s pre-roll buffer from already-written
+    # segments rather than stalling for new ones — eliminating the cold-start gap.
+    if not _app_instance.stream_manager.is_transition_ready(channel_id):
+        if has_bumper:
+            # Channel warming — return master pointing to video.m3u8 immediately.
+            # hls_segment() serves bumper content from video.m3u8 while not ready,
+            # then real segments once is_transition_ready().
+            # The variant URL (video.m3u8) NEVER changes in the master, so Televizo
+            # keeps polling video.m3u8 on its ~4s live-variant cycle.  The switch
+            # happens within one poll — no 20s master ABR re-check delay.
+            subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
+            content = _build_master_playlist(subtitle_langs)
+            resp = Response(content, mimetype="application/x-mpegurl")
+            resp.headers["Cache-Control"] = "no-cache, no-store"
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
+        # No bumper — block until the channel has enough segments to play.
+        if not _app_instance.stream_manager.wait_ready(channel_id, timeout=60):
+            abort(503)
 
-    hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
-
-    # Build master playlist if the channel has subtitle tracks.
-    # We do NOT wait for VTT files to be written here — that would add 5-8s
-    # of mandatory startup delay.  Instead we declare all channel subtitle
-    # languages immediately (they're known from the channel entries), and let
-    # the /hls/<id>/<lang>.vtt endpoint wait up to 15s for each file to
-    # appear.  This gives the player the master playlist as soon as the first
-    # HLS segment is ready (~2s cold start), while subtitles catch up async.
     subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
     log.debug("hls_manifest %s: subtitle_langs=%s", channel_id, subtitle_langs or "none")
-
-    log.debug("hls_manifest %s: serving %s playlist",
-              channel_id, "master" if subtitle_langs else "simple video")
-    if subtitle_langs:
-        content = _build_master_playlist(subtitle_langs)
-    else:
-        manifest_path = os.path.join(hls_dir, "video.m3u8")
-        with open(manifest_path, "r") as f:
-            content = f.read()
-        # Tell the player to start near the live edge instead of the oldest segment
-        # in the sliding window, preventing replay of recently-watched content on
-        # channel switch-back. TIME-OFFSET=-4.0 = 2 segments before live edge.
-        content = content.replace(
-            "#EXTM3U\n",
-            "#EXTM3U\n#EXT-X-START:TIME-OFFSET=-4.0,PRECISE=NO\n",
-            1,
-        )
-
+    content = _build_master_playlist(subtitle_langs)
     resp = Response(content, mimetype="application/x-mpegurl")
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -243,6 +309,14 @@ def hls_sub_manifest(channel_id: str, lang: str):
 
     content = "".join(out)
 
+    seq_offset = _app_instance.stream_manager.get_seq_offset(channel_id)
+    if seq_offset:
+        content = re.sub(
+            r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)",
+            lambda m: m.group(1) + str(int(m.group(2)) + seq_offset),
+            content,
+        )
+
     resp = Response(content, mimetype="application/x-mpegurl")
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -257,6 +331,32 @@ def hls_segment(channel_id: str, segment: str):
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
     if not hls_dir:
         abort(404)
+
+    # video.m3u8 doubles as the bumper delivery vehicle: while the channel is warming
+    # up, serve bumper content from this URL so the variant URL declared in the master
+    # never changes.  The player polls video.m3u8 every ~4s; real segments appear on
+    # the next poll after is_transition_ready() — no 20s master ABR re-check delay.
+    # Must run BEFORE seg_path / file-existence checks so we can serve bumper content
+    # even when video.m3u8 doesn't exist on disk yet (ffmpeg still starting up).
+    if segment == "video.m3u8":
+        if not _app_instance.stream_manager.is_transition_ready(channel_id):
+            bumper = _app_instance.stream_manager.get_random_bumper()
+            if bumper is not None and bumper.is_ready():
+                content = _bumper_manifest_content(bumper)
+                if content:
+                    _bumper_served_channels.add(channel_id)
+                    resp = Response(content, mimetype="application/x-mpegurl")
+                    resp.headers["Cache-Control"] = "no-cache, no-store"
+                    resp.headers["Access-Control-Allow-Origin"] = "*"
+                    _app_instance.stream_manager.touch(channel_id)
+                    return resp
+            # No bumper or unreadable — fall through; video.m3u8 may not exist yet
+            # which will 404 cleanly below.
+        elif channel_id in _bumper_served_channels:
+            # First real video.m3u8 after bumper: inject discontinuity so ExoPlayer
+            # resets its PTS/codec state and avoids the ~6s rebuffer stall.
+            _bumper_served_channels.discard(channel_id)
+            _discontinuity_pending.add(channel_id)
 
     seg_path = os.path.join(hls_dir, segment)
 
@@ -280,11 +380,52 @@ def hls_segment(channel_id: str, segment: str):
         else:
             abort(404)
 
+    if segment == "video.m3u8":
+        needs_disc = channel_id in _discontinuity_pending
+        seq_offset = _app_instance.stream_manager.get_seq_offset(channel_id)
+        if needs_disc or seq_offset:
+            if needs_disc:
+                _discontinuity_pending.discard(channel_id)
+            try:
+                with open(seg_path, "r") as f:
+                    content = f.read()
+                if seq_offset:
+                    content = re.sub(
+                        r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)",
+                        lambda m: m.group(1) + str(int(m.group(2)) + seq_offset),
+                        content,
+                    )
+                if needs_disc:
+                    content = _inject_discontinuity(content)
+                resp = Response(content, mimetype="application/x-mpegurl")
+                resp.headers["Cache-Control"] = "no-cache, no-store"
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                _app_instance.stream_manager.touch(channel_id)
+                return resp
+            except OSError:
+                pass  # fall through to send_from_directory on read error
+
     _app_instance.stream_manager.touch(channel_id)
     resp = send_from_directory(hls_dir, segment)
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
+
+
+@app.route("/hls/_loading/<bumper_id>/<path:segment>")
+def bumper_segment(bumper_id: str, segment: str):
+    """Serve segments for the bumper loading screen stream."""
+    bumper = _app_instance.stream_manager.get_bumper_by_id(bumper_id)
+    if bumper is None:
+        abort(404)
+    seg_path = os.path.join(bumper.hls_dir, segment)
+    if not os.path.exists(seg_path):
+        abort(404)
+    resp = send_from_directory(bumper.hls_dir, segment)
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 
 
 # ---------------------------------------------------------------------------
@@ -328,15 +469,16 @@ def catchup_start(channel_id: str):
     log.info("Catchup: resolved entry='%s' offset=%.1fs session=%s",
              session.entry.title, session.offset_sec, session.session_id)
 
-    # Wait up to 30s for the first segment (cold NAS can take >15s to open a file)
-    deadline = time.time() + 30
-    while not session.is_ready():
-        if session.is_failed() or time.time() > deadline:
-            abort(503)
-        time.sleep(0.5)
-
-    manifest_url = f"/catchup/{channel_id}/{session.session_id}/stream.m3u8"
-    return redirect(manifest_url)
+    # If a bumper is available, redirect immediately — catchup_manifest() will
+    # serve the bumper while the session warms up.  Without a bumper, keep the
+    # original behaviour: wait here so the player always gets a valid manifest.
+    if _app_instance.stream_manager.get_random_bumper() is None:
+        deadline = time.time() + 30
+        while not session.is_ready():
+            if session.is_failed() or time.time() > deadline:
+                abort(503)
+            time.sleep(0.5)
+    return redirect(f"/catchup/{channel_id}/{session.session_id}/stream.m3u8")
 
 
 @app.route("/catchup/<channel_id>/<session_id>/sub_<lang>.m3u8")
@@ -394,7 +536,21 @@ def catchup_sub_manifest(channel_id: str, session_id: str, lang: str):
 @app.route("/catchup/<channel_id>/<session_id>/stream.m3u8")
 def catchup_manifest(channel_id: str, session_id: str):
     session = _app_instance.catchup_manager.get_session(session_id)
-    if session is None or not session.is_ready():
+    if session is None:
+        abort(404)
+
+    if not session.is_ready():
+        if session.is_failed():
+            abort(503)
+        # Show bumper loading screen while catchup ffmpeg warms up, unless this
+        # is a seek within the same episode (is_seek=True) — in that case return
+        # 404 so the player retries in ~2s without a bumper flash.
+        if not session.is_seek:
+            bumper = _app_instance.stream_manager.get_random_bumper()
+            if bumper and bumper.is_ready():
+                resp = _bumper_response(None, bumper)
+                if resp:
+                    return resp
         abort(404)
 
     # Once catchup ffmpeg has finished AND the player has fetched at least one

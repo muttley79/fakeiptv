@@ -13,6 +13,7 @@ CatchupManager handles on-demand VOD sessions for past programmes.
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -792,7 +793,8 @@ class ChannelStreamer:
 
     def __init__(self, channel: Channel, tmp_base: str, subtitles: bool = True,
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
-                 ready_segments: int = 3, preferred_audio_language: str = "eng"):
+                 ready_segments: int = 3, preferred_audio_language: str = "eng",
+                 hls_start_number: int = 0):
         self.channel = channel
         self._tmp_base = tmp_base
         self._subtitles = subtitles
@@ -800,6 +802,15 @@ class ChannelStreamer:
         self._preferred_audio_language = preferred_audio_language
         self._prewarm_timeout = prewarm_timeout
         self._ready_segments = ready_segments
+        # MEDIA-SEQUENCE offset applied when serving video.m3u8 to the player.
+        # Set to bumper_seq + headroom when a bumper covers the cold-start gap,
+        # so the channel's declared sequence number is HIGHER than the bumper's.
+        # The player treats a forward jump as new content and downloads immediately
+        # rather than treating real segments as "already seen" (which caused a
+        # 6-10s stall waiting for a master-playlist re-poll to reset tracking).
+        # Segment filenames on disk stay as seg1.ts, seg2.ts, etc. — only the
+        # #EXT-X-MEDIA-SEQUENCE header in the served manifest is adjusted.
+        self._seq_offset = hls_start_number
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -1258,11 +1269,30 @@ class ChannelStreamer:
             actual_inpoint = _probe_keyframe_inpoint(
                 entry_path, nominal_inpoint, entry_duration
             )
+
+        # Step 3b — probe video stream start_time.
+        # Some MKVs (disc rips, certain encodes) have a non-zero video start_time
+        # (e.g. 3s) while external SRT timestamps are content-relative (0 = first
+        # video frame).  _probe_keyframe_inpoint returns container PTS time, so we
+        # must subtract video_start_time to convert actual_inpoint to content time
+        # before building subtitle cues.  No-op for the common case of start_time=0.
+        video_start_time = 0.0
+        if entry_path:
+            video_start_time = _probe_stream_start_time(entry_path, "v:0") or 0.0
+            if abs(video_start_time) > 0.05:
+                log.info(
+                    "Channel %s: video start_time=%.3fs — adjusting subtitle inpoint "
+                    "(%.3fs → %.3fs)",
+                    self.channel.id, video_start_time,
+                    actual_inpoint, actual_inpoint - video_start_time,
+                )
+        corrected_inpoint = actual_inpoint - video_start_time
+
         log.info(
             "Channel %s: subtitle inpoint nominal=%.3fs actual=%.3fs "
-            "(snap=%.3fs, entry=%s)",
+            "(snap=%.3fs, video_start=%.3fs, entry=%s)",
             self.channel.id, nominal_inpoint, actual_inpoint,
-            nominal_inpoint - actual_inpoint,
+            nominal_inpoint - actual_inpoint, video_start_time,
             os.path.basename(entry_path) if entry_path else "?",
         )
 
@@ -1275,7 +1305,7 @@ class ChannelStreamer:
             if sub is None:
                 return
             try:
-                cue_lines, cue_count = sub.build_cues(actual_inpoint)
+                cue_lines, cue_count = sub.build_cues(corrected_inpoint)
             except Exception:
                 log.exception("SubtitleStreamer build_cues failed (%s, %s)",
                               self.channel.id, lang or "und")
@@ -1543,6 +1573,172 @@ class ChannelStreamer:
 
 
 # ---------------------------------------------------------------------------
+# BumperStreamer / BumperManager — always-on loading screen streams
+# ---------------------------------------------------------------------------
+
+class BumperStreamer:
+    """
+    Keeps a single ffmpeg HLS loop running for one bumper file.
+    Starts at container startup; monitor thread restarts it on exit.
+    Segments live in {tmp_base}/bumper_{bumper_id}/.
+    """
+
+    def __init__(self, bumper_path: str, tmp_base: str):
+        self._bumper_path = bumper_path
+        name = os.path.splitext(os.path.basename(bumper_path))[0]
+        # Slugify: lowercase, replace non-alphanumeric (except hyphen) with hyphen
+        self.bumper_id = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
+        self.hls_dir = os.path.join(tmp_base, f"bumper_{self.bumper_id}")
+        self._manifest_path = os.path.join(self.hls_dir, "video.m3u8")
+        self._process: Optional[subprocess.Popen] = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
+
+    def start(self):
+        os.makedirs(self.hls_dir, exist_ok=True)
+        self._stop_event.clear()
+        self._launch()
+        self._monitor_thread = threading.Thread(
+            target=self._monitor, daemon=True, name=f"bumper-monitor-{self.bumper_id}"
+        )
+        self._monitor_thread.start()
+        log.info("BumperStreamer started: %s", self.bumper_id)
+
+    def stop(self):
+        self._stop_event.set()
+        proc = self._process
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def is_ready(self) -> bool:
+        return self._ready_event.is_set()
+
+    def wait_ready(self, timeout: float = 10.0) -> bool:
+        return self._ready_event.wait(timeout=timeout)
+
+    def _launch(self):
+        # Delete stale segments to avoid timestamp discontinuity
+        if os.path.isdir(self.hls_dir):
+            for f in os.listdir(self.hls_dir):
+                if f.endswith((".ts", ".m3u8")):
+                    try:
+                        os.remove(os.path.join(self.hls_dir, f))
+                    except OSError:
+                        pass
+
+        seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-stream_loop", "-1",
+            "-re",
+            "-i", self._bumper_path,
+            "-c:v", "copy",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-f", "hls",
+            "-hls_time", "2",
+            "-hls_list_size", "15",
+            "-hls_flags", "delete_segments+omit_endlist+append_list",
+            "-hls_segment_filename", seg_pattern,
+            self._manifest_path,
+        ]
+        log.debug("BumperStreamer launch: %s", " ".join(cmd))
+        self._process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        # Start ready-watcher thread
+        t = threading.Thread(
+            target=self._watch_ready, daemon=True,
+            name=f"bumper-ready-{self.bumper_id}"
+        )
+        t.start()
+
+    def _watch_ready(self):
+        while not self._stop_event.is_set():
+            if os.path.exists(self._manifest_path):
+                ts_count = sum(1 for f in os.listdir(self.hls_dir) if f.endswith(".ts"))
+                if ts_count >= 1:
+                    self._ready_event.set()
+                    return
+            time.sleep(0.2)
+
+    def _monitor(self):
+        while not self._stop_event.is_set():
+            proc = self._process
+            if proc is not None:
+                proc.wait()
+            if self._stop_event.is_set():
+                break
+            log.warning("BumperStreamer %s exited — restarting", self.bumper_id)
+            time.sleep(2)
+            self._ready_event.clear()
+            self._launch()
+
+
+class BumperManager:
+    """
+    Manages one BumperStreamer per bumper file found in bumpers_path.
+    All streams start at container startup and run continuously.
+    """
+
+    _VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
+
+    def __init__(self, bumpers_path: str, tmp_base: str):
+        self._bumpers_path = bumpers_path
+        self._tmp_base = tmp_base
+        self._bumpers: List[BumperStreamer] = []
+
+    def start_all(self):
+        if not os.path.isdir(self._bumpers_path):
+            log.warning("BumperManager: bumpers_path %s not found — bumper feature disabled",
+                        self._bumpers_path)
+            return
+        files = sorted(
+            f for f in os.listdir(self._bumpers_path)
+            if os.path.splitext(f)[1].lower() in self._VIDEO_EXTENSIONS
+        )
+        if not files:
+            log.warning("BumperManager: no video files found in %s", self._bumpers_path)
+            return
+        for filename in files:
+            path = os.path.join(self._bumpers_path, filename)
+            bs = BumperStreamer(path, self._tmp_base)
+            bs.start()
+            self._bumpers.append(bs)
+        log.info("BumperManager: started %d bumper stream(s): %s",
+                 len(self._bumpers), [b.bumper_id for b in self._bumpers])
+
+    def stop_all(self):
+        for b in self._bumpers:
+            b.stop()
+        self._bumpers.clear()
+
+    def get_random_ready(self) -> Optional[BumperStreamer]:
+        """Return a random ready BumperStreamer, or None if none are ready."""
+        ready = [b for b in self._bumpers if b.is_ready()]
+        if not ready:
+            return None
+        return random.choice(ready)
+
+    def get_by_id(self, bumper_id: str) -> Optional[BumperStreamer]:
+        for b in self._bumpers:
+            if b.bumper_id == bumper_id:
+                return b
+        return None
+
+
+# ---------------------------------------------------------------------------
 # StreamManager — owns all channel streamers
 # ---------------------------------------------------------------------------
 
@@ -1555,7 +1751,8 @@ class StreamManager:
     def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True,
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
                  ready_segments: int = 3, session_mode: bool = False,
-                 prewarm_adjacent: int = 0, preferred_audio_language: str = "eng"):
+                 prewarm_adjacent: int = 0, preferred_audio_language: str = "eng",
+                 bumpers_path: str = ""):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._audio_copy = audio_copy
@@ -1580,8 +1777,13 @@ class StreamManager:
             target=self._reap_loop, daemon=True, name="stream-reaper"
         )
         self._reaper.start()
+        # Bumper loading screens — started once at init if bumpers_path is set
+        self._bumper_manager: Optional[BumperManager] = None
+        if bumpers_path:
+            self._bumper_manager = BumperManager(bumpers_path, tmp_base)
+            self._bumper_manager.start_all()
 
-    def ensure_started(self, ch_id: str) -> bool:
+    def ensure_started(self, ch_id: str, background: bool = False) -> bool:
         """
         Start the ffmpeg streamer for ch_id if it isn't already running.
         Returns False if the channel is unknown, True otherwise.
@@ -1592,7 +1794,31 @@ class StreamManager:
         serialise all concurrent prewarm/ensure_started calls, causing 30s+ delays.
         The streamer is registered in _streamers before start() so a second
         concurrent call for the same ch_id sees it and skips.
+
+        background=True: run start() in a daemon thread so NAS probes and prewarm
+        don't block the Flask request.  The streamer is still registered
+        synchronously, so subsequent ensure_started() calls are no-ops.
+        Use when a bumper is available to fill the loading gap.
         """
+        # When a bumper will cover the cold-start gap, read the bumper's current
+        # MEDIA-SEQUENCE BEFORE taking the lock (file I/O outside critical section).
+        # We start the channel's HLS at a higher sequence number so the player's
+        # tracker sees a forward jump (bumper→channel) rather than a backward one.
+        # A backward jump makes the player think it already saw real segments and
+        # stall 6-10s for a master-playlist re-poll to reset its tracking.
+        hls_start = 0
+        if background and self._bumper_manager is not None:
+            bumper = self._bumper_manager.get_random_ready()
+            if bumper is not None:
+                try:
+                    with open(os.path.join(bumper.hls_dir, "video.m3u8")) as f:
+                        for line in f:
+                            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                                hls_start = int(line.strip().split(":")[1]) + 100
+                                break
+                except (OSError, ValueError):
+                    pass
+
         new_streamer = None
         with self._lock:
             if ch_id not in self._channels:
@@ -1603,14 +1829,21 @@ class StreamManager:
                                               audio_copy=self._audio_copy,
                                               prewarm_timeout=self._prewarm_timeout,
                                               ready_segments=self._ready_segments,
-                                              preferred_audio_language=self._preferred_audio_language)
+                                              preferred_audio_language=self._preferred_audio_language,
+                                              hls_start_number=hls_start)
                 if ch_id in self._watched_channels:
                     new_streamer._ever_watched = True  # restore 600s timeout after idle stop
                 self._streamers[ch_id] = new_streamer  # register before start()
             if self._session_mode:
                 self._last_global_touch = time.time()
         if new_streamer is not None:
-            new_streamer.start()  # outside lock — NAS I/O in _launch() runs in parallel
+            if background:
+                threading.Thread(
+                    target=new_streamer.start, daemon=True,
+                    name=f"start-{ch_id}",
+                ).start()
+            else:
+                new_streamer.start()  # outside lock — NAS I/O in _launch() runs in parallel
         return True
 
     def touch(self, ch_id: str):
@@ -1639,14 +1872,61 @@ class StreamManager:
                 s.stop()
             self._streamers.clear()
             self._channels.clear()
+        if self._bumper_manager:
+            self._bumper_manager.stop_all()
+
+    def get_random_bumper(self) -> Optional[BumperStreamer]:
+        """Return a random ready BumperStreamer, or None if unavailable."""
+        if self._bumper_manager is None:
+            return None
+        return self._bumper_manager.get_random_ready()
+
+    def get_bumper_by_id(self, bumper_id: str) -> Optional[BumperStreamer]:
+        if self._bumper_manager is None:
+            return None
+        return self._bumper_manager.get_by_id(bumper_id)
 
     def get_hls_dir(self, ch_id: str) -> Optional[str]:
         s = self._streamers.get(ch_id)
         return s.hls_dir if s else None
 
+    def get_seq_offset(self, ch_id: str) -> int:
+        """Return the MEDIA-SEQUENCE offset to add when serving video.m3u8."""
+        s = self._streamers.get(ch_id)
+        return s._seq_offset if s else 0
+
     def is_ready(self, ch_id: str) -> bool:
         s = self._streamers.get(ch_id)
         return s.is_ready() if s else False
+
+    def is_transition_ready(self, ch_id: str, min_segments: int = 4) -> bool:
+        """
+        True when the channel has at least min_segments TS files on disk.
+
+        ExoPlayer's bufferForPlaybackAfterRebufferMs is 5s; 4 × 2s segments = 8s
+        gives a comfortable margin so the player can fill its initial buffer
+        immediately from pre-written disk files rather than waiting for new writes.
+        Keeps bumper play-time to ~2 loops (~14–20s total) vs 3–4 with 8 segments.
+        """
+        s = self._streamers.get(ch_id)
+        if not s or not s.is_ready():
+            return False
+        try:
+            count = sum(1 for f in os.listdir(s.hls_dir) if f.endswith(".ts"))
+            return count >= min_segments
+        except OSError:
+            return False
+
+    def is_subtitle_ready(self, ch_id: str) -> bool:
+        """True once subtitle VTTs have been written with a correct MPEGTS anchor.
+
+        Returns True for channels with no subtitle tracks (event is set immediately
+        in _launch() when subtitle_langs is empty).
+        """
+        s = self._streamers.get(ch_id)
+        if s is None:
+            return True
+        return s._subtitle_ready_event.is_set()
 
     def wait_ready(self, ch_id: str, timeout: float = 20.0) -> bool:
         """Block until the channel manifest is ready or timeout expires."""
@@ -1793,7 +2073,7 @@ class CatchupSession:
 
     def __init__(self, session_id: str, entry: ScheduleEntry, offset_sec: float,
                  duration_sec: float, session_dir: str, subtitles: bool,
-                 preferred_audio_language: str = "eng"):
+                 preferred_audio_language: str = "eng", is_seek: bool = False):
         self.session_id = session_id
         self.entry = entry
         self.offset_sec = offset_sec
@@ -1801,6 +2081,11 @@ class CatchupSession:
         self.session_dir = session_dir
         self.subtitles = subtitles
         self._preferred_audio_language = preferred_audio_language
+        # True when the new session was created because of a seek within the same
+        # source file (another session for the same channel+file existed).
+        # The bumper loading screen is suppressed for seeks so the viewer doesn't
+        # see a flash of the loading animation when scrubbing within an episode.
+        self.is_seek = is_seek
         self.manifest_path = os.path.join(session_dir, "stream.m3u8")
         self._process: Optional[subprocess.Popen] = None
         self._last_accessed = time.time()
@@ -2505,6 +2790,14 @@ class CatchupManager:
                 sid for sid, s in self._sessions.items()
                 if sid.startswith(prefix) and abs(int(sid.rsplit("_", 1)[1]) - ts) > REUSE_TOLERANCE
             ]
+            # Before evicting, check if any stale session uses the same source file.
+            # If so, this is likely a seek within the same episode — suppress the
+            # bumper loading screen so the viewer doesn't see a flash mid-scrub.
+            is_seek = any(
+                s.entry.path == entry.path
+                for sid, s in self._sessions.items()
+                if sid.startswith(prefix)
+            )
             for sid in stale:
                 log.info("Evicting stale catchup session %s (new session for same channel)", sid)
                 self._sessions[sid].stop()
@@ -2520,6 +2813,7 @@ class CatchupManager:
                 session_dir=session_dir,
                 subtitles=self._subtitles,
                 preferred_audio_language=self._preferred_audio_language,
+                is_seek=is_seek,
             )
             session.start()
             self._sessions[session_id] = session

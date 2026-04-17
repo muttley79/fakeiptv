@@ -229,6 +229,7 @@ def hls_manifest(channel_id: str):
     # If the channel isn't ready yet, serve the bumper loading screen.
     # 3 segments (6s) pre-buffered before the discontinuity fires: the
     # player's download thread fills the buffer during the flush — no visible stall.
+    subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
     if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=3):
         if has_bumper:
             # Channel warming — return master pointing to video.m3u8 immediately.
@@ -237,10 +238,10 @@ def hls_manifest(channel_id: str):
             # The variant URL (video.m3u8) NEVER changes in the master, so Televizo
             # keeps polling video.m3u8 on its ~4s live-variant cycle.  The switch
             # happens within one poll — no 20s master ABR re-check delay.
-            # No subtitle tracks during bumper — declaring them causes the player
-            # to try to sync an empty/stub sub manifest with video, which stalls
-            # the video download pipeline until the ABR re-check fires (~7s).
-            content = _build_master_playlist([])
+            # Subtitle tracks ARE included during bumper so ExoPlayer registers the
+            # rendition from the start.  hls_sub_manifest returns a stub playlist
+            # (not 503) when video.m3u8 hasn't been written yet, so no stall.
+            content = _build_master_playlist(subtitle_langs)
             resp = Response(content, mimetype="application/x-mpegurl")
             resp.headers["Cache-Control"] = "no-cache, no-store"
             resp.headers["Access-Control-Allow-Origin"] = "*"
@@ -250,7 +251,6 @@ def hls_manifest(channel_id: str):
             abort(503)
 
     _channel_bumper.pop(channel_id, None)  # clear pin; next cold start picks fresh bumper
-    subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
     log.debug("hls_manifest %s: subtitle_langs=%s", channel_id, subtitle_langs or "none")
     content = _build_master_playlist(subtitle_langs)
     resp = Response(content, mimetype="application/x-mpegurl")
@@ -283,13 +283,6 @@ def hls_sub_manifest(channel_id: str, lang: str):
     vtt_name = f"sub_{lang}.vtt"
     vtt_path = os.path.join(hls_dir, vtt_name)
 
-    # A placeholder VTT is written immediately at launch (write_placeholder),
-    # so this should almost always exist.  The async subtitle thread overwrites
-    # it with real cues once extraction completes; the player picks up the
-    # update on its next poll (live playlist — no EXT-X-ENDLIST).
-    if not os.path.exists(vtt_path):
-        abort(404)
-
     # Mirror the video manifest exactly — same EXTINF durations, same media-sequence,
     # but replace each segment filename with the VTT file.  This satisfies the HLS
     # spec (TARGETDURATION ≥ all EXTINF values) and gives Televizo a proper live
@@ -299,6 +292,19 @@ def hls_sub_manifest(channel_id: str, lang: str):
     try:
         with open(video_manifest, "r") as f:
             video_lines = f.readlines()
+        if not os.path.exists(vtt_path):
+            # video.m3u8 exists but VTT not yet written (extraction running).
+            # Return empty stub — the player keeps polling and gets real cues shortly.
+            stub = (
+                "#EXTM3U\n"
+                "#EXT-X-VERSION:3\n"
+                "#EXT-X-TARGETDURATION:2\n"
+                "#EXT-X-MEDIA-SEQUENCE:0\n"
+            )
+            resp = Response(stub, mimetype="application/x-mpegurl")
+            resp.headers["Cache-Control"] = "no-cache, no-store"
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
         replace_next = False
         for line in video_lines:
             if line.startswith("#EXT-X-ENDLIST"):
@@ -312,9 +318,38 @@ def hls_sub_manifest(channel_id: str, lang: str):
             else:
                 out.append(line)
     except FileNotFoundError:
-        # video.m3u8 not written yet (channel warming, first ~2s after launch).
-        # Return a valid empty live playlist so the player keeps polling instead
-        # of treating a 503 as a stream error and halting its polling loop.
+        # video.m3u8 not written yet (channel warming — bumper is playing).
+        # Mirror the bumper's video.m3u8 with empty.vtt so the subtitle manifest
+        # has the same MEDIA-SEQUENCE as the bumper video track.  Without this,
+        # a selected subtitle track causes ExoPlayer to stall: it tries to buffer
+        # subtitle seq N to match bumper video seq N but the sub manifest is at
+        # seq 0 with no segments.
+        bumper = _channel_bumper.get(channel_id)
+        if bumper is not None and bumper.is_ready():
+            try:
+                with open(os.path.join(bumper.hls_dir, "video.m3u8"), "r") as f:
+                    bumper_lines = f.readlines()
+                bumper_out = []
+                replace_next = False
+                for line in bumper_lines:
+                    if line.startswith("#EXT-X-ENDLIST"):
+                        continue
+                    elif line.startswith("#EXTINF:"):
+                        bumper_out.append(line)
+                        replace_next = True
+                    elif replace_next:
+                        bumper_out.append(f"/hls/_loading/{bumper.bumper_id}/empty.vtt\n")
+                        replace_next = False
+                    else:
+                        bumper_out.append(line)
+                if bumper_out:
+                    # Return directly — do NOT apply seq_offset (bumper uses its own numbers)
+                    resp = Response("".join(bumper_out), mimetype="application/x-mpegurl")
+                    resp.headers["Cache-Control"] = "no-cache, no-store"
+                    resp.headers["Access-Control-Allow-Origin"] = "*"
+                    return resp
+            except Exception:
+                pass
         stub = (
             "#EXTM3U\n"
             "#EXT-X-VERSION:3\n"
@@ -386,14 +421,6 @@ def hls_segment(channel_id: str, segment: str):
             _discontinuity_pending.add(channel_id)
 
     seg_path = os.path.join(hls_dir, segment)
-
-    # VTT files may not be written yet when the player first requests them
-    # (async subtitle thread is still running).  Wait up to 15s for the file
-    # to appear before returning 404 — covers the ~6s subtitle generation time.
-    if segment.endswith(".vtt") and not os.path.exists(seg_path):
-        deadline = time.time() + 15
-        while not os.path.exists(seg_path) and time.time() < deadline:
-            time.sleep(0.2)
 
     if not os.path.exists(seg_path):
         # On-demand regen: live .ts segment was deleted by ffmpeg's sliding window.

@@ -20,7 +20,7 @@ import subprocess
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from .scheduler import Channel, NowPlaying, ScheduleEntry, get_now_playing, get_playing_at
@@ -1029,9 +1029,6 @@ class ChannelStreamer:
     def _launch(self):
         self._last_launch_wall_time = time.time()
         self._ready_event.clear()
-        threading.Thread(
-            target=self._watch_ready, daemon=True, name=f"ready-{self.channel.id}"
-        ).start()
         with self._lock:
             # Stop any running subtitle processes before cleaning up the directory
             for sub in self._subtitle_streamers.values():
@@ -1048,6 +1045,12 @@ class ChannelStreamer:
                         os.remove(os.path.join(self.hls_dir, fname))
                     except OSError:
                         pass
+
+            # Start _watch_ready AFTER stale cleanup so it never sees old .ts files
+            # and triggers a false-positive is_transition_ready() before ffmpeg starts.
+            threading.Thread(
+                target=self._watch_ready, daemon=True, name=f"ready-{self.channel.id}"
+            ).start()
 
             if not self._build_concat():
                 log.error("Cannot build concat for %s — no entries?", self.channel.id)
@@ -1089,6 +1092,19 @@ class ChannelStreamer:
                 "Channel %s: subtitle langs from entries: %s",
                 self.channel.id, subtitle_langs or "none",
             )
+
+            # Write placeholder VTTs before NAS prewarm so hls_sub_manifest returns
+            # an empty stub (not 404) the instant the master playlist declares the track.
+            if subtitle_langs:
+                os.makedirs(self.hls_dir, exist_ok=True)
+                for _lang in subtitle_langs:
+                    _lang_label = _lang or "und"
+                    _vtt_path = os.path.join(self.hls_dir, f"sub_{_lang_label}.vtt")
+                    try:
+                        with open(_vtt_path, "w", encoding="utf-8") as _f:
+                            _f.write("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n")
+                    except OSError:
+                        pass
 
             # Get now-playing early so we can probe the current entry for embedded subs.
             np = get_now_playing(self.channel)
@@ -1607,6 +1623,13 @@ class BumperStreamer:
 
     def start(self):
         os.makedirs(self.hls_dir, exist_ok=True)
+        # Write a permanent empty VTT so the subtitle manifest can mirror
+        # the bumper playlist with a valid (empty) subtitle segment reference.
+        try:
+            with open(os.path.join(self.hls_dir, "empty.vtt"), "w", encoding="utf-8") as f:
+                f.write("WEBVTT\n\n")
+        except OSError:
+            pass
         self._stop_event.clear()
         self._launch()
         self._monitor_thread = threading.Thread(
@@ -2778,17 +2801,26 @@ class CatchupManager:
             offset_sec = 0.0
             remaining = entry.duration_sec
 
-        # If the utc timestamp falls within the last 30 seconds of an episode
-        # (Televizo shift mode sometimes sends stop_time - ε instead of start_time),
-        # snap back to the beginning so the user sees the full episode.
-        SNAP_THRESHOLD = 30.0
+        # If utc lands within the last 2 seconds of an episode, we're at a programme
+        # boundary. This happens because EPG timestamps are truncated to integer seconds
+        # but schedule boundaries are floating-point — Televizo sends back the integer
+        # start of show B, which falls fractionally inside show A's last second.
+        # Snap FORWARD past the boundary to start the intended next episode.
+        SNAP_THRESHOLD = 2.0
         if remaining < SNAP_THRESHOLD:
+            next_result = get_playing_at(channel, at + timedelta(seconds=remaining + 0.5))
+            if next_result is not None:
+                next_entry, next_off = next_result
+                if next_off < SNAP_THRESHOLD:
+                    next_off = 0.0
+                entry, offset_sec = next_entry, next_off
+            else:
+                offset_sec = 0.0
             log.info(
-                "Catchup %s: utc maps to last %.1fs of '%s' — snapping to start",
+                "Catchup %s: utc near boundary (%.3fs remaining in prev) — snapping forward to '%s'",
                 channel.id, remaining, entry.title,
             )
-            offset_sec = 0.0
-            remaining = entry.duration_sec
+            remaining = entry.duration_sec - offset_sec
 
         duration_sec = max(remaining, 5.0)
         ts = int(at.timestamp())
@@ -2805,7 +2837,7 @@ class CatchupManager:
                         existing_ts = int(sid.rsplit("_", 1)[1])
                     except (ValueError, IndexError):
                         continue
-                    if abs(existing_ts - ts) <= REUSE_TOLERANCE:
+                    if abs(existing_ts - ts) <= REUSE_TOLERANCE and not s.has_been_watched():
                         s.touch()
                         return s
 
@@ -2821,7 +2853,7 @@ class CatchupManager:
             # If so, this is likely a seek within the same episode — suppress the
             # bumper loading screen so the viewer doesn't see a flash mid-scrub.
             is_seek = any(
-                s.entry.path == entry.path
+                s.entry.path == entry.path and not s.has_been_watched()
                 for sid, s in self._sessions.items()
                 if sid.startswith(prefix)
             )

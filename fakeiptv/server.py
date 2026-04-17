@@ -32,6 +32,7 @@ app = Flask(__name__)
 _app_instance: "FakeIPTV" = None  # set by app.py before server starts
 _prewarm_done = False              # pre-warm all channels on first manifest request
 _bumper_served_channels: set = set()   # live channels that last received a bumper manifest
+_channel_bumper: dict = {}             # channel_id → pinned bumper for this loading period
 _discontinuity_pending: set = set()    # channels: inject #EXT-X-DISCONTINUITY into next video.m3u8
 
 # Matches HLS segment filenames like "seg42.ts" → group(1) = "42"
@@ -82,10 +83,10 @@ def _bumper_manifest_content(bumper) -> str:
     """
     Read the bumper's video.m3u8 and rewrite segment paths to absolute
     /hls/_loading/{bumper_id}/ URLs so the player fetches bumper segments
-    through the correct route.  The bumper uses hls_list_size=3 (6s window)
-    so the player exhausts the segment list every ~6s and must re-poll
-    video.m3u8 — giving the server a timely opportunity to switch to real
-    content once the channel is ready.
+    through the correct route.  The bumper uses 1-second segments with
+    hls_list_size=3 (3s window) so the player re-polls video.m3u8 every ~1s
+    — giving the server a timely opportunity to switch to real content once
+    the channel is ready.
     """
     manifest_path = os.path.join(bumper.hls_dir, "video.m3u8")
     try:
@@ -209,7 +210,11 @@ def hls_manifest(channel_id: str):
     # Check bumper availability before starting the channel so we can use
     # background=True when a bumper is ready — this lets start() run its NAS
     # probes and prewarm in a daemon thread while the bumper is served immediately.
-    bumper = _app_instance.stream_manager.get_random_bumper()
+    # Pin a bumper for this loading period so all subsequent video.m3u8 polls
+    # serve the same bumper (avoids alternating segments when multiple bumpers exist).
+    if channel_id not in _channel_bumper:
+        _channel_bumper[channel_id] = _app_instance.stream_manager.get_random_bumper()
+    bumper = _channel_bumper[channel_id]
     has_bumper = bumper is not None and bumper.is_ready()
 
     # Start ffmpeg lazily on first client request for this channel.
@@ -244,6 +249,7 @@ def hls_manifest(channel_id: str):
         if not _app_instance.stream_manager.wait_ready(channel_id, timeout=60):
             abort(503)
 
+    _channel_bumper.pop(channel_id, None)  # clear pin; next cold start picks fresh bumper
     subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
     log.debug("hls_manifest %s: subtitle_langs=%s", channel_id, subtitle_langs or "none")
     content = _build_master_playlist(subtitle_langs)
@@ -355,7 +361,7 @@ def hls_segment(channel_id: str, segment: str):
     # even when video.m3u8 doesn't exist on disk yet (ffmpeg still starting up).
     if segment == "video.m3u8":
         if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=3):
-            bumper = _app_instance.stream_manager.get_random_bumper()
+            bumper = _channel_bumper.get(channel_id)
             if bumper is not None and bumper.is_ready():
                 content = _bumper_manifest_content(bumper)
                 if content:
@@ -376,6 +382,7 @@ def hls_segment(channel_id: str, segment: str):
             # tracks declared during bumper phase (fix in hls_manifest), DISCONTINUITY
             # is processed immediately and triggers a fast stream.m3u8 re-check.
             _bumper_served_channels.discard(channel_id)
+            _channel_bumper.pop(channel_id, None)
             _discontinuity_pending.add(channel_id)
 
     seg_path = os.path.join(hls_dir, segment)
@@ -571,7 +578,9 @@ def catchup_manifest(channel_id: str, session_id: str):
         # is a seek within the same episode (is_seek=True) — in that case return
         # 404 so the player retries in ~2s without a bumper flash.
         if not session.is_seek:
-            bumper = _app_instance.stream_manager.get_random_bumper()
+            if session_id not in _channel_bumper:
+                _channel_bumper[session_id] = _app_instance.stream_manager.get_random_bumper()
+            bumper = _channel_bumper[session_id]
             if bumper and bumper.is_ready():
                 resp = _bumper_response(None, bumper)
                 if resp:
@@ -587,6 +596,7 @@ def catchup_manifest(channel_id: str, session_id: str):
                   session_id, channel_id)
         return redirect(f"/hls/{channel_id}/stream.m3u8", code=302)
 
+    _channel_bumper.pop(session_id, None)
     resp = send_from_directory(session.session_dir, "stream.m3u8")
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"

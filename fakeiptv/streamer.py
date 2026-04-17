@@ -1650,10 +1650,10 @@ class BumperStreamer:
             # costs negligible CPU (single short clip on a server-class machine).
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
             "-sc_threshold", "0",                   # no extra cuts at scene changes
-            "-force_key_frames", "expr:gte(t,n_forced*2)",  # I-frame every 2 s
+            "-force_key_frames", "expr:gte(t,n_forced*1)",  # I-frame every 1 s
             "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-f", "hls",
-            "-hls_time", "2",
+            "-hls_time", "1",
             "-hls_list_size", "3",
             "-hls_flags", "delete_segments+omit_endlist+append_list",
             "-hls_segment_filename", seg_pattern,

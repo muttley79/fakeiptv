@@ -1517,11 +1517,14 @@ class ChannelStreamer:
     def _monitor(self):
         # Two-tier stall detection:
         #   STARTUP_TIMEOUT — how long to wait for the FIRST segment.  Files with a
-        #     proper seek index (MKV Cues / MP4 moov) start in 2-3s.  10s allows
-        #     reasonable NAS latency while failing fast on genuinely broken files.
+        #     proper seek index (MKV Cues / MP4 moov) start in 2-3s.  60s allows
+        #     long-GOP HEVC content (GOP up to ~50s observed in cartoon encodes) to
+        #     reach the first keyframe boundary before the segment is written.
+        #     Genuinely broken files (ffmpeg exits with error) are caught by the
+        #     ret != 0 path, not by this timeout, so slow recovery is not a concern.
         #   RUNNING_TIMEOUT — how long to wait for the NEXT segment once the channel is
         #     already running.  A 30s gap mid-stream is a genuine stall.
-        STARTUP_TIMEOUT = 20
+        STARTUP_TIMEOUT = 60
         RUNNING_TIMEOUT = 30
         while not self._stop_event.is_set():
             proc = self._process

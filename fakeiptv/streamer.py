@@ -1139,6 +1139,11 @@ class ChannelStreamer:
                 threading.Thread(
                     target=self._write_subtitle_files_async,
                     args=(subtitle_langs,),
+                    kwargs={
+                        "launch_inpoint": np.offset_sec if np else 0.0,
+                        "launch_entry_path": np.entry.path if (np and np.entry) else None,
+                        "launch_entry_duration": np.entry.duration_sec if (np and np.entry) else 0.0,
+                    },
                     daemon=True,
                     name=f"sub-write-{self.channel.id}",
                 ).start()
@@ -1211,7 +1216,13 @@ class ChannelStreamer:
             )
 
 
-    def _write_subtitle_files_async(self, subtitle_langs: list):
+    def _write_subtitle_files_async(
+        self,
+        subtitle_langs: list,
+        launch_inpoint: float = 0.0,
+        launch_entry_path: Optional[str] = None,
+        launch_entry_duration: float = 0.0,
+    ):
         """
         Combined subtitle build + write thread (runs entirely in background).
 
@@ -1230,10 +1241,9 @@ class ChannelStreamer:
         gives accurate inpoint data on the first try, without the cold-NAS
         timeout/retry complexity of the previous approach.
         """
-        np_now = get_now_playing(self.channel)
-        nominal_inpoint = np_now.offset_sec if np_now else 0.0
-        entry_path = np_now.entry.path if (np_now and np_now.entry) else None
-        entry_duration = np_now.entry.duration_sec if (np_now and np_now.entry) else 0.0
+        nominal_inpoint = launch_inpoint
+        entry_path = launch_entry_path
+        entry_duration = launch_entry_duration
 
         # Step 1 — wait for the first TS segment (up to 30s)
         deadline = time.time() + 30

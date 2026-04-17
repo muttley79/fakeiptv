@@ -32,6 +32,7 @@ app = Flask(__name__)
 _app_instance: "FakeIPTV" = None  # set by app.py before server starts
 _prewarm_done = False              # pre-warm all channels on first manifest request
 _bumper_served_channels: set = set()   # live channels that last received a bumper manifest
+_discontinuity_pending: set = set()    # channels: inject #EXT-X-DISCONTINUITY into next video.m3u8
 
 # Matches HLS segment filenames like "seg42.ts" → group(1) = "42"
 _SEG_RE = re.compile(r"^seg(\d+)\.ts$")
@@ -101,6 +102,20 @@ def _bumper_manifest_content(bumper) -> str:
             lines.append(line)
     return "".join(lines)
 
+
+def _inject_discontinuity(content: str) -> str:
+    """Insert #EXT-X-DISCONTINUITY before the first #EXTINF line.
+
+    Resets ExoPlayer's TimestampAdjuster for all tracks so the subtitle
+    X-TIMESTAMP-MAP anchor aligns with the video adjuster after the
+    bumper→real channel transition.
+    """
+    lines = content.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if line.startswith("#EXTINF:"):
+            lines.insert(i, "#EXT-X-DISCONTINUITY\n")
+            break
+    return "".join(lines)
 
 
 def _bumper_response(channel_id, bumper):
@@ -353,13 +368,15 @@ def hls_segment(channel_id: str, segment: str):
             # No bumper or unreadable — fall through; video.m3u8 may not exist yet
             # which will 404 cleanly below.
         elif channel_id in _bumper_served_channels:
-            # Transition: bumper → real channel.  Just clear the flag so seq_offset
-            # is applied on the next video.m3u8 response.  No DISCONTINUITY injected:
-            # the tag triggered ExoPlayer's ABR master-playlist re-check cycle (~18s)
-            # before it would start downloading real segments, causing a visible stall.
-            # seq_offset (forward MEDIA-SEQUENCE jump) alone is sufficient to tell the
-            # player this is new content — it starts downloading immediately.
+            # First real video.m3u8 after bumper: inject DISCONTINUITY so ExoPlayer
+            # resets all TimestampAdjusters.  Without this, the subtitle adjuster keeps
+            # the bumper's accumulated PTS offset, causing subtitles to appear ~3s early.
+            # The previous 18s stall was caused by the sub-sync stall inside the bumper
+            # (503 / empty stub) delaying DISCONTINUITY processing; with no subtitle
+            # tracks declared during bumper phase (fix in hls_manifest), DISCONTINUITY
+            # is processed immediately and triggers a fast stream.m3u8 re-check.
             _bumper_served_channels.discard(channel_id)
+            _discontinuity_pending.add(channel_id)
 
     seg_path = os.path.join(hls_dir, segment)
 
@@ -384,16 +401,22 @@ def hls_segment(channel_id: str, segment: str):
             abort(404)
 
     if segment == "video.m3u8":
+        needs_disc = channel_id in _discontinuity_pending
         seq_offset = _app_instance.stream_manager.get_seq_offset(channel_id)
-        if seq_offset:
+        if needs_disc or seq_offset:
+            if needs_disc:
+                _discontinuity_pending.discard(channel_id)
             try:
                 with open(seg_path, "r") as f:
                     content = f.read()
-                content = re.sub(
-                    r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)",
-                    lambda m: m.group(1) + str(int(m.group(2)) + seq_offset),
-                    content,
-                )
+                if seq_offset:
+                    content = re.sub(
+                        r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)",
+                        lambda m: m.group(1) + str(int(m.group(2)) + seq_offset),
+                        content,
+                    )
+                if needs_disc:
+                    content = _inject_discontinuity(content)
                 resp = Response(content, mimetype="application/x-mpegurl")
                 resp.headers["Cache-Control"] = "no-cache, no-store"
                 resp.headers["Access-Control-Allow-Origin"] = "*"

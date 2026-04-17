@@ -63,11 +63,15 @@ def main():
 
     fake_iptv.start()
 
-    flask_app.run(
+    from waitress import serve
+    log.info("Starting waitress on %s:%s", config.server.host, config.server.port)
+    serve(
+        flask_app,
         host=config.server.host,
         port=config.server.port,
-        threaded=True,
-        use_reloader=False,
+        threads=16,
+        channel_timeout=60,
+        connection_limit=200,
     )
 
 

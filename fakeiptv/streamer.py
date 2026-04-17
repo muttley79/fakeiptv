@@ -1654,7 +1654,7 @@ class BumperStreamer:
             "-c:a", "aac", "-b:a", "128k", "-ac", "2",
             "-f", "hls",
             "-hls_time", "2",
-            "-hls_list_size", "15",
+            "-hls_list_size", "3",
             "-hls_flags", "delete_segments+omit_endlist+append_list",
             "-hls_segment_filename", seg_pattern,
             self._manifest_path,

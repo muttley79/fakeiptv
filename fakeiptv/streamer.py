@@ -189,6 +189,238 @@ def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
         pass  # non-fatal — ffmpeg/ffprobe will just be slower on cold cache
 
 
+# EBML element IDs for MKV parsing.
+_EBML_ID_EBML_HEADER     = 0x1A45DFA3
+_EBML_ID_SEGMENT         = 0x18538067
+_EBML_ID_SEGMENT_INFO    = 0x1549A966
+_EBML_ID_TIMESTAMP_SCALE = 0x2AD7B1
+_EBML_ID_SEEKHEAD        = 0x114D9B74
+_EBML_ID_SEEK            = 0x4DBB
+_EBML_ID_SEEK_ID         = 0x53AB
+_EBML_ID_SEEK_POS        = 0x53AC
+_EBML_ID_CUES            = 0x1C53BB6B
+_EBML_ID_CUE_POINT       = 0xBB
+_EBML_ID_CUE_TIME        = 0xB3
+_EBML_ID_CLUSTER         = 0x1F43B675
+
+
+def _ebml_read_id(data: bytes, pos: int) -> Tuple[Optional[int], int]:
+    """Read EBML variable-length element ID. Returns (id_int, new_pos)."""
+    if pos >= len(data):
+        return None, pos
+    b = data[pos]
+    if b >= 0x80:
+        return b, pos + 1
+    if b >= 0x40:
+        if pos + 2 > len(data):
+            return None, pos
+        return (b << 8) | data[pos + 1], pos + 2
+    if b >= 0x20:
+        if pos + 3 > len(data):
+            return None, pos
+        return (b << 16) | (data[pos + 1] << 8) | data[pos + 2], pos + 3
+    if b >= 0x10:
+        if pos + 4 > len(data):
+            return None, pos
+        return (b << 24) | (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3], pos + 4
+    return None, pos + 1
+
+
+def _ebml_read_size(data: bytes, pos: int) -> Tuple[Optional[int], int]:
+    """Read EBML variable-length size. Returns (size_int, new_pos) or (None, pos) on error."""
+    UNKNOWN = -1
+    if pos >= len(data):
+        return None, pos
+    b = data[pos]
+    if b >= 0x80:
+        return b & 0x7F, pos + 1
+    if b >= 0x40:
+        if pos + 2 > len(data):
+            return None, pos
+        return ((b & 0x3F) << 8) | data[pos + 1], pos + 2
+    if b >= 0x20:
+        if pos + 3 > len(data):
+            return None, pos
+        return ((b & 0x1F) << 16) | (data[pos + 1] << 8) | data[pos + 2], pos + 3
+    if b >= 0x10:
+        if pos + 4 > len(data):
+            return None, pos
+        return ((b & 0x0F) << 24) | (data[pos + 1] << 16) | (data[pos + 2] << 8) | data[pos + 3], pos + 4
+    if b >= 0x08:
+        if pos + 5 > len(data):
+            return None, pos
+        v = ((b & 0x07) << 32) | (data[pos + 1] << 24) | (data[pos + 2] << 16) | (data[pos + 3] << 8) | data[pos + 4]
+        return (UNKNOWN if v == 0x7FFFFFFFF else v), pos + 5
+    if b >= 0x04:
+        if pos + 6 > len(data):
+            return None, pos
+        v = ((b & 0x03) << 40) | (data[pos + 1] << 32) | (data[pos + 2] << 24) | (data[pos + 3] << 16) | (data[pos + 4] << 8) | data[pos + 5]
+        return (UNKNOWN if v == 0x3FFFFFFFFFF else v), pos + 6
+    if b >= 0x02:
+        if pos + 7 > len(data):
+            return None, pos
+        v = ((b & 0x01) << 48) | (data[pos + 1] << 40) | (data[pos + 2] << 32) | (data[pos + 3] << 24) | (data[pos + 4] << 16) | (data[pos + 5] << 8) | data[pos + 6]
+        return (UNKNOWN if v == 0x1FFFFFFFFFFFF else v), pos + 7
+    if b == 0x01:
+        if pos + 8 > len(data):
+            return None, pos
+        v = (data[pos + 1] << 48) | (data[pos + 2] << 40) | (data[pos + 3] << 32) | (data[pos + 4] << 24) | (data[pos + 5] << 16) | (data[pos + 6] << 8) | data[pos + 7]
+        return (UNKNOWN if v == 0xFFFFFFFFFFFFFF else v), pos + 8
+    return None, pos + 1
+
+
+def _mkv_cues_keyframe_inpoint(path: str, inpoint: float) -> Optional[float]:
+    """
+    Read MKV Cues element directly to find the keyframe ≤ inpoint.
+    Returns seconds, or None if parsing fails.  Much faster than ffprobe
+    -read_intervals which performs linear packet scanning.
+    """
+    try:
+        file_size = os.path.getsize(path)
+        if file_size < 65536:
+            return None
+
+        # Read first 64 KB to find SeekHead and SegmentInfo.
+        with open(path, "rb") as f:
+            head = f.read(65536)
+
+        pos = 0
+        UNKNOWN = -1
+
+        # Parse EBML header.
+        eid, pos = _ebml_read_id(head, pos)
+        esz, pos = _ebml_read_size(head, pos)
+        if eid != _EBML_ID_EBML_HEADER or esz is None:
+            return None
+        if esz != UNKNOWN:
+            pos += esz
+
+        # Parse Segment header.
+        eid, pos = _ebml_read_id(head, pos)
+        esz, pos = _ebml_read_size(head, pos)
+        if eid != _EBML_ID_SEGMENT:
+            return None
+        seg_body_abs = pos  # absolute file offset of Segment body start
+
+        # Scan Segment children: find SeekHead (for Cues offset) and SegmentInfo (for TimestampScale).
+        cues_seek_pos = None
+        timestamp_scale_ns = 1000000  # default: 1ms per tick
+
+        seg_pos = pos
+        while seg_pos < len(head) - 4:
+            eid, next_pos = _ebml_read_id(head, seg_pos)
+            esz, next_pos = _ebml_read_size(head, next_pos)
+            if eid is None or esz is None:
+                break
+            if eid == _EBML_ID_CLUSTER:
+                break  # metadata is before Cluster
+
+            if eid == _EBML_ID_SEEKHEAD:
+                # Parse SeekHead to find Cues reference.
+                sh_end = min(next_pos + esz, len(head))
+                sh_pos = next_pos
+                while sh_pos < sh_end - 2:
+                    seek_id, sh_pos = _ebml_read_id(head, sh_pos)
+                    seek_sz, sh_pos = _ebml_read_size(head, sh_pos)
+                    if seek_id is None or seek_sz is None:
+                        break
+                    if seek_id == _EBML_ID_SEEK:
+                        seek_entry_end = min(sh_pos + seek_sz, len(head))
+                        seek_entry_id = None
+                        seek_entry_pos = None
+                        se_pos = sh_pos
+                        while se_pos < seek_entry_end - 2:
+                            sub_id, se_pos = _ebml_read_id(head, se_pos)
+                            sub_sz, se_pos = _ebml_read_size(head, se_pos)
+                            if sub_id is None or sub_sz is None:
+                                break
+                            if sub_id == _EBML_ID_SEEK_ID:
+                                seek_entry_id, _ = _ebml_read_id(head, se_pos)
+                            elif sub_id == _EBML_ID_SEEK_POS:
+                                val = 0
+                                for i in range(min(sub_sz, 8)):
+                                    val = (val << 8) | head[se_pos + i]
+                                seek_entry_pos = val
+                            se_pos += sub_sz
+                        if seek_entry_id == _EBML_ID_CUES and seek_entry_pos is not None:
+                            cues_seek_pos = seek_entry_pos
+                    sh_pos += seek_sz
+
+            elif eid == _EBML_ID_SEGMENT_INFO:
+                # Parse SegmentInfo to find TimestampScale.
+                info_end = min(next_pos + esz, len(head))
+                info_pos = next_pos
+                while info_pos < info_end - 2:
+                    info_id, info_pos = _ebml_read_id(head, info_pos)
+                    info_sz, info_pos = _ebml_read_size(head, info_pos)
+                    if info_id is None or info_sz is None:
+                        break
+                    if info_id == _EBML_ID_TIMESTAMP_SCALE:
+                        val = 0
+                        for i in range(min(info_sz, 4)):
+                            val = (val << 8) | head[info_pos + i]
+                        timestamp_scale_ns = val
+                    info_pos += info_sz
+
+            if esz == UNKNOWN or esz < 0:
+                break
+            seg_pos = next_pos + esz
+
+        if cues_seek_pos is None:
+            return None
+
+        # Read Cues element.
+        abs_cues = seg_body_abs + cues_seek_pos
+        if abs_cues >= file_size:
+            return None
+
+        with open(path, "rb") as f:
+            f.seek(abs_cues)
+            # Read Cues element ID and size.
+            cues_hdr = f.read(16)
+        eid, hdr_pos = _ebml_read_id(cues_hdr, 0)
+        esz, hdr_pos = _ebml_read_size(cues_hdr, hdr_pos)
+        if eid != _EBML_ID_CUES or esz is None or esz <= 0 or esz > 8 * 1024 * 1024:
+            return None
+
+        # Read Cues content (cap at 8 MB).
+        with open(path, "rb") as f:
+            f.seek(abs_cues + hdr_pos)
+            cues_data = f.read(min(esz, 8 * 1024 * 1024))
+
+        # Parse CuePoints to find the largest CueTime ≤ inpoint.
+        best_time = None
+        cues_pos = 0
+        while cues_pos < len(cues_data) - 2:
+            cp_id, cues_pos = _ebml_read_id(cues_data, cues_pos)
+            cp_sz, cues_pos = _ebml_read_size(cues_data, cues_pos)
+            if cp_id is None or cp_sz is None:
+                break
+            if cp_id == _EBML_ID_CUE_POINT:
+                cp_end = min(cues_pos + cp_sz, len(cues_data))
+                cp_pos = cues_pos
+                cue_time = None
+                while cp_pos < cp_end - 2:
+                    cue_id, cp_pos = _ebml_read_id(cues_data, cp_pos)
+                    cue_sz, cp_pos = _ebml_read_size(cues_data, cp_pos)
+                    if cue_id is None or cue_sz is None:
+                        break
+                    if cue_id == _EBML_ID_CUE_TIME:
+                        val = 0
+                        for i in range(min(cue_sz, 8)):
+                            val = (val << 8) | cues_data[cp_pos + i]
+                        cue_time = val * timestamp_scale_ns / 1e9
+                        if cue_time <= inpoint:
+                            best_time = cue_time
+                    cp_pos += cue_sz
+            cues_pos += cp_sz
+
+        return best_time
+
+    except Exception:
+        return None
+
+
 def _probe_gop_size(path: str) -> float:
     """
     Return the max keyframe interval (GOP size) for the file, in seconds.
@@ -247,6 +479,17 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
     """
     if inpoint <= 0:
         return 0.0
+
+    # Try fast MKV Cues path first (direct EBML parsing, no subprocess).
+    if path.lower().endswith(".mkv"):
+        result = _mkv_cues_keyframe_inpoint(path, inpoint)
+        if result is not None:
+            if abs(result - inpoint) > 0.1:
+                log.info(
+                    "Subtitle keyframe snap (Cues): %.3fs → %.3fs (Δ=%.3fs) for %s",
+                    inpoint, result, inpoint - result, os.path.basename(path),
+                )
+            return result
 
     # GOP-based fallback: probe the first 10 s of the file (no seeking, always
     # fast) to get the actual keyframe interval for this file.  Used when the

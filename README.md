@@ -16,13 +16,14 @@ Designed for **Televizo** on a local network, deployed via Docker on Windows 11 
   - **{Genre} Movies**, **Movie Hits**, **Movies** — movie channels, genre-exclusive where possible
 - **Deterministic schedule** — anchored to a fixed epoch (`2024-01-01 00:00:00` local time). Restarting picks up exactly where it would have been with no state stored.
 - **No transcoding** — `ffmpeg -re -c:v copy` remuxes to MPEG-TS. 2-second HLS segments, 15-segment sliding window. Audio optionally copied or transcoded to AAC 192k.
-- **Bumper loading screen** — a video loops while a channel's ffmpeg warms up. Switching channels feels instant instead of showing a spinner. Bumper is suppressed when scrubbing catch-up (no mid-scrub flash).
-- **Catch-up TV** — select any past programme in Televizo's EPG guide and it plays from the beginning. Uses `catchup="shift"` mode with 60-second session reuse and 2-hour expiry.
+- **Bumper loading screen** — a video loops while a channel's ffmpeg warms up. Switching channels feels instant instead of showing a spinner. Bumper is suppressed when scrubbing catch-up (no mid-scrub flash). Transcoded once on first use, then cached and remuxed on restarts (zero CPU on restart).
+- **Catch-up TV** — select any past programme in Televizo's EPG guide and it plays from the beginning. Uses `catchup="shift"` mode with 60-second session reuse and 2-hour expiry. Subtitles follow from live (external SRT, no embedded tracks in VOD).
 - **XMLTV EPG** — UTC timestamps (required for Televizo), auto-embedded in the playlist via `url-tvg=`, regenerated hourly. Covers `catchup_days` days back + 1 day forward.
 - **Subtitles** — external `.srt` files (any language) converted to WebVTT with correct MPEG-TS timestamp anchoring. External SRT takes priority over embedded tracks. Hebrew RTL bidi supported. Bitmap subtitles (PGS/VOBSUB) auto-detected and skipped.
 - **HDR handling** — `hevc_metadata` bitstream filter strips HDR colour metadata on all-HDR HEVC channels so SDR players don't show a green screen.
 - **Audio language selection** — picks the preferred audio track by ISO 639 language code. Automatic fallback to AAC 192k stereo if eac3/DTS loses parameters during remux.
 - **NAS disk pre-warming** — reads header, tail, and estimated seek cluster of each MKV before ffmpeg touches it, putting pages in the NAS RAM cache to avoid cold-seek stalls.
+- **Fast keyframe indexing** — MKV Cues-based probing for quick subtitle snap-to-keyframe seeks (no slow ffprobe intervals).
 - **Metadata integration** — ratings, genres, and posters from NFO sidecars, Sonarr, Radarr, or TMDB (cascade in that order).
 - **SQLite duration cache** — probes each file once; keyed by path + mtime. Survives restarts.
 - **Daily refresh** — library rescan at midnight local time. Also available at `GET /refresh`.

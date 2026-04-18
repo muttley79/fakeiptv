@@ -6,7 +6,9 @@ import os
 from typing import Optional
 
 from .models import Channel, NowPlaying
-from .scheduler import get_now_playing, CONCAT_HOURS
+from .scheduler import get_now_playing
+
+CONCAT_HOURS = 4
 from .subtitle_utils import (
     _read_srt, _parse_srt_cues, _sec_to_vtt_ts, _text_has_hebrew, _he_bidi_fix,
     _extract_embedded_srt

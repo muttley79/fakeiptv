@@ -6,7 +6,7 @@ lists all channels with their stream URLs, EPG IDs, and catchup metadata.
 from datetime import datetime
 from typing import Dict
 
-from .scheduler import Channel
+from .models import Channel
 
 
 def build_m3u8(

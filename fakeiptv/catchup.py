@@ -11,7 +11,9 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from .models import Channel, ScheduleEntry
-from .scheduler import get_playing_at, HLS_SEGMENT_SECONDS
+from .scheduler import get_playing_at
+
+HLS_SEGMENT_SECONDS = 2
 from .ffprobe_utils import (
     _nas_prewarm, _probe_audio_stream_index, _probe_subtitle_stream_indices,
     _probe_segment_start_pts, _probe_keyframe_inpoint, _probe_stream_start_time

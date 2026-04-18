@@ -12,9 +12,11 @@ from typing import Dict
 from .config import AppConfig
 from .epg import build_xmltv
 from .playlist import build_m3u8
-from .scanner import MediaLibrary, Scanner
-from .scheduler import Channel, build_channels, build_epg_window
-from .streamer import CatchupManager, StreamManager
+from .models import Channel, MediaLibrary
+from .scanner import Scanner
+from .scheduler import build_channels, build_epg_window
+from .streamer import StreamManager
+from .catchup import CatchupManager
 
 log = logging.getLogger(__name__)
 

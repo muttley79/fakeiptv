@@ -22,3 +22,11 @@ docker-compose.yml
 # OS
 .DS_Store
 Thumbs.db
+
+# Ad-hoc / one-off scripts
+check_seek.sh
+fix_seek.sh
+debug_mkv.py
+convert_avi.sh
+portforward.py
+streamer.py

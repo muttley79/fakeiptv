@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 
 from flask import Flask, Response, abort, jsonify, redirect, request, send_from_directory
 
+from .hls_utils import _build_master_playlist, _inject_discontinuity, _parse_media_sequence, _bumper_manifest_content, _bumper_response
+
 if TYPE_CHECKING:
     from .app import FakeIPTV
 
@@ -83,81 +85,6 @@ def epg_gz():
 # HLS stream
 # ---------------------------------------------------------------------------
 
-_LANG_NAMES = {
-    "he": "Hebrew", "en": "English", "es": "Spanish", "fr": "French",
-    "de": "German", "ar": "Arabic", "ru": "Russian", "pt": "Portuguese",
-    "it": "Italian", "nl": "Dutch", "pl": "Polish", "cs": "Czech",
-    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "": "Subtitles",
-}
-
-
-def _bumper_manifest_content(bumper) -> str:
-    return bumper.manifest_content()
-
-
-def _parse_media_sequence(content: str) -> int:
-    m = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", content)
-    return int(m.group(1)) if m else 0
-
-
-def _inject_discontinuity(content: str) -> str:
-    """Insert #EXT-X-DISCONTINUITY before the first #EXTINF line.
-
-    Resets ExoPlayer's TimestampAdjuster for all tracks so the subtitle
-    X-TIMESTAMP-MAP anchor aligns with the video adjuster after the
-    bumper→real channel transition.
-    """
-    lines = content.splitlines(keepends=True)
-    for i, line in enumerate(lines):
-        if line.startswith("#EXTINF:"):
-            lines.insert(i, "#EXT-X-DISCONTINUITY\n")
-            break
-    return "".join(lines)
-
-
-def _bumper_response(channel_id, bumper):
-    """Return a Flask Response serving the bumper manifest.
-
-    channel_id should be the live channel ID (str) so the discontinuity flag is
-    set for the next real manifest poll.  Pass None for catchup sessions.
-    """
-    content = _bumper_manifest_content(bumper)
-    if not content:
-        return None
-    if channel_id is not None:
-        _bumper_served_channels.add(channel_id)
-    resp = Response(content, mimetype="application/x-mpegurl")
-    resp.headers["Cache-Control"] = "no-cache, no-store"
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    return resp
-
-
-def _build_master_playlist(subtitle_langs, variant_uri="video.m3u8") -> str:
-    """
-    Build an HLS master playlist referencing variant_uri (default video.m3u8)
-    and one subtitle track per language (sub_{lang}.m3u8).
-    DEFAULT=NO / AUTOSELECT=NO so a missing or slow subtitle track never
-    blocks video playback — the player loads subs opportunistically.
-    """
-    lines = [
-        "#EXTM3U\n",
-        "#EXT-X-START:TIME-OFFSET=-4.0,PRECISE=NO\n",
-    ]
-    for lang in subtitle_langs:
-        name = _LANG_NAMES.get(lang, lang.upper() or "Subtitles")
-        lang_label = lang or "und"
-        lines.append(
-            f'#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",'
-            f'LANGUAGE="{lang_label}",NAME="{name}",'
-            f'DEFAULT=NO,AUTOSELECT=NO,'
-            f'URI="sub_{lang_label}.m3u8"\n'
-        )
-    if subtitle_langs:
-        lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH=8000000,SUBTITLES="subs"\n')
-    else:
-        lines.append("#EXT-X-STREAM-INF:BANDWIDTH=8000000\n")
-    lines.append(f"{variant_uri}\n")
-    return "".join(lines)
 
 
 @app.route("/hls/<channel_id>/stream.m3u8")

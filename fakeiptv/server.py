@@ -42,9 +42,10 @@ def _log_request(response):
     return response
 
 _prewarm_done = False              # pre-warm all channels on first manifest request
-_bumper_served_channels: set = set()   # live channels that last received a bumper manifest
+_bumper_served_channels: set = set()   # live channels/catchup sessions that last received a bumper manifest
 _channel_bumper: dict = {}             # channel_id → pinned bumper for this loading period
 _discontinuity_pending: set = set()    # channels: inject #EXT-X-DISCONTINUITY into next video.m3u8
+_catchup_seq_offsets: dict = {}        # session_id → seq_offset to apply to stream.m3u8
 
 # Matches HLS segment filenames like "seg42.ts" → group(1) = "42"
 _SEG_RE = re.compile(r"^seg(\d+)\.ts$")
@@ -92,6 +93,11 @@ _LANG_NAMES = {
 
 def _bumper_manifest_content(bumper) -> str:
     return bumper.manifest_content()
+
+
+def _parse_media_sequence(content: str) -> int:
+    m = re.search(r"#EXT-X-MEDIA-SEQUENCE:(\d+)", content)
+    return int(m.group(1)) if m else 0
 
 
 def _inject_discontinuity(content: str) -> str:
@@ -590,9 +596,15 @@ def catchup_manifest(channel_id: str, session_id: str):
                 _channel_bumper[session_id] = _app_instance.stream_manager.get_random_bumper()
             bumper = _channel_bumper[session_id]
             if bumper and bumper.is_ready():
-                resp = _bumper_response(None, bumper)
-                if resp:
-                    return resp
+                # Return a minimal master pointing to video.m3u8; catchup_segment()
+                # will serve the bumper media playlist from that URL while loading.
+                # Never serve bumper media directly from stream.m3u8 — stream.m3u8 must
+                # always be a master playlist (serving media causes player type confusion).
+                content = _build_master_playlist([], variant_uri="video.m3u8")
+                resp = Response(content, mimetype="application/x-mpegurl")
+                resp.headers["Cache-Control"] = "no-cache, no-store"
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                return resp
         abort(404)
 
     # Once catchup ffmpeg has finished AND the player has fetched at least one
@@ -602,6 +614,8 @@ def catchup_manifest(channel_id: str, session_id: str):
     if session.is_done() and session.has_been_watched():
         log.debug("Catchup %s done — redirecting to live channel %s",
                   session_id, channel_id)
+        _catchup_seq_offsets.pop(session_id, None)
+        _bumper_served_channels.discard(session_id)
         return redirect(f"/hls/{channel_id}/stream.m3u8", code=302)
 
     _channel_bumper.pop(session_id, None)
@@ -617,6 +631,53 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
     session = _app_instance.catchup_manager.get_session(session_id)
     if session is None:
         abort(404)
+
+    # video.m3u8 is the variant media playlist — same role as video.m3u8 for live
+    # channels.  Serve bumper media here while the catchup ffmpeg warms up, then
+    # inject DISCONTINUITY + seq_offset on the first real serve so ExoPlayer resets
+    # its PTS adjuster and the media-sequence doesn't jump backward.
+    if segment == "video.m3u8":
+        if not session.is_ready():
+            bumper = _channel_bumper.get(session_id)
+            if bumper and bumper.is_ready():
+                content = _bumper_manifest_content(bumper)
+                if content:
+                    _bumper_served_channels.add(session_id)
+                    if session_id not in _catchup_seq_offsets:
+                        _catchup_seq_offsets[session_id] = _parse_media_sequence(content) + 100
+                    resp = Response(content, mimetype="application/x-mpegurl")
+                    resp.headers["Cache-Control"] = "no-cache, no-store"
+                    resp.headers["Access-Control-Allow-Origin"] = "*"
+                    return resp
+            abort(404)
+        elif session_id in _bumper_served_channels:
+            # First real video.m3u8 after bumper: flag for DISCONTINUITY injection
+            _bumper_served_channels.discard(session_id)
+            _channel_bumper.pop(session_id, None)
+            _discontinuity_pending.add(session_id)
+
+        needs_disc = session_id in _discontinuity_pending
+        seq_offset = _catchup_seq_offsets.get(session_id, 0)
+        if needs_disc or seq_offset:
+            if needs_disc:
+                _discontinuity_pending.discard(session_id)
+            try:
+                with open(os.path.join(session.session_dir, "video.m3u8"), "r") as f:
+                    content = f.read()
+                if seq_offset:
+                    content = re.sub(
+                        r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)",
+                        lambda m: m.group(1) + str(int(m.group(2)) + seq_offset),
+                        content,
+                    )
+                if needs_disc:
+                    content = _inject_discontinuity(content)
+                resp = Response(content, mimetype="application/x-mpegurl")
+                resp.headers["Cache-Control"] = "no-cache, no-store"
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                return resp
+            except OSError:
+                pass
 
     seg_path = os.path.join(session.session_dir, segment)
 

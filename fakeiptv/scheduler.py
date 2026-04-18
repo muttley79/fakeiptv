@@ -7,11 +7,11 @@ import hashlib
 import logging
 import random
 import re
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from .scanner import Episode, MediaLibrary, Movie, Show, slugify
+from .models import Episode, MediaLibrary, Movie, Show, Channel, ScheduleEntry, NowPlaying  # noqa: F401
+from .scanner import slugify
 
 log = logging.getLogger(__name__)
 
@@ -33,51 +33,6 @@ SHOW_GENRE_MAX_DOMINANCE = 0.6
 GOLDIES_MIN = 2
 
 
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ScheduleEntry:
-    """One slot in a channel's repeating schedule."""
-    path: str
-    title: str
-    subtitle: str        # episode title or movie title
-    duration_sec: float
-    plot: str
-    poster_url: str
-    season: int = 0
-    episode: int = 0
-    year: int = 0
-    genres: List[str] = field(default_factory=list)
-    audio_codec: str = ""
-    subtitle_paths: Dict[str, str] = field(default_factory=dict)
-    has_embedded_subs: bool = False
-    is_hdr: bool = False
-    video_width: int = 0
-    video_height: int = 0
-    video_codec: str = ""
-
-
-@dataclass
-class Channel:
-    id: str              # slug, e.g. "breaking-bad"
-    name: str
-    group: str           # "Shows", "Movies", "Genre Mix"
-    entries: List[ScheduleEntry] = field(default_factory=list)
-    poster_url: str = ""
-
-    @property
-    def total_duration(self) -> float:
-        return sum(e.duration_sec for e in self.entries)
-
-
-@dataclass
-class NowPlaying:
-    channel_id: str
-    entry: ScheduleEntry
-    offset_sec: float      # how far into the entry we currently are
-    entry_index: int       # index in channel.entries
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ class ScheduleEntry:
     is_hdr: bool = False
     video_width: int = 0
     video_height: int = 0
+    video_codec: str = ""
 
 
 @dataclass
@@ -125,11 +126,11 @@ def build_channels(
     # --- Primetime — every show ---
     _add_show_channel("primetime", "Primetime", all_shows)
 
-    # --- Genre channels (each show in all its genres) ---
+    # --- Genre channels (primary genre only, like movies) ---
     genre_shows: Dict[str, List[Show]] = {}
     for show in all_shows:
-        for g in show.genres:
-            genre_shows.setdefault(g, []).append(show)
+        if show.genres:
+            genre_shows.setdefault(show.genres[0], []).append(show)
 
     for genre, shows in sorted(genre_shows.items()):
         if len(shows) < SHOW_GENRE_MIN:
@@ -238,6 +239,7 @@ def _episode_to_entry(ep: Episode) -> ScheduleEntry:
         is_hdr=ep.is_hdr,
         video_width=ep.video_width,
         video_height=ep.video_height,
+        video_codec=ep.video_codec,
     )
 
 
@@ -257,6 +259,7 @@ def _movie_to_entry(movie: Movie) -> ScheduleEntry:
         is_hdr=movie.is_hdr,
         video_width=movie.video_width,
         video_height=movie.video_height,
+        video_codec=movie.video_codec,
     )
 
 
@@ -342,7 +345,7 @@ def _channel_offset_sec(channel_id: str) -> float:
     _ALLSHOWS_CHANNELS = ['primetime', 'mix-1', 'mix-2', 'mix-3', 'mix-4', 'mix-5']
     if channel_id in _ALLSHOWS_CHANNELS:
         idx = _ALLSHOWS_CHANNELS.index(channel_id)
-        return float(idx * 5 * 24 * 3600)   # 0, 5, 10, 15, 20, 25 days (120h spacing ≈ cycle/6)
+        return float(idx * 131 * 3600)   # 0, 131h, 262h, 393h, 524h, 655h (≈5d+11h, not 24h-aligned)
     h = int(hashlib.md5(channel_id.encode()).hexdigest()[:8], 16)
     return float(h % (7 * 24 * 3600))   # 0..604799 s  (up to 7 days)
 

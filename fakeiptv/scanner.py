@@ -47,6 +47,7 @@ class Episode:
     is_hdr: bool = False
     video_width: int = 0
     video_height: int = 0
+    video_codec: str = ""
 
 
 @dataclass
@@ -66,6 +67,7 @@ class Movie:
     is_hdr: bool = False
     video_width: int = 0
     video_height: int = 0
+    video_codec: str = ""
 
 @dataclass
 class Show:
@@ -123,7 +125,8 @@ class DurationCache:
                 has_embedded_subs INTEGER NOT NULL DEFAULT -1,
                 is_hdr            INTEGER NOT NULL DEFAULT -1,
                 video_width       INTEGER NOT NULL DEFAULT 0,
-                video_height      INTEGER NOT NULL DEFAULT 0
+                video_height      INTEGER NOT NULL DEFAULT 0,
+                video_codec       TEXT NOT NULL DEFAULT ''
             )
         """)
         # Migrate older databases that lack the new columns
@@ -134,6 +137,7 @@ class DurationCache:
             "ADD COLUMN slow_seek INTEGER NOT NULL DEFAULT -1",  # kept for schema compat, unused
             "ADD COLUMN video_width INTEGER NOT NULL DEFAULT 0",
             "ADD COLUMN video_height INTEGER NOT NULL DEFAULT 0",
+            "ADD COLUMN video_codec TEXT NOT NULL DEFAULT ''",
         ]:
             try:
                 self._conn.execute(f"ALTER TABLE durations {col_def}")
@@ -149,26 +153,27 @@ class DurationCache:
         return f"{path}|{mtime}"
 
     def get_info(self, path: str) -> Optional[tuple]:
-        """Return (duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height) or None if not cached."""
+        """Return (duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec) or None if not cached."""
         row = self._conn.execute(
-            "SELECT duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height FROM durations WHERE key = ?",
+            "SELECT duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec FROM durations WHERE key = ?",
             (self._key(path),)
         ).fetchone()
         if row is None:
             return None
-        duration, audio_codec, has_embedded_subs_int, is_hdr_int, video_width, video_height = row
-        if has_embedded_subs_int < 0 or is_hdr_int < 0 or video_width == 0:
+        duration, audio_codec, has_embedded_subs_int, is_hdr_int, video_width, video_height, video_codec = row
+        if has_embedded_subs_int < 0 or is_hdr_int < 0 or video_width == 0 or not video_codec:
             return None  # legacy entry lacking fields — re-probe
-        return duration, audio_codec, bool(has_embedded_subs_int), bool(is_hdr_int), video_width, video_height
+        return duration, audio_codec, bool(has_embedded_subs_int), bool(is_hdr_int), video_width, video_height, video_codec
 
     def set_info(self, path: str, duration: float, audio_codec: str,
-                 has_embedded_subs: bool, is_hdr: bool, video_width: int = 0, video_height: int = 0):
+                 has_embedded_subs: bool, is_hdr: bool, video_width: int = 0, video_height: int = 0,
+                 video_codec: str = ""):
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO durations "
-                "(key, duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(key, duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (self._key(path), duration, audio_codec,
-                 int(has_embedded_subs), int(is_hdr), video_width, video_height),
+                 int(has_embedded_subs), int(is_hdr), video_width, video_height, video_codec),
             )
             self._conn.commit()
 
@@ -356,12 +361,14 @@ def probe_file_info(path: str):
         is_hdr = False
         video_width = 0
         video_height = 0
+        video_codec = ""
         for stream in data.get("streams", []):
             ctype = stream.get("codec_type", "")
             if ctype == "video" and not is_hdr:
                 if not video_width:
                     video_width = stream.get("width") or 0
                     video_height = stream.get("height") or 0
+                    video_codec = stream.get("codec_name", "").lower()
                 transfer = stream.get("color_transfer", "")
                 if transfer in _HDR_TRANSFERS:
                     is_hdr = True
@@ -371,10 +378,10 @@ def probe_file_info(path: str):
             elif ctype == "subtitle":
                 if stream.get("codec_name", "") not in _BITMAP_SUB_CODECS:
                     has_embedded_subs = True
-        return duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height
+        return duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec
     except Exception as e:
         log.warning("ffprobe failed for %s: %s", path, e)
-        return 0.0, "", False, False, 0, 0
+        return 0.0, "", False, False, 0, 0, ""
 
 
 def _is_likely_hebrew(path: str) -> bool:
@@ -525,7 +532,7 @@ class Scanner:
         nfo_path = os.path.splitext(path)[0] + ".nfo"
         nfo = parse_nfo(nfo_path) if os.path.exists(nfo_path) else {}
 
-        dur_probed, audio_codec, has_embedded_subs, is_hdr, video_width, video_height = self._get_file_info(path)
+        dur_probed, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec = self._get_file_info(path)
         duration = nfo.get("runtime_sec") or dur_probed
         if not duration:
             log.warning("Could not determine duration for %s, skipping", path)
@@ -599,6 +606,7 @@ class Scanner:
             is_hdr=is_hdr,
             video_width=video_width,
             video_height=video_height,
+            video_codec=video_codec,
         )
 
     # ------------------------------------------------------------------
@@ -664,7 +672,7 @@ class Scanner:
                 if not nfo.get("runtime_sec") and meta.get("runtime_sec"):
                     nfo["runtime_sec"] = meta["runtime_sec"]
 
-        dur_probed, audio_codec, has_embedded_subs, is_hdr, video_width, video_height = self._get_file_info(path)
+        dur_probed, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec = self._get_file_info(path)
         duration = nfo.get("runtime_sec") or dur_probed
         if not duration:
             log.warning("Could not determine duration for %s, skipping", path)
@@ -704,6 +712,7 @@ class Scanner:
             is_hdr=is_hdr,
             video_width=video_width,
             video_height=video_height,
+            video_codec=video_codec,
         )
 
     # ------------------------------------------------------------------
@@ -711,15 +720,15 @@ class Scanner:
     # ------------------------------------------------------------------
 
     def _get_file_info(self, path: str):
-        """Return (duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height), using cache when available."""
+        """Return (duration, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec), using cache when available."""
         info = self._dur_cache.get_info(path)
         if info is not None:
             return info
         log.info("Probing: %s", os.path.basename(path))
-        dur, audio_codec, has_embedded_subs, is_hdr, video_width, video_height = probe_file_info(path)
+        dur, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec = probe_file_info(path)
         if dur:
-            self._dur_cache.set_info(path, dur, audio_codec, has_embedded_subs, is_hdr, video_width, video_height)
-        return dur, audio_codec, has_embedded_subs, is_hdr, video_width, video_height
+            self._dur_cache.set_info(path, dur, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec)
+        return dur, audio_codec, has_embedded_subs, is_hdr, video_width, video_height, video_codec
 
     @staticmethod
     def _clean_filename_title(filename: str) -> str:

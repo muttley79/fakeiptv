@@ -447,6 +447,7 @@ def hls_segment(channel_id: str, segment: str):
 
     if segment == "video.m3u8":
         needs_disc = channel_id in _discontinuity_pending
+        needs_disc = needs_disc or _app_instance.stream_manager.pop_codec_disc(channel_id)
         seq_offset = _app_instance.stream_manager.get_seq_offset(channel_id)
         if needs_disc or seq_offset:
             if needs_disc:

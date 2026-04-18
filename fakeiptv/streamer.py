@@ -832,6 +832,7 @@ class ChannelStreamer:
         # Populated in _launch() for the current entry; cleared on each restart.
         self._live_srt_langs: set = set()
         self._live_srt_indices: Dict[str, int] = {}
+        self._codec_disc_pending = False   # set by _build_concat when codec/res changes at boundary
 
     # ------------------------------------------------------------------
     # Public API
@@ -843,6 +844,7 @@ class ChannelStreamer:
         self._last_accessed = time.time()
         self._started_at = time.time()
         self._launch()
+        self._codec_disc_pending = False  # no prior stream; don't inject disc on initial start
         self._monitor_thread = threading.Thread(
             target=self._monitor, daemon=True, name=f"monitor-{self.channel.id}"
         )
@@ -976,9 +978,38 @@ class ChannelStreamer:
         idx = now_playing.entry_index
         offset = now_playing.offset_sec
         first = True
+        prev_codec = ""
+        prev_width = 0
+        prev_height = 0
+        at_least_one = False  # True once first entry has been added to concat
 
         while accumulated < total_seconds:
             entry = entries[idx % n]
+            # Detect codec or resolution change between consecutive entries.
+            # Truncate the concat here so ffmpeg restarts at the boundary and the
+            # server can inject #EXT-X-DISCONTINUITY for a clean decoder reset.
+            cur_codec = entry.video_codec
+            cur_w = entry.video_width
+            cur_h = entry.video_height
+            if at_least_one and prev_codec and cur_codec and (
+                cur_codec != prev_codec
+                or (cur_w and prev_width and cur_w != prev_width)
+                or (cur_h and prev_height and cur_h != prev_height)
+            ):
+                self._codec_disc_pending = True
+                log.debug(
+                    "Channel %s: codec/res change at boundary (%s %dx%d → %s %dx%d) — "
+                    "truncating concat, will inject DISCONTINUITY on restart",
+                    self.channel.id, prev_codec, prev_width, prev_height,
+                    cur_codec, cur_w, cur_h,
+                )
+                break
+            if cur_codec:
+                prev_codec = cur_codec
+            if cur_w:
+                prev_width = cur_w
+            if cur_h:
+                prev_height = cur_h
             # Forward slashes required by ffconcat; escape single quotes so
             # paths like "It's Always Sunny.mkv" don't break the format.
             # Use unquoted paths with backslash escaping.
@@ -1003,6 +1034,7 @@ class ChannelStreamer:
             else:
                 accumulated += entry.duration_sec
             idx += 1
+            at_least_one = True
 
         with open(self.concat_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
@@ -1948,6 +1980,14 @@ class StreamManager:
         s = self._streamers.get(ch_id)
         return s._seq_offset if s else 0
 
+    def pop_codec_disc(self, ch_id: str) -> bool:
+        """Return True (and clear the flag) if a codec/resolution change restart just occurred."""
+        s = self._streamers.get(ch_id)
+        if s and s._codec_disc_pending:
+            s._codec_disc_pending = False
+            return True
+        return False
+
     def is_ready(self, ch_id: str) -> bool:
         s = self._streamers.get(ch_id)
         return s.is_ready() if s else False
@@ -2224,7 +2264,7 @@ class CatchupSession:
             "-i", self.entry.path,
             "-t", str(self.duration_sec),
             "-c:v", "copy",
-            "-c:a", "copy",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2",
             "-map", "0:v:0",
             "-map", f"0:a:{audio_idx}",
             "-f", "hls",
@@ -2262,7 +2302,7 @@ class CatchupSession:
         ).start()
 
     def _monitor_stderr(self):
-        """Read ffmpeg stderr and log it; detect bitmap subtitle errors."""
+        """Read ffmpeg stderr and log warnings/errors."""
         proc = self._process
         if not proc:
             return
@@ -2725,7 +2765,7 @@ class CatchupSession:
                 "-ss", str(start_sec),
                 "-t", str(HLS_SEGMENT_SECONDS),
                 "-i", self.entry.path,
-                "-c:v", "copy", "-c:a", "copy",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ac", "2",
                 "-map", "0:v:0", "-map", f"0:a:{self._audio_idx}",
                 "-f", "mpegts", seg_path,
             ]
@@ -2846,9 +2886,16 @@ class CatchupManager:
             # Without this, skipping forward/backward spawns a new session per
             # seek while the old (potentially multi-GB) sessions sit idle until
             # the 2h reaper runs.
+            # Also evict sessions that have been watched — they can't be reused
+            # anyway, and leaving them running while creating a new session with
+            # the same session_id/dir causes two ffmpeg processes to compete for
+            # the same manifest file (e.g. repeated "start over" on same episode).
             stale = [
                 sid for sid, s in self._sessions.items()
-                if sid.startswith(prefix) and abs(int(sid.rsplit("_", 1)[1]) - ts) > REUSE_TOLERANCE
+                if sid.startswith(prefix) and (
+                    abs(int(sid.rsplit("_", 1)[1]) - ts) > REUSE_TOLERANCE
+                    or s.has_been_watched()
+                )
             ]
             # Before evicting, check if any stale session uses the same source file.
             # If so, this is likely a seek within the same episode — suppress the

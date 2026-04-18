@@ -79,9 +79,9 @@ def read_size(data, pos):
         v = ((b & 0x01) << 48) | (data[pos+1] << 40) | (data[pos+2] << 32) | (data[pos+3] << 24) | (data[pos+4] << 16) | (data[pos+5] << 8) | data[pos+6]
         return (UNKNOWN if v == 0x1FFFFFFFFFFFF else v), pos + 7
     if b == 0x01:
-        if pos + 8 > len(data): return None, pos
+        if pos + 9 > len(data): return None, pos
         v = (data[pos+1] << 48) | (data[pos+2] << 40) | (data[pos+3] << 32) | (data[pos+4] << 24) | (data[pos+5] << 16) | (data[pos+6] << 8) | data[pos+7]
-        return (UNKNOWN if v == 0xFFFFFFFFFFFFFF else v), pos + 8
+        return (UNKNOWN if v == 0xFFFFFFFFFFFFFF else v), pos + 9
     return None, pos + 1
 
 # Known EBML element IDs

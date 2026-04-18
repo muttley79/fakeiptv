@@ -208,7 +208,7 @@ def _probe_gop_size(path: str) -> float:
             "-show_entries", "packet=pts_time,flags",
             "-read_intervals", "0%10",
             path,
-        ], capture_output=True, text=True, timeout=8)
+        ], capture_output=True, text=True, timeout=30)
         packets = json.loads(r.stdout).get("packets", [])
         kf_times = sorted([
             float(p["pts_time"]) for p in packets
@@ -476,6 +476,13 @@ _LATIN_RUN_RE = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[ \'-][A-Za-z][A-Za-z0-9]*)*
 # for LTR-rendering players (it appears at visual-left = end, by accident).
 _HTML_TAG_RE = re.compile(r'(<[^>]*>)')
 _LEADING_PUNCT_RE = re.compile(r'^((?:<[^>]*>)*)([.!?,\u2026]+)')
+# Pre-swap table: ExoPlayer doesn't mirror brackets in RTL context, so we swap
+# them in the logical string so they render correctly after RTL reordering.
+_BRACKET_FLIP = str.maketrans('()[]{}', ')(][}{')
+
+
+def _text_has_hebrew(text: str) -> bool:
+    return any('\u0590' <= c <= '\u05FF' for c in text)
 
 
 def _he_bidi_fix(line: str) -> str:
@@ -523,11 +530,15 @@ def _he_bidi_fix(line: str) -> str:
         line = leading_tags + rest
 
     # Step 2: wrap Latin runs in text nodes only (tags are passed through raw).
+    # Also pre-swap bracket pairs in text nodes: ExoPlayer doesn't mirror
+    # brackets in RTL context, so (שלום) would render as )שלום(. Swapping
+    # in the logical string compensates for the missing glyph mirroring.
     parts = _HTML_TAG_RE.split(line)
     result = ''
     for i, part in enumerate(parts):
         if i % 2 == 0:  # text node
-            result += _LATIN_RUN_RE.sub(lambda mo: LRI + mo.group() + PDI, part)
+            mirrored = part.translate(_BRACKET_FLIP)
+            result += _LATIN_RUN_RE.sub(lambda mo: LRI + mo.group() + PDI, mirrored)
         else:           # HTML tag — preserve unchanged
             result += part
 
@@ -558,6 +569,7 @@ class SubtitleStreamer:
     def __init__(self, channel: Channel, lang: str, hls_dir: str):
         self._channel = channel
         self.lang = lang
+        self._is_rtl = (lang == "he")
         self.hls_dir = hls_dir
         lang_label = lang or "und"
         self.vtt_path = os.path.join(hls_dir, f"sub_{lang_label}.vtt")
@@ -604,7 +616,7 @@ class SubtitleStreamer:
                 "  background-color: transparent;\n"
                 "  text-shadow: 1px 0 0 #000, -1px 0 0 #000, 0 1px 0 #000, 0 -1px 0 #000;\n"
             )
-            if self.lang == "he":
+            if self._is_rtl:
                 # Explicit RTL direction for ExoPlayer versions that respect
                 # ::cue CSS — belt-and-suspenders alongside the RLM prepend in
                 # _he_bidi_fix.
@@ -679,6 +691,8 @@ class SubtitleStreamer:
             if srt_path and os.path.exists(srt_path):
                 entries_with_subs += 1
                 raw = _read_srt(srt_path)
+                if not self._is_rtl and self.lang == "" and _text_has_hebrew(raw):
+                    self._is_rtl = True
                 cues = _parse_srt_cues(raw)
                 # Disc-rip SRTs may use absolute disc timestamps (e.g. first cue at
                 # 02:30:04 because the episode starts at chapter 02:30:00 on the disc).
@@ -697,7 +711,7 @@ class SubtitleStreamer:
                         continue
                     if s_adj >= total_seconds:
                         break
-                    if self.lang == "he":
+                    if self._is_rtl:
                         text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
                     cue_lines.append(
                         f"{_sec_to_vtt_ts(s_adj)} --> {_sec_to_vtt_ts(e_adj)}\n"
@@ -752,7 +766,7 @@ class SubtitleStreamer:
                             continue
                         if s_adj >= total_seconds:
                             break
-                        if self.lang == "he":
+                        if self._is_rtl:
                             text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
                         cue_lines.append(
                             f"{_sec_to_vtt_ts(s_adj)} --> {_sec_to_vtt_ts(e_adj)}\n"
@@ -1318,12 +1332,27 @@ class ChannelStreamer:
                 self.channel.id, start_pts, start_pts / 90000,
             )
 
+        # Step 2.5 — write empty VTT stubs with the correct MPEGTS anchor and
+        # set _subtitle_ready_event immediately.  The player gets valid (empty)
+        # VTTs right away; cues are filled in during step 5 below.  This keeps
+        # subtitle requests non-blocking even when the keyframe probe is slow
+        # (e.g. UHD REMUXes without a seek index that need linear scanning).
+        for _lang in subtitle_langs:
+            _sub = self._subtitle_streamers.get(_lang)
+            if _sub:
+                _sub.write_files([], 0, start_pts)
+        self._subtitle_ready_event.set()
+        log.info("Channel %s: subtitle stubs ready (MPEGTS:%d) — cue build pending",
+                 self.channel.id, start_pts)
+
         # Step 3 — probe keyframe inpoint. NAS is warm (ffmpeg has been reading
-        # the file since the segment appeared), so ffprobe completes in <1s.
+        # the file since the segment appeared).  Use a longer timeout (60s) than
+        # the default 15s: the player is no longer blocked (stubs written above)
+        # and files without a seek index need time for linear scanning.
         actual_inpoint = nominal_inpoint
         if nominal_inpoint > 0 and entry_path:
             actual_inpoint = _probe_keyframe_inpoint(
-                entry_path, nominal_inpoint, entry_duration
+                entry_path, nominal_inpoint, entry_duration, timeout=60
             )
 
         # Step 3b — probe video stream start_time.
@@ -2530,23 +2559,23 @@ class CatchupSession:
         #      that reads the growing SRT every 15s and updates VTT + manifest.
         #      Zero extra NAS I/O — ffmpeg is already reading the file for video.
 
-        def _cue_style(lang):
+        def _cue_style(is_rtl):
             s = (
                 "  background-color: transparent;\n"
                 "  text-shadow: 1px 0 0 #000, -1px 0 0 #000,"
                 " 0 1px 0 #000, 0 -1px 0 #000;\n"
             )
-            if lang == "he":
+            if is_rtl:
                 s += "  direction: rtl;\n  unicode-bidi: isolate;\n"
             return s
 
-        def _write_vtt(lang, lang_label, cue_lines):
+        def _write_vtt(lang, lang_label, cue_lines, is_rtl=False):
             vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
             try:
                 with open(vtt_path, "w", encoding="utf-8") as f:
                     f.write("WEBVTT\n")
                     f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
-                    f.write(f"STYLE\n::cue {{\n{_cue_style(lang)}}}\n\n")
+                    f.write(f"STYLE\n::cue {{\n{_cue_style(is_rtl)}}}\n\n")
                     f.writelines(cue_lines)
             except OSError as exc:
                 log.error("Catchup %s: VTT write failed lang=%s: %s",
@@ -2570,8 +2599,9 @@ class CatchupSession:
                 pass
 
         def _build_cues_from_raw(raw, lang, offset):
-            """Parse SRT raw text and return VTT cue lines. offset subtracted from timestamps."""
+            """Parse SRT raw text and return (cue_lines, is_rtl). offset subtracted from timestamps."""
             cue_lines = []
+            is_rtl = lang == "he" or (lang == "" and _text_has_hebrew(raw))
             try:
                 for cue_start, cue_end, text in _parse_srt_cues(raw):
                     s = cue_start - offset
@@ -2579,7 +2609,7 @@ class CatchupSession:
                     if e <= 0:
                         continue
                     s = max(0.0, s)
-                    if lang == "he":
+                    if is_rtl:
                         text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
                     cue_lines.append(
                         f"{_sec_to_vtt_ts(s)} --> {_sec_to_vtt_ts(e)}\n{text}\n\n"
@@ -2587,7 +2617,7 @@ class CatchupSession:
             except Exception:
                 log.exception("Catchup %s: cue parse failed lang=%s",
                               self.session_id, lang or "und")
-            return cue_lines
+            return cue_lines, is_rtl
 
         def _extract_one(lang):
             """Path A: external SRT (instant) or subprocess fallback (blocking)."""
@@ -2604,10 +2634,10 @@ class CatchupSession:
                 # No ffmpeg SRT side output — fall back to standalone subprocess.
                 raw = _extract_embedded_srt(self.entry.path, lang, actual_start_sec,
                                              self.duration_sec, timeout=120)
-            cue_lines = _build_cues_from_raw(raw, lang, actual_start_sec) if raw else []
+            cue_lines, is_rtl = _build_cues_from_raw(raw, lang, actual_start_sec) if raw else ([], False)
             log.debug("Catchup %s: wrote %d cues lang=%s (external/fallback)",
                       self.session_id, len(cue_lines), lang_label)
-            _write_vtt(lang, lang_label, cue_lines)
+            _write_vtt(lang, lang_label, cue_lines, is_rtl)
 
         def _poll_ffmpeg_srt(lang):
             """Path B: read the SRT written by the main ffmpeg every 15s, update VTT."""
@@ -2664,7 +2694,7 @@ class CatchupSession:
                 # effective_offset = actual_start_sec - offset_sec  (negative
                 # when the keyframe is before the requested seek point, as usual)
                 effective_offset = actual_start_sec - self.offset_sec
-                cue_lines = _build_cues_from_raw(raw, lang, effective_offset)
+                cue_lines, is_rtl = _build_cues_from_raw(raw, lang, effective_offset)
                 if not cue_lines:
                     if self._process and self._process.poll() is not None:
                         break
@@ -2687,7 +2717,7 @@ class CatchupSession:
 
                 seq += 1
                 done = (self._process and self._process.poll() is not None)
-                _write_vtt(lang, lang_label, cue_lines)
+                _write_vtt(lang, lang_label, cue_lines, is_rtl)
                 _bump_manifest(lang_label, seq, endlist=done)
                 log.debug(
                     "Catchup %s: SRT poll — %d cues lang=%s seq=%d%s",

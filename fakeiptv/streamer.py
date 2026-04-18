@@ -692,10 +692,9 @@ class SubtitleStreamer:
                 for start, end, text in cues:
                     s_adj = (start - srt_offset) - inpoint + stream_pos
                     e_adj = (end   - srt_offset) - inpoint + stream_pos
-                    if e_adj <= 0:
+                    if e_adj <= 0 or s_adj < 0:
                         entry_cues_skipped += 1
                         continue
-                    s_adj = max(0.0, s_adj)
                     if s_adj >= total_seconds:
                         break
                     if self.lang == "he":
@@ -749,9 +748,8 @@ class SubtitleStreamer:
                     for start, end, text in cues:
                         s_adj = start - inpoint + stream_pos
                         e_adj = end   - inpoint + stream_pos
-                        if e_adj <= 0:
+                        if e_adj <= 0 or s_adj < 0:
                             continue
-                        s_adj = max(0.0, s_adj)
                         if s_adj >= total_seconds:
                             break
                         if self.lang == "he":

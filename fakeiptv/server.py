@@ -30,6 +30,17 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 _app_instance: "FakeIPTV" = None  # set by app.py before server starts
+
+@app.before_request
+def _start_timer():
+    request._start_time = time.time()
+
+@app.after_request
+def _log_request(response):
+    elapsed_ms = (time.time() - request._start_time) * 1000
+    log.debug("%s %s %d %.0fms", request.method, request.full_path.rstrip("?"), response.status_code, elapsed_ms)
+    return response
+
 _prewarm_done = False              # pre-warm all channels on first manifest request
 _bumper_served_channels: set = set()   # live channels that last received a bumper manifest
 _channel_bumper: dict = {}             # channel_id → pinned bumper for this loading period

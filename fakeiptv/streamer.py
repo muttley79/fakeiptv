@@ -2983,7 +2983,7 @@ class CatchupManager:
             # If so, this is likely a seek within the same episode — suppress the
             # bumper loading screen so the viewer doesn't see a flash mid-scrub.
             is_seek = any(
-                s.entry.path == entry.path and not s.has_been_watched()
+                s.entry.path == entry.path
                 for sid, s in self._sessions.items()
                 if sid.startswith(prefix)
             )

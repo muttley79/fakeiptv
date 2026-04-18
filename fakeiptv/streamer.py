@@ -1637,22 +1637,26 @@ class ChannelStreamer:
 
 class BumperStreamer:
     """
-    Keeps a single ffmpeg HLS loop running for one bumper file.
-    Starts at container startup; monitor thread restarts it on exit.
-    Segments live in {tmp_base}/bumper_{bumper_id}/.
+    Transcodes a bumper file once to a persistent MP4 cache (1s keyframes),
+    then remuxes to HLS segments with -c:v copy on each container start.
+    Playlists are generated dynamically (clock-based cycling) — no ffmpeg
+    process runs after the startup segmentation step completes.
     """
 
-    def __init__(self, bumper_path: str, tmp_base: str):
+    def __init__(self, bumper_path: str, tmp_base: str, cache_dir: str):
         self._bumper_path = bumper_path
         name = os.path.splitext(os.path.basename(bumper_path))[0]
         # Slugify: lowercase, replace non-alphanumeric (except hyphen) with hyphen
         self.bumper_id = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
         self.hls_dir = os.path.join(tmp_base, f"bumper_{self.bumper_id}")
         self._manifest_path = os.path.join(self.hls_dir, "video.m3u8")
+        self._cache_path = os.path.join(cache_dir, f"{self.bumper_id}.mp4")
+        self._meta_path = os.path.join(cache_dir, f"{self.bumper_id}.meta")
         self._process: Optional[subprocess.Popen] = None
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
-        self._monitor_thread: Optional[threading.Thread] = None
+        self._segments: List[str] = []
+        self._seg_duration: float = 1.0
 
     def start(self):
         os.makedirs(self.hls_dir, exist_ok=True)
@@ -1664,12 +1668,10 @@ class BumperStreamer:
         except OSError:
             pass
         self._stop_event.clear()
-        self._launch()
-        self._monitor_thread = threading.Thread(
-            target=self._monitor, daemon=True, name=f"bumper-monitor-{self.bumper_id}"
-        )
-        self._monitor_thread.start()
-        log.info("BumperStreamer started: %s", self.bumper_id)
+        threading.Thread(
+            target=self._run, daemon=True, name=f"bumper-{self.bumper_id}"
+        ).start()
+        log.info("BumperStreamer starting: %s", self.bumper_id)
 
     def stop(self):
         self._stop_event.set()
@@ -1690,89 +1692,173 @@ class BumperStreamer:
     def wait_ready(self, timeout: float = 10.0) -> bool:
         return self._ready_event.wait(timeout=timeout)
 
-    def _launch(self):
-        # Delete stale segments to avoid timestamp discontinuity
-        if os.path.isdir(self.hls_dir):
-            for f in os.listdir(self.hls_dir):
-                if f.endswith((".ts", ".m3u8")):
-                    try:
-                        os.remove(os.path.join(self.hls_dir, f))
-                    except OSError:
-                        pass
+    def current_seq(self) -> int:
+        return int(time.time())
 
-        seg_pattern = os.path.join(self.hls_dir, "seg%d.ts")
+    def manifest_content(self) -> str:
+        n = len(self._segments)
+        if n == 0:
+            return ""
+        now_seq = int(time.time())
+        target = max(1, round(self._seg_duration))
+        lines = [
+            "#EXTM3U", "#EXT-X-VERSION:3",
+            f"#EXT-X-TARGETDURATION:{target}",
+            f"#EXT-X-MEDIA-SEQUENCE:{now_seq}",
+        ]
+        prev_idx = None
+        for i in range(min(3, n)):
+            idx = (now_seq + i) % n
+            # Use seq-based virtual filename so the URL is always unique across
+            # loop cycles — players won't refuse to re-fetch a "seen" URL.
+            # The server maps seg{N}.ts → seg{N%n}.ts on disk.
+            # Insert DISCONTINUITY at the wrap point so the player resets its
+            # PTS tracker (seg0 starts at PTS≈0, seg{n-1} ends at PTS≈n*dur).
+            if prev_idx is not None and idx < prev_idx:
+                lines.append("#EXT-X-DISCONTINUITY")
+            prev_idx = idx
+            lines += [
+                f"#EXTINF:{self._seg_duration:.3f},",
+                f"/hls/_loading/{self.bumper_id}/seg{now_seq + i}.ts",
+            ]
+        return "\n".join(lines) + "\n"
+
+    def _run(self):
+        if not self._ensure_cache():
+            return
+        if self._stop_event.is_set():
+            return
+        if not self._segment_to_hls():
+            return
+        segs, dur = self._parse_manifest()
+        if not segs:
+            log.error("BumperStreamer: no segments after HLS segmentation for %s", self.bumper_id)
+            return
+        self._segments = segs
+        self._seg_duration = dur
+        self._ready_event.set()
+        log.info("BumperStreamer ready: %s (%d segs, %.2fs each)", self.bumper_id, len(segs), dur)
+
+    def _ensure_cache(self) -> bool:
+        try:
+            src_mtime = str(os.path.getmtime(self._bumper_path))
+        except OSError as exc:
+            log.error("BumperStreamer: cannot stat %s: %s", self._bumper_path, exc)
+            return False
+        if os.path.exists(self._cache_path) and os.path.exists(self._meta_path):
+            try:
+                with open(self._meta_path) as f:
+                    if f.read().strip() == src_mtime:
+                        log.debug("BumperStreamer: cache hit for %s", self.bumper_id)
+                        return True
+            except OSError:
+                pass
+        log.info("BumperStreamer: transcoding %s -> cache (first use or source changed)",
+                 self.bumper_id)
+        os.makedirs(os.path.dirname(self._cache_path), exist_ok=True)
+        tmp = self._cache_path + ".tmp"
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-stream_loop", "-1",
-            "-re",
             "-i", self._bumper_path,
-            # Transcode video with forced 2-second keyframes so -hls_time 2 is
-            # honoured.  -c:v copy is unreliable here: if the source has large
-            # GOP intervals (e.g. 10 s), ffmpeg can only cut at existing keyframes
-            # and produces 10-second segments regardless of -hls_time.  Long
-            # segments mean the player buffers many seconds of bumper and cannot
-            # be interrupted promptly when the real channel becomes ready.
-            # ultrafast + crf 28 is imperceptible for a loading animation and
-            # costs negligible CPU (single short clip on a server-class machine).
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-            "-sc_threshold", "0",                   # no extra cuts at scene changes
-            "-force_key_frames", "expr:gte(t,n_forced*1)",  # I-frame every 1 s
+            # Transcode once with forced 1s keyframes so -hls_time 1 produces
+            # actual 1s segments when remuxing to HLS below.  crf 23 instead of
+            # ultrafast/28 — quality matters here since this file is cached forever.
+            "-c:v", "libx264", "-crf", "23",
+            "-sc_threshold", "0",
+            "-force_key_frames", "expr:gte(t,n_forced*1)",
             "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-            "-f", "hls",
-            "-hls_time", "1",
-            "-hls_list_size", "3",
-            "-hls_flags", "delete_segments+omit_endlist+append_list",
-            "-hls_segment_filename", seg_pattern,
-            self._manifest_path,
+            "-movflags", "+faststart",
+            "-f", "mp4",
+            tmp,
         ]
-        log.debug("BumperStreamer launch: %s", " ".join(cmd))
-        self._process = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        log.debug("BumperStreamer transcode: %s", " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        # Start ready-watcher thread
-        t = threading.Thread(
-            target=self._watch_ready, daemon=True,
-            name=f"bumper-ready-{self.bumper_id}"
+        self._process = proc
+        proc.wait()
+        if proc.returncode != 0 or self._stop_event.is_set():
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if proc.returncode != 0:
+                log.error("BumperStreamer: transcode failed (rc=%d) for %s",
+                          proc.returncode, self.bumper_id)
+            return False
+        os.replace(tmp, self._cache_path)
+        try:
+            with open(self._meta_path, "w") as f:
+                f.write(src_mtime)
+        except OSError as exc:
+            log.warning("BumperStreamer: could not write meta for %s: %s", self.bumper_id, exc)
+        return True
+
+    def _segment_to_hls(self) -> bool:
+        for fn in os.listdir(self.hls_dir):
+            if fn.endswith((".ts", ".m3u8")):
+                try:
+                    os.remove(os.path.join(self.hls_dir, fn))
+                except OSError:
+                    pass
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", self._cache_path,
+            "-c:v", "copy", "-c:a", "copy",
+            "-f", "hls", "-hls_time", "1",
+            "-hls_list_size", "0",
+            "-hls_flags", "omit_endlist",
+            "-hls_segment_filename", os.path.join(self.hls_dir, "seg%d.ts"),
+            self._manifest_path,
+        ]
+        log.debug("BumperStreamer segment: %s", " ".join(cmd))
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
-        t.start()
+        self._process = proc
+        proc.wait()
+        if proc.returncode != 0:
+            log.error("BumperStreamer: HLS segmentation failed (rc=%d) for %s",
+                      proc.returncode, self.bumper_id)
+        return proc.returncode == 0 and not self._stop_event.is_set()
 
-    def _watch_ready(self):
-        while not self._stop_event.is_set():
-            if os.path.exists(self._manifest_path):
-                ts_count = sum(1 for f in os.listdir(self.hls_dir) if f.endswith(".ts"))
-                if ts_count >= 1:
-                    self._ready_event.set()
-                    return
-            time.sleep(0.2)
-
-    def _monitor(self):
-        while not self._stop_event.is_set():
-            proc = self._process
-            if proc is not None:
-                proc.wait()
-            if self._stop_event.is_set():
-                break
-            log.warning("BumperStreamer %s exited — restarting", self.bumper_id)
-            time.sleep(2)
-            self._ready_event.clear()
-            self._launch()
+    def _parse_manifest(self):
+        segs, durs = [], []
+        try:
+            with open(self._manifest_path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            return [], 1.0
+        for i, line in enumerate(lines):
+            if line.startswith("#EXTINF:"):
+                try:
+                    durs.append(float(line[8:].rstrip(",")))
+                except ValueError:
+                    pass
+                nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                if nxt and not nxt.startswith("#"):
+                    segs.append(os.path.basename(nxt))
+        avg = sum(durs) / len(durs) if durs else 1.0
+        return segs, avg
 
 
 class BumperManager:
     """
     Manages one BumperStreamer per bumper file found in bumpers_path.
-    All streams start at container startup and run continuously.
+    Each bumper is transcoded once to cache_dir on first use, then remuxed
+    to HLS on each container start with -c:v copy (fast, no CPU).
     """
 
     _VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm")
 
-    def __init__(self, bumpers_path: str, tmp_base: str):
+    def __init__(self, bumpers_path: str, tmp_base: str, cache_dir: str):
         self._bumpers_path = bumpers_path
         self._tmp_base = tmp_base
+        self._cache_dir = os.path.join(cache_dir, "bumpers")
         self._bumpers: List[BumperStreamer] = []
 
     def start_all(self):
@@ -1787,9 +1873,10 @@ class BumperManager:
         if not files:
             log.warning("BumperManager: no video files found in %s", self._bumpers_path)
             return
+        os.makedirs(self._cache_dir, exist_ok=True)
         for filename in files:
             path = os.path.join(self._bumpers_path, filename)
-            bs = BumperStreamer(path, self._tmp_base)
+            bs = BumperStreamer(path, self._tmp_base, self._cache_dir)
             bs.start()
             self._bumpers.append(bs)
         log.info("BumperManager: started %d bumper stream(s): %s",
@@ -1828,7 +1915,7 @@ class StreamManager:
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
                  ready_segments: int = 3, session_mode: bool = False,
                  prewarm_adjacent: int = 0, preferred_audio_language: str = "eng",
-                 bumpers_path: str = ""):
+                 bumpers_path: str = "", bumpers_cache_dir: str = ""):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._audio_copy = audio_copy
@@ -1856,7 +1943,9 @@ class StreamManager:
         # Bumper loading screens — started once at init if bumpers_path is set
         self._bumper_manager: Optional[BumperManager] = None
         if bumpers_path:
-            self._bumper_manager = BumperManager(bumpers_path, tmp_base)
+            self._bumper_manager = BumperManager(
+                bumpers_path, tmp_base, bumpers_cache_dir or tmp_base
+            )
             self._bumper_manager.start_all()
 
     def ensure_started(self, ch_id: str, background: bool = False) -> bool:
@@ -1886,14 +1975,7 @@ class StreamManager:
         if background and self._bumper_manager is not None:
             bumper = self._bumper_manager.get_random_ready()
             if bumper is not None:
-                try:
-                    with open(os.path.join(bumper.hls_dir, "video.m3u8")) as f:
-                        for line in f:
-                            if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
-                                hls_start = int(line.strip().split(":")[1]) + 100
-                                break
-                except (OSError, ValueError):
-                    pass
+                hls_start = bumper.current_seq() + 100
 
         new_streamer = None
         with self._lock:

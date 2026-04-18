@@ -40,6 +40,7 @@ class FakeIPTV:
             prewarm_adjacent=config.server.prewarm_adjacent,
             preferred_audio_language=config.server.preferred_audio_language,
             bumpers_path=config.server.bumpers_path,
+            bumpers_cache_dir=config.metadata.cache_dir,
         )
         self.catchup_manager = CatchupManager(
             tmp_base=config.server.tmp_dir,

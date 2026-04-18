@@ -91,28 +91,7 @@ _LANG_NAMES = {
 
 
 def _bumper_manifest_content(bumper) -> str:
-    """
-    Read the bumper's video.m3u8 and rewrite segment paths to absolute
-    /hls/_loading/{bumper_id}/ URLs so the player fetches bumper segments
-    through the correct route.  The bumper uses 1-second segments with
-    hls_list_size=3 (3s window) so the player re-polls video.m3u8 every ~1s
-    — giving the server a timely opportunity to switch to real content once
-    the channel is ready.
-    """
-    manifest_path = os.path.join(bumper.hls_dir, "video.m3u8")
-    try:
-        with open(manifest_path, "r") as f:
-            content = f.read()
-    except OSError:
-        return ""
-    lines = []
-    for line in content.splitlines(keepends=True):
-        stripped = line.strip()
-        if re.match(r"seg\d+\.ts\s*$", stripped):
-            lines.append(f"/hls/_loading/{bumper.bumper_id}/{stripped}\n")
-        else:
-            lines.append(line)
-    return "".join(lines)
+    return bumper.manifest_content()
 
 
 def _inject_discontinuity(content: str) -> str:
@@ -337,30 +316,22 @@ def hls_sub_manifest(channel_id: str, lang: str):
         # seq 0 with no segments.
         bumper = _channel_bumper.get(channel_id)
         if bumper is not None and bumper.is_ready():
-            try:
-                with open(os.path.join(bumper.hls_dir, "video.m3u8"), "r") as f:
-                    bumper_lines = f.readlines()
-                bumper_out = []
-                replace_next = False
-                for line in bumper_lines:
-                    if line.startswith("#EXT-X-ENDLIST"):
-                        continue
-                    elif line.startswith("#EXTINF:"):
-                        bumper_out.append(line)
-                        replace_next = True
-                    elif replace_next:
-                        bumper_out.append(f"/hls/_loading/{bumper.bumper_id}/empty.vtt\n")
-                        replace_next = False
+            raw = bumper.manifest_content()
+            if raw:
+                # Mirror bumper video manifest but replace .ts segments with empty.vtt
+                # so the subtitle track has the same MEDIA-SEQUENCE as the video track.
+                out_lines = []
+                for line in raw.splitlines(keepends=True):
+                    if line.strip().endswith(".ts"):
+                        out_lines.append(
+                            f"/hls/_loading/{bumper.bumper_id}/empty.vtt\n"
+                        )
                     else:
-                        bumper_out.append(line)
-                if bumper_out:
-                    # Return directly — do NOT apply seq_offset (bumper uses its own numbers)
-                    resp = Response("".join(bumper_out), mimetype="application/x-mpegurl")
-                    resp.headers["Cache-Control"] = "no-cache, no-store"
-                    resp.headers["Access-Control-Allow-Origin"] = "*"
-                    return resp
-            except Exception:
-                pass
+                        out_lines.append(line)
+                resp = Response("".join(out_lines), mimetype="application/x-mpegurl")
+                resp.headers["Cache-Control"] = "no-cache, no-store"
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                return resp
         stub = (
             "#EXTM3U\n"
             "#EXT-X-VERSION:3\n"
@@ -484,15 +455,13 @@ def bumper_segment(bumper_id: str, segment: str):
     bumper = _app_instance.stream_manager.get_bumper_by_id(bumper_id)
     if bumper is None:
         abort(404)
-    seg_path = os.path.join(bumper.hls_dir, segment)
-    # Segment may have just been listed in the manifest while ffmpeg is still
-    # writing it. Poll briefly before giving up (avoids player 404/buffer flash).
-    deadline = time.time() + 0.5
-    while not os.path.exists(seg_path) and time.time() < deadline:
-        time.sleep(0.05)
-    if not os.path.exists(seg_path):
-        abort(404)
-    resp = send_from_directory(bumper.hls_dir, segment)
+    # Manifest uses virtual seq-based names (seg{N}.ts) to guarantee unique URLs
+    # across loop cycles.  Map back to the actual on-disk file seg{N%n}.ts.
+    actual = segment
+    m = re.match(r"seg(\d+)\.ts$", segment)
+    if m and bumper._segments:
+        actual = bumper._segments[int(m.group(1)) % len(bumper._segments)]
+    resp = send_from_directory(bumper.hls_dir, actual)
     resp.headers["Cache-Control"] = "no-cache, no-store"
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp

@@ -389,22 +389,23 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
     if inpoint <= 0:
         return 0.0
 
+    # MKV Cues hint where to start the packet scan, but they can be inaccurate
+    # (e.g. stale mux where CueTime doesn't match any real keyframe). Always
+    # verify with a real ffprobe packet scan; use the Cues result only to
+    # narrow the scan window.
+    cues_hint = None
     if path.lower().endswith(".mkv"):
-        result = _mkv_cues_keyframe_inpoint(path, inpoint)
-        if result is not None:
-            if abs(result - inpoint) > 0.1:
-                log.info(
-                    "Subtitle keyframe snap (Cues): %.3fs → %.3fs (Δ=%.3fs) for %s",
-                    inpoint, result, inpoint - result, os.path.basename(path),
-                )
-            return result
+        cues_hint = _mkv_cues_keyframe_inpoint(path, inpoint)
 
     gop_size = _probe_gop_size(path)
     fallback = max(0.0, inpoint - gop_size)
 
     with _keyframe_probe_sem:
         try:
-            start = max(0.0, inpoint - max(gop_size * 2, 10.0))
+            # If Cues gave a hint, scan from 2 GOPs before it (catches inaccurate Cues);
+            # otherwise scan from 2 GOPs before the inpoint.
+            hint = cues_hint if cues_hint is not None else inpoint
+            start = max(0.0, hint - max(gop_size * 2, 10.0))
             r = subprocess.run([
                 "ffprobe", "-v", "quiet",
                 "-print_format", "json",

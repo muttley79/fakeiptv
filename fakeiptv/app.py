@@ -11,6 +11,7 @@ from typing import Dict
 
 from .config import AppConfig
 from .epg import build_xmltv
+from .library_cache import LibraryCache
 from .playlist import build_m3u8
 from .models import Channel, MediaLibrary
 from .scanner import Scanner
@@ -78,8 +79,27 @@ class FakeIPTV:
     # Refresh
     # ------------------------------------------------------------------
 
-    def refresh(self):
-        log.info("Refreshing media library...")
+    def refresh(self, force: bool = False):
+        cache = LibraryCache(self.config)
+
+        if not force:
+            cached_library = cache.load()
+            if cached_library is not None:
+                channels = build_channels(
+                    cached_library,
+                    disabled=self.config.channels.disabled,
+                    rename=self.config.channels.rename,
+                    goldies_before=self.config.channels.goldies_before,
+                    hits_rating=self.config.channels.hits_rating,
+                )
+                self.library = cached_library
+                self.channels = channels
+                self.stream_manager.reload(channels)
+                self._rebuild_cache()
+                log.info("Startup complete (from cache): %d channels", len(channels))
+                return
+
+        log.info("Refreshing media library (full scan)...")
         scanner = Scanner(
             shows_path=self.config.media.shows_path,
             movies_path=self.config.media.movies_path,
@@ -105,6 +125,7 @@ class FakeIPTV:
 
         self.stream_manager.reload(channels)
         self._rebuild_cache()
+        cache.save(library)
         log.info(
             "Refresh complete: %d shows, %d movies, %d channels",
             len(library.shows),
@@ -193,7 +214,7 @@ class FakeIPTV:
 
     def _midnight_refresh(self):
         log.info("Midnight auto-refresh triggered")
-        self.refresh()
+        self.refresh(force=True)
         self._schedule_midnight_refresh()
 
     # ------------------------------------------------------------------

@@ -637,7 +637,7 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
 
 @app.route("/refresh")
 def refresh():
-    threading.Thread(target=_app_instance.refresh, daemon=True).start()
+    threading.Thread(target=lambda: _app_instance.refresh(force=True), daemon=True).start()
     return jsonify({"status": "ok", "message": "Library refresh started"})
 
 

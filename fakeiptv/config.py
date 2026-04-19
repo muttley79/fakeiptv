@@ -44,6 +44,8 @@ class MetadataConfig:
     sonarr_api_key: str = ""
     radarr_url: str = ""
     radarr_api_key: str = ""
+    startup_cache: bool = True
+    startup_cache_max_age_hours: int = 24
 
 
 @dataclass
@@ -126,6 +128,11 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         sonarr_api_key=_env("FAKEIPTV_SONARR_API_KEY", meta_raw.get("sonarr_api_key", "")),
         radarr_url=_env("FAKEIPTV_RADARR_URL", meta_raw.get("radarr_url", "")),
         radarr_api_key=_env("FAKEIPTV_RADARR_API_KEY", meta_raw.get("radarr_api_key", "")),
+        startup_cache=_env_bool("FAKEIPTV_STARTUP_CACHE", meta_raw.get("startup_cache", True)),
+        startup_cache_max_age_hours=_env_int(
+            "FAKEIPTV_STARTUP_CACHE_MAX_AGE_HOURS",
+            int(meta_raw.get("startup_cache_max_age_hours", 24))
+        ),
     )
     channels = ChannelsConfig(
         disabled=ch_raw.get("disabled") or [],

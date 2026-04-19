@@ -42,6 +42,7 @@ class LiveSubtitleWriter:
         subtitle_ready_event: threading.Event,
         live_srt_langs: Set[str],
         get_launch_time: Callable[[], float],
+        subtitle_background: bool = True,
     ):
         self._channel_id = channel_id
         self._hls_dir = hls_dir
@@ -50,6 +51,7 @@ class LiveSubtitleWriter:
         self._subtitle_ready_event = subtitle_ready_event
         self._live_srt_langs = live_srt_langs
         self._get_launch_time = get_launch_time
+        self._subtitle_background = subtitle_background
 
     def write_subtitle_files_async(
         self,
@@ -239,14 +241,6 @@ class LiveSubtitleWriter:
           - The SRT file doesn't grow for 30 × 2s = 60s (e.g. entry has no subs).
         """
         lang_label = lang or "und"
-        cue_style = (
-            "  background-color: transparent;\n"
-            "  text-shadow: 1px 0 0 #000, -1px 0 0 #000,"
-            " 0 1px 0 #000, 0 -1px 0 #000;\n"
-        )
-        if lang == "he":
-            cue_style += "  direction: rtl;\n  unicode-bidi: isolate;\n"
-
         last_size = 0
         stall_count = 0
 
@@ -306,7 +300,8 @@ class LiveSubtitleWriter:
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     f.write("WEBVTT\n")
                     f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
-                    f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
+                    if not self._subtitle_background:
+                        f.write("STYLE\n::cue {\n  background-color: transparent;\n}\n\n")
                     # Current-entry cues first (stream start = 0)
                     f.writelines(ffmpeg_cue_lines)
                     # Future-entry cues from external SRTs (non-zero stream_pos timestamps)

@@ -24,6 +24,7 @@ class ServerConfig:
     host_ip: str = "127.0.0.1"
     tmp_dir: str = "/dev/shm/fakeiptv"
     subtitles: bool = True
+    subtitle_background: bool = True  # True = black background box, False = transparent
     audio_copy: bool = True   # False = always transcode audio to AAC (fixes DTS/incompatible codecs)
     preferred_audio_language: str = "eng"  # ISO 639-2 (3-letter) code; 2-letter also accepted
     catchup_days: int = 7
@@ -104,6 +105,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         host_ip=_env("FAKEIPTV_HOST_IP", server_raw.get("host_ip", "127.0.0.1")),
         tmp_dir=_env("FAKEIPTV_TMP_DIR", server_raw.get("tmp_dir", "/tmp/fakeiptv")),
         subtitles=_env_bool("FAKEIPTV_SUBTITLES", server_raw.get("subtitles", True)),
+        subtitle_background=_env_bool("FAKEIPTV_SUBTITLE_BACKGROUND", server_raw.get("subtitle_background", True)),
         audio_copy=_env_bool("FAKEIPTV_AUDIO_COPY", server_raw.get("audio_copy", True)),
         preferred_audio_language=_env("FAKEIPTV_PREFERRED_AUDIO_LANGUAGE",
                                       server_raw.get("preferred_audio_language", "eng")),

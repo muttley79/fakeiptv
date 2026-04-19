@@ -17,6 +17,7 @@ server:
   # file creates /run/fakeiptv owned by the service user — set that here instead.
   tmp_dir: /dev/shm/fakeiptv
   subtitles: true          # Include subtitle tracks (SRT/ASS→WebVTT). Set false to disable.
+  subtitle_background: true  # true = black background box (ExoPlayer default); false = transparent (no outline support)
   catchup_days: 7          # Days of past programming available for catch-up. Set 0 to disable.
 
 metadata:

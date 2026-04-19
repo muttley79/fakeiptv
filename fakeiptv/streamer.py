@@ -54,10 +54,11 @@ class ChannelStreamer:
     def __init__(self, channel: Channel, tmp_base: str, subtitles: bool = True,
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
                  ready_segments: int = 3, preferred_audio_language: str = "eng",
-                 hls_start_number: int = 0):
+                 hls_start_number: int = 0, subtitle_background: bool = True):
         self.channel = channel
         self._tmp_base = tmp_base
         self._subtitles = subtitles
+        self._subtitle_background = subtitle_background
         self._audio_copy = audio_copy   # False → transcode audio to AAC
         self._preferred_audio_language = preferred_audio_language
         self._prewarm_timeout = prewarm_timeout
@@ -436,7 +437,8 @@ class ChannelStreamer:
                 # SRT reading (build_cues) runs in the async thread in parallel
                 # with ffmpeg startup, so _launch() returns without any NAS reads.
                 for lang in subtitle_langs:
-                    sub = SubtitleStreamer(self.channel, lang, self.hls_dir)
+                    sub = SubtitleStreamer(self.channel, lang, self.hls_dir,
+                                          subtitle_background=self._subtitle_background)
                     sub.write_placeholder()
                     if lang in self._live_srt_langs:
                         sub.has_ffmpeg_srt = True
@@ -452,6 +454,7 @@ class ChannelStreamer:
                     subtitle_ready_event=self._subtitle_ready_event,
                     live_srt_langs=self._live_srt_langs,
                     get_launch_time=lambda: self._last_launch_wall_time,
+                    subtitle_background=self._subtitle_background,
                 )
                 threading.Thread(
                     target=_writer.write_subtitle_files_async,
@@ -658,9 +661,11 @@ class StreamManager:
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
                  ready_segments: int = 3, session_mode: bool = False,
                  prewarm_adjacent: int = 0, preferred_audio_language: str = "eng",
-                 bumpers_path: str = "", bumpers_cache_dir: str = ""):
+                 bumpers_path: str = "", bumpers_cache_dir: str = "",
+                 subtitle_background: bool = True):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
+        self._subtitle_background = subtitle_background
         self._audio_copy = audio_copy
         self._preferred_audio_language = preferred_audio_language
         self._prewarm_timeout = prewarm_timeout
@@ -731,7 +736,8 @@ class StreamManager:
                                               prewarm_timeout=self._prewarm_timeout,
                                               ready_segments=self._ready_segments,
                                               preferred_audio_language=self._preferred_audio_language,
-                                              hls_start_number=hls_start)
+                                              hls_start_number=hls_start,
+                                              subtitle_background=self._subtitle_background)
                 if ch_id in self._watched_channels:
                     new_streamer._ever_watched = True  # restore 600s timeout after idle stop
                 self._streamers[ch_id] = new_streamer  # register before start()
@@ -885,6 +891,7 @@ class StreamManager:
                         prewarm_timeout=self._prewarm_timeout,
                         ready_segments=self._ready_segments,
                         preferred_audio_language=self._preferred_audio_language,
+                        subtitle_background=self._subtitle_background,
                     )
                     s.start()
                     self._streamers[ch_id] = s

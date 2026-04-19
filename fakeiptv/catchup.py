@@ -44,7 +44,8 @@ class CatchupSession:
 
     def __init__(self, session_id: str, entry: ScheduleEntry, offset_sec: float,
                  duration_sec: float, session_dir: str, subtitles: bool,
-                 preferred_audio_language: str = "eng", is_seek: bool = False):
+                 preferred_audio_language: str = "eng", is_seek: bool = False,
+                 subtitle_background: bool = True):
         self.session_id = session_id
         self.entry = entry
         self.offset_sec = offset_sec
@@ -53,6 +54,7 @@ class CatchupSession:
         self.subtitles = subtitles
         self._preferred_audio_language = preferred_audio_language
         self.is_seek = is_seek
+        self._subtitle_background = subtitle_background
         self.manifest_path = os.path.join(session_dir, "stream.m3u8")
         self._process: Optional[subprocess.Popen] = None
         self._last_accessed = time.time()
@@ -257,23 +259,14 @@ class CatchupSession:
             start_pts / 90000.0 - (self.offset_sec - actual_start_sec),
         )
 
-        def _cue_style(is_rtl):
-            s = (
-                "  background-color: transparent;\n"
-                "  text-shadow: 1px 0 0 #000, -1px 0 0 #000,"
-                " 0 1px 0 #000, 0 -1px 0 #000;\n"
-            )
-            if is_rtl:
-                s += "  direction: rtl;\n  unicode-bidi: isolate;\n"
-            return s
-
         def _write_vtt(lang, lang_label, cue_lines, is_rtl=False):
             vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
             try:
                 with open(vtt_path, "w", encoding="utf-8") as f:
                     f.write("WEBVTT\n")
                     f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
-                    f.write(f"STYLE\n::cue {{\n{_cue_style(is_rtl)}}}\n\n")
+                    if not self._subtitle_background:
+                        f.write("STYLE\n::cue {\n  background-color: transparent;\n}\n\n")
                     f.writelines(cue_lines)
             except OSError as exc:
                 log.error("Catchup %s: VTT write failed lang=%s: %s",
@@ -561,10 +554,11 @@ class CatchupManager:
     """Creates and manages CatchupSession instances."""
 
     def __init__(self, tmp_base: str, subtitles: bool = True,
-                 preferred_audio_language: str = "eng"):
+                 preferred_audio_language: str = "eng", subtitle_background: bool = True):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._preferred_audio_language = preferred_audio_language
+        self._subtitle_background = subtitle_background
         self._sessions: Dict[str, CatchupSession] = {}
         self._lock = threading.Lock()
         self._reaper = threading.Thread(
@@ -658,6 +652,7 @@ class CatchupManager:
                 subtitles=self._subtitles,
                 preferred_audio_language=self._preferred_audio_language,
                 is_seek=is_seek,
+                subtitle_background=self._subtitle_background,
             )
             session.start()
             self._sessions[session_id] = session

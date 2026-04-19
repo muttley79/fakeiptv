@@ -20,7 +20,7 @@ log = logging.getLogger(__name__)
 class SubtitleStreamer:
     """Generates a static WebVTT subtitle file + HLS playlist for one language."""
 
-    def __init__(self, channel: Channel, lang: str, hls_dir: str):
+    def __init__(self, channel: Channel, lang: str, hls_dir: str, subtitle_background: bool = True):
         self._channel = channel
         self.lang = lang
         self._is_rtl = (lang == "he")
@@ -28,6 +28,7 @@ class SubtitleStreamer:
         lang_label = lang or "und"
         self.vtt_path = os.path.join(hls_dir, f"sub_{lang_label}.vtt")
         self.manifest_path = os.path.join(hls_dir, f"sub_{lang_label}.m3u8")
+        self._subtitle_background = subtitle_background
         self._ok = False
         self.has_ffmpeg_srt = False
 
@@ -53,13 +54,8 @@ class SubtitleStreamer:
         with open(self.vtt_path, "w", encoding="utf-8") as f:
             f.write("WEBVTT\n")
             f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
-            cue_style = (
-                "  background-color: transparent;\n"
-                "  text-shadow: 1px 0 0 #000, -1px 0 0 #000, 0 1px 0 #000, 0 -1px 0 #000;\n"
-            )
-            if self._is_rtl:
-                cue_style += "  direction: rtl;\n  unicode-bidi: isolate;\n"
-            f.write(f"STYLE\n::cue {{\n{cue_style}}}\n\n")
+            if not self._subtitle_background:
+                f.write("STYLE\n::cue {\n  background-color: transparent;\n}\n\n")
             f.writelines(cue_lines)
 
         vtt_name = os.path.basename(self.vtt_path)

@@ -29,7 +29,7 @@ from .live_subtitle import LiveSubtitleWriter
 from .bumper import BumperStreamer, BumperManager
 from .catchup import CatchupManager
 from .ffprobe_utils import (
-    _nas_prewarm, _probe_keyframe_inpoint, _probe_gop_size,
+    _nas_prewarm, _nas_prewarm_header, _probe_keyframe_inpoint, _probe_gop_size,
     _probe_audio_stream_index, _probe_subtitle_stream_indices,
     _probe_segment_start_pts, _probe_stream_start_time,
 )
@@ -47,6 +47,7 @@ RESTART_DELAY = 1
 IDLE_TIMEOUT = 600
 IDLE_TIMEOUT_PREWARM = 120
 IDLE_CHECK_INTERVAL = 30
+CONCAT_PREWARM_LEAD = 60   # seconds before episode transition to prewarm next file
 
 class ChannelStreamer:
     """Manages the ffmpeg process for a single channel."""
@@ -535,6 +536,9 @@ class ChannelStreamer:
                 start_new_session=True,
             )
 
+        if np:
+            self._start_concat_lookahead_prewarm(np, self._last_launch_wall_time)
+
     def _kill(self):
         with self._lock:
             if self._process and self._process.poll() is None:
@@ -547,6 +551,58 @@ class ChannelStreamer:
                     except Exception:
                         pass
             self._process = None
+
+    # ------------------------------------------------------------------
+    # Concat lookahead prewarm thread
+    # ------------------------------------------------------------------
+
+    def _start_concat_lookahead_prewarm(self, np: NowPlaying, launch_time: float) -> None:
+        """Spawn a daemon thread that prewarms upcoming concat entries into NAS RAM
+        ~CONCAT_PREWARM_LEAD seconds before ffmpeg opens each one."""
+        threading.Thread(
+            target=self._concat_prewarm_worker,
+            args=(np, launch_time),
+            daemon=True,
+            name=f"prewarm-{self.channel.id}",
+        ).start()
+
+    def _concat_prewarm_worker(self, np: NowPlaying, launch_time: float) -> None:
+        entries = self.channel.entries
+        n = len(entries)
+        if n == 0:
+            return
+
+        # Time until ffmpeg finishes the first (current) entry from its inpoint
+        accumulated = np.entry.duration_sec - np.offset_sec
+        idx = (np.entry_index + 1) % n
+
+        while not self._stop_event.is_set():
+            # Bail if _launch() was called again (stall-restart or concat refresh)
+            if self._last_launch_wall_time != launch_time:
+                return
+
+            # Stop after the concat window — nothing beyond this is in the concat file
+            if accumulated > CONCAT_HOURS * 3600:
+                return
+
+            entry = entries[idx]
+            wake_time = launch_time + accumulated - CONCAT_PREWARM_LEAD
+            sleep_secs = wake_time - time.time()
+            if sleep_secs > 0:
+                self._stop_event.wait(timeout=sleep_secs)
+                if self._stop_event.is_set():
+                    return
+                if self._last_launch_wall_time != launch_time:
+                    return
+
+            log.debug(
+                "Concat lookahead prewarm: channel=%s entry=%s",
+                self.channel.id, entry.title,
+            )
+            _nas_prewarm_header(entry.path)
+
+            accumulated += entry.duration_sec
+            idx = (idx + 1) % n
 
     # ------------------------------------------------------------------
     # Monitor thread — restart ffmpeg when it exits

@@ -148,6 +148,25 @@ def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
         pass
 
 
+def _nas_prewarm_header(path: str) -> None:
+    """Prime the NAS cache for opening a file from the start (concat transition).
+
+    Reads the container header and the tail where MKV stores its Cues index.
+    No seek-cluster read needed — ffmpeg opens the file at position 0.
+    """
+    HEAD = 65536        # 64 KB — container header + codec params
+    TAIL = 524288       # 512 KB — MKV Cues / MP4 moov index (often at end)
+    try:
+        file_size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            f.read(HEAD)
+            if file_size > HEAD + TAIL:
+                f.seek(file_size - TAIL)
+                f.read(TAIL)
+    except Exception:
+        pass
+
+
 def _ebml_read_id(data: bytes, pos: int) -> Tuple[Optional[int], int]:
     """Read EBML variable-length element ID. Returns (id_int, new_pos)."""
     if pos >= len(data):

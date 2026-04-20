@@ -57,6 +57,7 @@ class LiveSubtitleWriter:
         self,
         subtitle_langs: list,
         launch_inpoint: float = 0.0,
+        launch_actual_inpoint: float = -1.0,
         launch_entry_path: Optional[str] = None,
         launch_entry_duration: float = 0.0,
     ):
@@ -126,8 +127,11 @@ class LiveSubtitleWriter:
         # the file since the segment appeared).  Use a longer timeout (60s) than
         # the default 15s: the player is no longer blocked (stubs written above)
         # and files without a seek index need time for linear scanning.
+        # If _launch() already probed and snapped the inpoint, skip the duplicate probe.
         actual_inpoint = nominal_inpoint
-        if nominal_inpoint > 0 and entry_path:
+        if launch_actual_inpoint >= 0.0:
+            actual_inpoint = launch_actual_inpoint
+        elif nominal_inpoint > 0 and entry_path:
             actual_inpoint = _probe_keyframe_inpoint(
                 entry_path, nominal_inpoint, entry_duration, timeout=60
             )

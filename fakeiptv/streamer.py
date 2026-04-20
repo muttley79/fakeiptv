@@ -411,6 +411,34 @@ class ChannelStreamer:
             if np and np.offset_sec > 0 and np.entry:
                 _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
 
+            # Snap inpoint to the actual keyframe landing point to eliminate
+            # real-time pre-inpoint decode delay under -re. NAS is now warm.
+            actual_inpoint = np.offset_sec if np else 0.0
+            if np and np.offset_sec > 0 and np.entry:
+                try:
+                    snapped = _probe_keyframe_inpoint(
+                        np.entry.path, np.offset_sec, np.entry.duration_sec, timeout=5
+                    )
+                    if snapped < np.offset_sec - 0.1:
+                        actual_inpoint = snapped
+                        with open(self.concat_path, 'r', encoding='utf-8') as _f:
+                            _ct = _f.read()
+                        _ct = re.sub(
+                            r'(?m)^inpoint \S+$',
+                            f'inpoint {snapped:.3f}',
+                            _ct,
+                            count=1,
+                        )
+                        with open(self.concat_path, 'w', encoding='utf-8') as _f:
+                            _f.write(_ct)
+                        log.info(
+                            "Channel %s: inpoint snapped %.3fs → %.3fs (Δ=%.3fs, saving ~%.1fs bumper)",
+                            self.channel.id, np.offset_sec, snapped,
+                            np.offset_sec - snapped, np.offset_sec - snapped,
+                        )
+                except Exception:
+                    actual_inpoint = np.offset_sec
+
             if subtitle_langs:
                 # For langs that have no external SRT on the *current* entry, probe
                 # for an embedded subtitle stream.  The main ffmpeg process will write
@@ -463,6 +491,7 @@ class ChannelStreamer:
                     args=(subtitle_langs,),
                     kwargs={
                         "launch_inpoint": np.offset_sec if np else 0.0,
+                        "launch_actual_inpoint": actual_inpoint,
                         "launch_entry_path": np.entry.path if (np and np.entry) else None,
                         "launch_entry_duration": np.entry.duration_sec if (np and np.entry) else 0.0,
                     },

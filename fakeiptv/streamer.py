@@ -1016,6 +1016,10 @@ class StreamManager:
         running. Active channels also have per-episode _concat_prewarm_worker threads
         for precise timing; this sweep provides coverage for inactive channels.
         """
+        # Wait for reload() to populate _channels before first sweep
+        while not self._channels:
+            time.sleep(5)
+        self._global_prewarm_once()
         while True:
             time.sleep(GLOBAL_PREWARM_INTERVAL)
             self._global_prewarm_once()

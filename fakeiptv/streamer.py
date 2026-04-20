@@ -1026,6 +1026,8 @@ class StreamManager:
 
     def _global_prewarm_once(self):
         channels = list(self._channels.values())  # snapshot outside lock
+        log.info("Global NAS prewarm: sweeping %d channels", len(channels))
+        warmed = 0
         for ch in channels:
             np = get_now_playing(ch)
             if not np or not np.entry:
@@ -1040,7 +1042,9 @@ class StreamManager:
             # Warm next 2 upcoming entries (opened from start by ffconcat).
             for i in range(1, 3):
                 _nas_prewarm_header(entries[(np.entry_index + i) % n].path)
+            warmed += 1
             time.sleep(0.5)  # stagger to avoid NAS burst
+        log.info("Global NAS prewarm: done (%d/%d channels warmed)", warmed, len(channels))
 
     def _reap_loop(self):
         """Background thread: stop ffmpeg for channels with no recent client activity."""

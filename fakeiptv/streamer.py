@@ -414,13 +414,18 @@ class ChannelStreamer:
             # Snap inpoint to the actual keyframe landing point to eliminate
             # real-time pre-inpoint decode delay under -re. NAS is now warm.
             actual_inpoint = np.offset_sec if np else 0.0
+            launch_actual_inpoint_override = -1.0
             if np and np.offset_sec > 0 and np.entry:
                 try:
                     snapped = _probe_keyframe_inpoint(
                         np.entry.path, np.offset_sec, np.entry.duration_sec, timeout=5
                     )
-                    if snapped < np.offset_sec - 0.1:
+                    gop_size = _probe_gop_size(np.entry.path)
+                    expected_fallback = max(0.0, np.offset_sec - gop_size)
+                    is_real_keyframe = abs(snapped - expected_fallback) > 0.3
+                    if is_real_keyframe and snapped < np.offset_sec - 0.1:
                         actual_inpoint = snapped
+                        launch_actual_inpoint_override = snapped
                         with open(self.concat_path, 'r', encoding='utf-8') as _f:
                             _ct = _f.read()
                         _ct = re.sub(
@@ -437,7 +442,7 @@ class ChannelStreamer:
                             np.offset_sec - snapped, np.offset_sec - snapped,
                         )
                 except Exception:
-                    actual_inpoint = np.offset_sec
+                    pass
 
             if subtitle_langs:
                 # For langs that have no external SRT on the *current* entry, probe
@@ -491,7 +496,7 @@ class ChannelStreamer:
                     args=(subtitle_langs,),
                     kwargs={
                         "launch_inpoint": np.offset_sec if np else 0.0,
-                        "launch_actual_inpoint": actual_inpoint,
+                        "launch_actual_inpoint": launch_actual_inpoint_override,
                         "launch_entry_path": np.entry.path if (np and np.entry) else None,
                         "launch_entry_duration": np.entry.duration_sec if (np and np.entry) else 0.0,
                     },

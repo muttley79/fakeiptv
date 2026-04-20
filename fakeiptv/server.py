@@ -40,7 +40,8 @@ def _start_timer():
 @app.after_request
 def _log_request(response):
     elapsed_ms = (time.time() - request._start_time) * 1000
-    log.debug("%s %s %d %.0fms", request.method, request.full_path.rstrip("?"), response.status_code, elapsed_ms)
+    ua = (request.headers.get("User-Agent") or "")[:40]
+    log.debug("%s %s %d %.0fms [%s]", request.method, request.full_path.rstrip("?"), response.status_code, elapsed_ms, ua)
     return response
 
 _prewarm_done = False              # pre-warm all channels on first manifest request
@@ -301,7 +302,20 @@ def hls_segment(channel_id: str, segment: str):
 
     hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
     if not hls_dir:
-        abort(404)
+        if segment != "video.m3u8":
+            abort(404)
+        # video.m3u8: start the channel lazily, same as hls_manifest does.
+        # Clients that skip stream.m3u8 (e.g. Xiaomi TV) can wake the channel.
+        if channel_id not in _channel_bumper:
+            _channel_bumper[channel_id] = _app_instance.stream_manager.get_random_bumper()
+        bumper = _channel_bumper[channel_id]
+        has_bumper = bumper is not None and bumper.is_ready()
+        if not _app_instance.stream_manager.ensure_started(channel_id, background=has_bumper):
+            abort(404)
+        _app_instance.stream_manager.touch(channel_id)
+        hls_dir = _app_instance.stream_manager.get_hls_dir(channel_id)
+        if not hls_dir:
+            abort(404)
 
     # video.m3u8 doubles as the bumper delivery vehicle: while the channel is warming
     # up, serve bumper content from this URL so the variant URL declared in the master

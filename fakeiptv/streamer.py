@@ -790,7 +790,7 @@ class StreamManager:
             )
             self._bumper_manager.start_all()
 
-    def ensure_started(self, ch_id: str, background: bool = False) -> bool:
+    def ensure_started(self, ch_id: str, background: bool = False, is_prewarm: bool = False) -> bool:
         """
         Start the ffmpeg streamer for ch_id if it isn't already running.
         Returns False if the channel is unknown, True otherwise.
@@ -832,7 +832,7 @@ class StreamManager:
                                               preferred_audio_language=self._preferred_audio_language,
                                               hls_start_number=hls_start,
                                               subtitle_background=self._subtitle_background)
-                if ch_id in self._watched_channels:
+                if not is_prewarm and ch_id in self._watched_channels:
                     new_streamer._ever_watched = True  # restore 600s timeout after idle stop
                 self._streamers[ch_id] = new_streamer  # register before start()
             elif hls_start > 0:

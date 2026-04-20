@@ -183,7 +183,7 @@ class FakeIPTV:
             for ch_id in channels:
                 def _start(cid=ch_id):
                     try:
-                        self.stream_manager.ensure_started(cid)
+                        self.stream_manager.ensure_started(cid, is_prewarm=True)
                     except Exception:
                         log.exception("Pre-warm failed for channel %s", cid)
                 t = threading.Thread(target=_start, daemon=True, name=f"prewarm-{ch_id}")

@@ -48,6 +48,7 @@ IDLE_TIMEOUT = 600
 IDLE_TIMEOUT_PREWARM = 120
 IDLE_CHECK_INTERVAL = 30
 CONCAT_PREWARM_LEAD = 60   # seconds before episode transition to prewarm next file
+GLOBAL_PREWARM_INTERVAL = 600  # seconds between all-channel NAS warmup sweeps
 
 class ChannelStreamer:
     """Manages the ffmpeg process for a single channel."""
@@ -744,6 +745,9 @@ class StreamManager:
             target=self._reap_loop, daemon=True, name="stream-reaper"
         )
         self._reaper.start()
+        threading.Thread(
+            target=self._global_prewarm_loop, daemon=True, name="global-prewarm"
+        ).start()
         # Bumper loading screens — started once at init if bumpers_path is set
         self._bumper_manager: Optional[BumperManager] = None
         if bumpers_path:
@@ -1003,6 +1007,36 @@ class StreamManager:
         """Re-create a deleted live segment on demand. Returns True if successful."""
         s = self._streamers.get(ch_id)
         return s.regenerate_segment(seg_num) if s else False
+
+    def _global_prewarm_loop(self):
+        """Background thread: periodically warm all channels' upcoming entries into NAS RAM.
+
+        Runs every GLOBAL_PREWARM_INTERVAL seconds. Warms the current seek position
+        plus the next 2 entries for every channel, regardless of whether ffmpeg is
+        running. Active channels also have per-episode _concat_prewarm_worker threads
+        for precise timing; this sweep provides coverage for inactive channels.
+        """
+        while True:
+            time.sleep(GLOBAL_PREWARM_INTERVAL)
+            self._global_prewarm_once()
+
+    def _global_prewarm_once(self):
+        channels = list(self._channels.values())  # snapshot outside lock
+        for ch in channels:
+            np = get_now_playing(ch)
+            if not np or not np.entry:
+                continue
+            entries = ch.entries
+            n = len(entries)
+            if n == 0:
+                continue
+            # Warm current entry at seek offset — same read _launch() does,
+            # so cold-start finds it already cached.
+            _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
+            # Warm next 2 upcoming entries (opened from start by ffconcat).
+            for i in range(1, 3):
+                _nas_prewarm_header(entries[(np.entry_index + i) % n].path)
+            time.sleep(0.5)  # stagger to avoid NAS burst
 
     def _reap_loop(self):
         """Background thread: stop ffmpeg for channels with no recent client activity."""

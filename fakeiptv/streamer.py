@@ -563,6 +563,12 @@ class ChannelStreamer:
                 cmd += ["-vn", "-an", "-map", f"0:s:{idx}",
                         "-flush_packets", "1", "-c:s", "srt", srt_out]
             log.debug("ffmpeg cmd: %s", " ".join(cmd))
+            # Re-warm NAS immediately before ffmpeg starts seeking.
+            # The first prewarm (line 412) happened before multiple ffprobe calls,
+            # so the cached pages may have been evicted. This second prewarm ensures
+            # the cluster data is hot when ffmpeg actually opens the file.
+            if np and np.offset_sec > 0 and np.entry:
+                _nas_prewarm(np.entry.path, np.offset_sec, np.entry.duration_sec)
             self._process = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,   # no terminal stdin — prevents tty state corruption

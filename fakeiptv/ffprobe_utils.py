@@ -36,6 +36,8 @@ _EBML_ID_SEEK_POS        = 0x53AC
 _EBML_ID_CUES            = 0x1C53BB6B
 _EBML_ID_CUE_POINT       = 0xBB
 _EBML_ID_CUE_TIME        = 0xB3
+_EBML_ID_CUE_TRACK_POSITIONS = 0xB7
+_EBML_ID_CUE_CLUSTER_POSITION = 0xF1
 _EBML_ID_CLUSTER         = 0x1F43B675
 
 
@@ -139,13 +141,22 @@ def _nas_prewarm(path: str, inpoint: float, entry_duration: float) -> None:
             f.read(HEAD)
             f.seek(max(HEAD, file_size - WARM))
             f.read(WARM)
-            bps = file_size / entry_duration
-            cluster_pos = max(HEAD, int(inpoint * bps) - WARM // 2)
+            cluster_pos = None
+            if path.lower().endswith(".mkv"):
+                exact = _mkv_cues_cluster_pos(path, inpoint)
+                if exact is not None:
+                    cluster_pos = max(HEAD, exact - WARM // 4)
+                    log.debug(f"NAS prewarm MKV {path.split('/')[-1]}: exact_offset={exact}, cluster_pos={cluster_pos}")
+                else:
+                    log.debug(f"NAS prewarm MKV {path.split('/')[-1]}: Cues not found, using linear estimate")
+            if cluster_pos is None:
+                bps = file_size / entry_duration
+                cluster_pos = max(HEAD, int(inpoint * bps) - WARM // 2)
             if cluster_pos < file_size - WARM * 2:
                 f.seek(cluster_pos)
                 f.read(WARM)
-    except Exception:
-        pass
+    except Exception as e:
+        log.debug(f"NAS prewarm error for {path}: {e}")
 
 
 def _nas_prewarm_header(path: str) -> None:
@@ -365,6 +376,162 @@ def _mkv_cues_keyframe_inpoint(path: str, inpoint: float) -> Optional[float]:
             cues_pos += cp_sz
 
         return best_time
+
+    except Exception:
+        return None
+
+
+def _mkv_cues_cluster_pos(path: str, inpoint: float) -> Optional[int]:
+    """Read MKV Cues element to find the absolute byte offset of the cluster containing inpoint.
+
+    Returns the byte offset (relative to file start) of the cluster, or None on failure.
+    """
+    try:
+        file_size = os.path.getsize(path)
+        if file_size < 65536:
+            return None
+
+        with open(path, "rb") as f:
+            head = f.read(65536)
+
+        pos = 0
+        UNKNOWN = -1
+
+        eid, pos = _ebml_read_id(head, pos)
+        esz, pos = _ebml_read_size(head, pos)
+        if eid != _EBML_ID_EBML_HEADER or esz is None:
+            return None
+        if esz != UNKNOWN:
+            pos += esz
+
+        eid, pos = _ebml_read_id(head, pos)
+        esz, pos = _ebml_read_size(head, pos)
+        if eid != _EBML_ID_SEGMENT:
+            return None
+        seg_body_abs = pos
+
+        cues_seek_pos = None
+        timestamp_scale_ns = 1000000
+
+        seg_pos = pos
+        while seg_pos < len(head) - 4:
+            eid, next_pos = _ebml_read_id(head, seg_pos)
+            esz, next_pos = _ebml_read_size(head, next_pos)
+            if eid is None or esz is None:
+                break
+            if eid == _EBML_ID_CLUSTER:
+                break
+
+            if eid == _EBML_ID_SEEKHEAD:
+                sh_end = min(next_pos + esz, len(head))
+                sh_pos = next_pos
+                while sh_pos < sh_end - 2:
+                    seek_id, sh_pos = _ebml_read_id(head, sh_pos)
+                    seek_sz, sh_pos = _ebml_read_size(head, sh_pos)
+                    if seek_id is None or seek_sz is None:
+                        break
+                    if seek_id == _EBML_ID_SEEK:
+                        seek_entry_end = min(sh_pos + seek_sz, len(head))
+                        seek_entry_id = None
+                        seek_entry_pos = None
+                        se_pos = sh_pos
+                        while se_pos < seek_entry_end - 2:
+                            sub_id, se_pos = _ebml_read_id(head, se_pos)
+                            sub_sz, se_pos = _ebml_read_size(head, se_pos)
+                            if sub_id is None or sub_sz is None:
+                                break
+                            if sub_id == _EBML_ID_SEEK_ID:
+                                seek_entry_id, _ = _ebml_read_id(head, se_pos)
+                            elif sub_id == _EBML_ID_SEEK_POS:
+                                val = 0
+                                for i in range(min(sub_sz, 8)):
+                                    val = (val << 8) | head[se_pos + i]
+                                seek_entry_pos = val
+                            se_pos += sub_sz
+                        if seek_entry_id == _EBML_ID_CUES and seek_entry_pos is not None:
+                            cues_seek_pos = seek_entry_pos
+                    sh_pos += seek_sz
+
+            elif eid == _EBML_ID_SEGMENT_INFO:
+                info_end = min(next_pos + esz, len(head))
+                info_pos = next_pos
+                while info_pos < info_end - 2:
+                    info_id, info_pos = _ebml_read_id(head, info_pos)
+                    info_sz, info_pos = _ebml_read_size(head, info_pos)
+                    if info_id is None or info_sz is None:
+                        break
+                    if info_id == _EBML_ID_TIMESTAMP_SCALE:
+                        val = 0
+                        for i in range(min(info_sz, 4)):
+                            val = (val << 8) | head[info_pos + i]
+                        timestamp_scale_ns = val
+                    info_pos += info_sz
+
+            if esz == UNKNOWN or esz < 0:
+                break
+            seg_pos = next_pos + esz
+
+        if cues_seek_pos is None:
+            return None
+
+        abs_cues = seg_body_abs + cues_seek_pos
+        if abs_cues >= file_size:
+            return None
+
+        with open(path, "rb") as f:
+            f.seek(abs_cues)
+            cues_hdr = f.read(16)
+        eid, hdr_pos = _ebml_read_id(cues_hdr, 0)
+        esz, hdr_pos = _ebml_read_size(cues_hdr, hdr_pos)
+        if eid != _EBML_ID_CUES or esz is None or esz <= 0 or esz > 8 * 1024 * 1024:
+            return None
+
+        with open(path, "rb") as f:
+            f.seek(abs_cues + hdr_pos)
+            cues_data = f.read(min(esz, 8 * 1024 * 1024))
+
+        best_cluster_pos = None
+        cues_pos = 0
+        while cues_pos < len(cues_data) - 2:
+            cp_id, cues_pos = _ebml_read_id(cues_data, cues_pos)
+            cp_sz, cues_pos = _ebml_read_size(cues_data, cues_pos)
+            if cp_id is None or cp_sz is None:
+                break
+            if cp_id == _EBML_ID_CUE_POINT:
+                cp_end = min(cues_pos + cp_sz, len(cues_data))
+                cp_pos = cues_pos
+                cue_time = None
+                cue_cluster_pos = None
+                while cp_pos < cp_end - 2:
+                    cue_id, cp_pos = _ebml_read_id(cues_data, cp_pos)
+                    cue_sz, cp_pos = _ebml_read_size(cues_data, cp_pos)
+                    if cue_id is None or cue_sz is None:
+                        break
+                    if cue_id == _EBML_ID_CUE_TIME:
+                        val = 0
+                        for i in range(min(cue_sz, 8)):
+                            val = (val << 8) | cues_data[cp_pos + i]
+                        cue_time = val * timestamp_scale_ns / 1e9
+                    elif cue_id == _EBML_ID_CUE_TRACK_POSITIONS:
+                        ctp_end = min(cp_pos + cue_sz, len(cues_data))
+                        ctp_pos = cp_pos
+                        while ctp_pos < ctp_end - 2:
+                            ctp_id, ctp_pos = _ebml_read_id(cues_data, ctp_pos)
+                            ctp_sz, ctp_pos = _ebml_read_size(cues_data, ctp_pos)
+                            if ctp_id is None or ctp_sz is None:
+                                break
+                            if ctp_id == _EBML_ID_CUE_CLUSTER_POSITION:
+                                val = 0
+                                for i in range(min(ctp_sz, 8)):
+                                    val = (val << 8) | cues_data[ctp_pos + i]
+                                cue_cluster_pos = val
+                            ctp_pos += ctp_sz
+                    cp_pos += cue_sz
+                if cue_time is not None and cue_time <= inpoint and cue_cluster_pos is not None:
+                    best_cluster_pos = seg_body_abs + cue_cluster_pos
+            cues_pos += cp_sz
+
+        return best_cluster_pos
 
     except Exception:
         return None

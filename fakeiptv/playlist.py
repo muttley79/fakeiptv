@@ -31,7 +31,7 @@ def build_m3u8(
     )
 
     for chno, channel in enumerate(sorted_channels, start=1):
-        logo = channel.poster_url or ""
+        logo = f"{base_url}/logos/{channel.id}.png" if not channel.poster_url else channel.poster_url
         stream_url = f"{base_url}/hls/{channel.id}/stream.m3u8"
 
         catchup_attrs = ""

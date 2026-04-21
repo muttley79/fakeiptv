@@ -34,6 +34,7 @@ class ServerConfig:
     prewarm_timeout: int = 120   # seconds before a pre-warmed-only channel is stopped
     ready_segments: int = 1      # segments buffered before a channel is declared ready
     bumpers_path: str = "/app/bumpers"  # directory containing bumper video files (MP4)
+    assets_dir: str = "/assets"         # static assets (logos, etc.)
 
 
 @dataclass
@@ -118,6 +119,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         prewarm_timeout=_env_int("FAKEIPTV_PREWARM_TIMEOUT", int(server_raw.get("prewarm_timeout", 120))),
         ready_segments=_env_int("FAKEIPTV_READY_SEGMENTS", int(server_raw.get("ready_segments", 1))),
         bumpers_path=_env("FAKEIPTV_BUMPERS_PATH", server_raw.get("bumpers_path", "/app/bumpers")),
+        assets_dir=_env("FAKEIPTV_ASSETS_DIR", server_raw.get("assets_dir", "/assets")),
     )
     metadata = MetadataConfig(
         tmdb_api_key=_env("FAKEIPTV_TMDB_API_KEY", meta_raw.get("tmdb_api_key", "")),

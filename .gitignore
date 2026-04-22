@@ -15,6 +15,7 @@ docker-compose.yml
 # Cache files
 *.json
 !package.json
+/fakeiptv-cache/
 
 # HLS temp segments
 /tmp/

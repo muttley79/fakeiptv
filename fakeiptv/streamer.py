@@ -880,7 +880,11 @@ class StreamManager:
                         continue
                     adj_idx = idx + offset
                     if 0 <= adj_idx < len(order):
-                        self.ensure_started(order[adj_idx])
+                        adj_id = order[adj_idx]
+                        threading.Thread(
+                            target=self.ensure_started, args=(adj_id,), daemon=True,
+                            name=f"prewarm-adj-{adj_id}",
+                        ).start()
 
     def stop_all(self):
         with self._lock:

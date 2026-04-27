@@ -79,6 +79,7 @@ class LiveSubtitleWriter:
         gives accurate inpoint data on the first try, without the cold-NAS
         timeout/retry complexity of the previous approach.
         """
+        own_launch_time = self._get_launch_time()
         nominal_inpoint = launch_inpoint
         entry_path = launch_entry_path
         entry_duration = launch_entry_duration
@@ -100,21 +101,22 @@ class LiveSubtitleWriter:
 
         # Step 2 — probe start_pts
         if seg_path is None:
-            log.warning("_write_subtitle_files_async: no TS segment for %s — using MPEGTS:0",
+            log.warning("_write_subtitle_files_async: no TS segment for %s in 30s — exiting stale thread",
                         self._channel_id)
-            start_pts = 0
-        else:
-            start_pts = _probe_segment_start_pts(seg_path) or 0
-            log.info(
-                "Channel %s: subtitle TIMESTAMP-MAP → MPEGTS:%d (%.3fs)",
-                self._channel_id, start_pts, start_pts / 90000,
-            )
+            return
+        start_pts = _probe_segment_start_pts(seg_path) or 0
+        log.info(
+            "Channel %s: subtitle TIMESTAMP-MAP → MPEGTS:%d (%.3fs)",
+            self._channel_id, start_pts, start_pts / 90000,
+        )
 
         # Step 2.5 — write empty VTT stubs with the correct MPEGTS anchor and
         # set _subtitle_ready_event immediately.  The player gets valid (empty)
         # VTTs right away; cues are filled in during step 5 below.  This keeps
         # subtitle requests non-blocking even when the keyframe probe is slow
         # (e.g. UHD REMUXes without a seek index that need linear scanning).
+        if self._get_launch_time() != own_launch_time:
+            return
         for _lang in subtitle_langs:
             _sub = self._subtitle_streamers.get(_lang)
             if _sub:
@@ -190,6 +192,8 @@ class LiveSubtitleWriter:
 
         # Step 5 — write VTT files (with whatever cues we have from external SRTs)
         # and start live SRT watcher threads for embedded langs.
+        if self._get_launch_time() != own_launch_time:
+            return
         ready_langs = []
         launch_time = self._get_launch_time()
         for lang, (cue_lines, cue_count) in pending.items():

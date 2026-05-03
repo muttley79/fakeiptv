@@ -16,11 +16,11 @@ from .scheduler import get_playing_at
 HLS_SEGMENT_SECONDS = 2
 from .ffprobe_utils import (
     _nas_prewarm, _probe_audio_stream_index, _probe_subtitle_stream_indices,
-    _probe_segment_start_pts, _probe_keyframe_inpoint, _probe_stream_start_time
+    _probe_segment_start_pts,
 )
 from .subtitle_utils import (
-    _read_srt, _parse_srt_cues, _sec_to_vtt_ts, _text_has_hebrew, _he_bidi_fix,
-    _extract_embedded_srt
+    _read_srt, _parse_srt_cues, _sec_to_vtt_ts, _he_bidi_fix,
+    _extract_embedded_srt,
 )
 
 log = logging.getLogger(__name__)
@@ -100,26 +100,26 @@ class CatchupSession:
         seg_pattern = os.path.join(self.session_dir, "seg%d.ts")
         video_manifest = os.path.join(self.session_dir, "video.m3u8")
 
-        self._sub_stream_indices: dict = {}
+        # Determine subtitle languages to write as VTT sidecar files.
+        # VTTs are written asynchronously in _write_subs_and_master() after
+        # the first segment is produced (so start_pts can be probed for
+        # correct X-TIMESTAMP-MAP alignment).
+        self._sub_langs = []
         if self.subtitles:
-            always_langs = list(self._ALWAYS_SUBTITLE_LANGS)
+            candidate_langs = list(self._ALWAYS_SUBTITLE_LANGS)
             for lang in self.entry.subtitle_paths:
-                if lang not in always_langs:
-                    always_langs.append(lang)
-            embedded_langs = [
-                l for l in always_langs
-                if l and not (self.entry.subtitle_paths.get(l) and
-                              os.path.exists(self.entry.subtitle_paths[l]))
-            ]
-            if embedded_langs:
-                self._sub_stream_indices = _probe_subtitle_stream_indices(
-                    self.entry.path, embedded_langs
-                )
-                if self._sub_stream_indices:
-                    log.debug(
-                        "Catchup %s: SRT side outputs for langs=%s",
-                        self.session_id, list(self._sub_stream_indices),
-                    )
+                if lang not in candidate_langs:
+                    candidate_langs.append(lang)
+            # External SRTs
+            for lang in candidate_langs:
+                if (self.entry.subtitle_paths.get(lang)
+                        and os.path.exists(self.entry.subtitle_paths[lang])):
+                    self._sub_langs.append(lang)
+            # Fallback: embedded subtitle streams when no external SRTs
+            if not self._sub_langs:
+                no_srt_langs = [l for l in candidate_langs if l]
+                embedded = _probe_subtitle_stream_indices(self.entry.path, no_srt_langs)
+                self._sub_langs = sorted(embedded.keys())
 
         cmd = [
             "ffmpeg",
@@ -129,22 +129,17 @@ class CatchupSession:
             "-re",
             "-avoid_negative_ts", "make_zero",
             "-i", self.entry.path,
-            "-t", str(self.duration_sec),
             "-c:v", "copy",
             "-c:a", "aac", "-b:a", "192k", "-ac", "2",
             "-map", "0:v:0",
             "-map", f"0:a:{audio_idx}",
+            "-t", str(self.duration_sec),
             "-f", "hls",
             "-hls_time", str(HLS_SEGMENT_SECONDS),
             "-hls_list_size", "0",
             "-hls_segment_filename", seg_pattern,
             video_manifest,
         ]
-        for lang, idx in self._sub_stream_indices.items():
-            lang_label = lang or "und"
-            srt_out = os.path.join(self.session_dir, f"sub_{lang_label}.srt")
-            cmd += ["-vn", "-an", "-map", f"0:s:{idx}",
-                    "-flush_packets", "1", "-c:s", "srt", srt_out]
         log.debug("Catchup ffmpeg: %s", " ".join(cmd))
         self._process = subprocess.Popen(
             cmd,
@@ -202,241 +197,77 @@ class CatchupSession:
             shutil.rmtree(self.session_dir, ignore_errors=True)
 
     def _write_subs_and_master(self):
-        """Background thread: write HLS master playlist and subtitle VTTs."""
+        """Background thread: probe start_pts, write per-language VTTs, write master."""
         seg0 = os.path.join(self.session_dir, "seg0.ts")
         deadline = time.time() + 35
         while not os.path.exists(seg0):
             if time.time() > deadline or (
                 self._process and self._process.poll() is not None
             ):
-                if self.subtitles:
-                    self._write_placeholder_vtts_and_master(
-                        self._ALWAYS_SUBTITLE_LANGS, 0
-                    )
-                else:
-                    self._write_master([])
-                self._subs_ready.set()
-                return
+                break
             time.sleep(0.2)
 
-        start_pts = _probe_segment_start_pts(seg0) or 0
+        start_pts = 0
+        if os.path.exists(seg0):
+            start_pts = _probe_segment_start_pts(seg0) or 0
+            log.info("Catchup %s: subtitle TIMESTAMP-MAP → MPEGTS:%d",
+                     self.session_id, start_pts)
 
-        if not self.subtitles:
-            self._write_master([])
-            self._subs_ready.set()
-            return
+        for lang in self._sub_langs:
+            n = self._write_vtt_for_lang(lang, start_pts)
+            log.info("Catchup %s: wrote %s VTT, %d cues (MPEGTS:%d)",
+                     self.session_id, lang or "und", n, start_pts)
 
-        langs = list(self._ALWAYS_SUBTITLE_LANGS)
-        for lang in self.entry.subtitle_paths:
-            if lang not in langs:
-                langs.append(lang)
-
-        self._write_placeholder_vtts_and_master(langs, start_pts)
-
-        actual_start_sec = _probe_keyframe_inpoint(
-            self.entry.path, self.offset_sec, self.entry.duration_sec
-        )
-
-        video_start_time = _probe_stream_start_time(self.entry.path, "v:0")
-        sub_pts_corrections = {}
-        for lang, idx in self._sub_stream_indices.items():
-            sub_start = _probe_stream_start_time(self.entry.path, f"s:{idx}")
-            correction = video_start_time - sub_start
-            sub_pts_corrections[lang] = correction
-            if abs(correction) > 0.05:
-                log.info(
-                    "Catchup %s: sub stream %s (idx %d) start_time=%.3fs vs "
-                    "video start_time=%.3fs → correction=%.3fs",
-                    self.session_id, lang or "und", idx, sub_start,
-                    video_start_time, correction,
-                )
-
-        log.info(
-            "Catchup %s subtitle timing: offset_sec=%.3f actual_start=%.3f "
-            "start_pts=%d (%.3fs) pts_minus_actual=%.3fs",
-            self.session_id, self.offset_sec, actual_start_sec,
-            start_pts, start_pts / 90000.0,
-            start_pts / 90000.0 - (self.offset_sec - actual_start_sec),
-        )
-
-        def _write_vtt(lang, lang_label, cue_lines, is_rtl=False):
-            vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
-            try:
-                with open(vtt_path, "w", encoding="utf-8") as f:
-                    f.write("WEBVTT\n")
-                    f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
-                    if not self._subtitle_background:
-                        f.write("STYLE\n::cue {\n  background-color: transparent;\n}\n\n")
-                    f.writelines(cue_lines)
-            except OSError as exc:
-                log.error("Catchup %s: VTT write failed lang=%s: %s",
-                          self.session_id, lang_label, exc)
-
-        def _bump_manifest(lang_label, seq, endlist=False):
-            sub_m3u8 = os.path.join(self.session_dir, f"sub_{lang_label}.m3u8")
-            try:
-                with open(sub_m3u8, "w", encoding="utf-8") as f:
-                    f.write(
-                        "#EXTM3U\n"
-                        "#EXT-X-TARGETDURATION:99999\n"
-                        "#EXT-X-VERSION:3\n"
-                        f"#EXT-X-MEDIA-SEQUENCE:{seq}\n"
-                        f"#EXTINF:{self.duration_sec:.1f},\n"
-                        f"sub_{lang_label}.vtt\n"
-                    )
-                    if endlist:
-                        f.write("#EXT-X-ENDLIST\n")
-            except OSError:
-                pass
-
-        def _build_cues_from_raw(raw, lang, offset):
-            cue_lines = []
-            is_rtl = lang == "he" or (lang == "" and _text_has_hebrew(raw))
-            try:
-                for cue_start, cue_end, text in _parse_srt_cues(raw):
-                    s = cue_start - offset
-                    e = cue_end - offset
-                    if e <= 0:
-                        continue
-                    s = max(0.0, s)
-                    if is_rtl:
-                        text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
-                    cue_lines.append(
-                        f"{_sec_to_vtt_ts(s)} --> {_sec_to_vtt_ts(e)}\n{text}\n\n"
-                    )
-            except Exception:
-                log.exception("Catchup %s: cue parse failed lang=%s",
-                              self.session_id, lang or "und")
-            return cue_lines, is_rtl
-
-        def _extract_one(lang):
-            lang_label = lang or "und"
-            srt_path = self.entry.subtitle_paths.get(lang, "")
-            raw = ""
-            if srt_path and os.path.exists(srt_path):
-                try:
-                    raw = _read_srt(srt_path)
-                except Exception:
-                    log.exception("Catchup %s: SRT read failed lang=%s",
-                                  self.session_id, lang_label)
-            elif lang and lang not in self._sub_stream_indices:
-                raw = _extract_embedded_srt(self.entry.path, lang, actual_start_sec,
-                                             self.duration_sec, timeout=120)
-            cue_lines, is_rtl = _build_cues_from_raw(raw, lang, actual_start_sec) if raw else ([], False)
-            log.debug("Catchup %s: wrote %d cues lang=%s (external/fallback)",
-                      self.session_id, len(cue_lines), lang_label)
-            _write_vtt(lang, lang_label, cue_lines, is_rtl)
-
-        def _poll_ffmpeg_srt(lang):
-            lang_label = lang or "und"
-            srt_path = os.path.join(self.session_dir, f"sub_{lang_label}.srt")
-            seq = 0
-            last_size = 0
-
-            while True:
-                for _ in range(4):
-                    time.sleep(0.5)
-                    if self._process and self._process.poll() is not None:
-                        break
-
-                if not os.path.exists(srt_path):
-                    if self._process and self._process.poll() is not None:
-                        break
-                    continue
-
-                size = os.path.getsize(srt_path)
-                if size == last_size:
-                    if self._process and self._process.poll() is not None:
-                        break
-                    continue
-                last_size = size
-
-                try:
-                    raw = _read_srt(srt_path)
-                except Exception:
-                    if self._process and self._process.poll() is not None:
-                        break
-                    continue
-
-                effective_offset = actual_start_sec - self.offset_sec
-                cue_lines, is_rtl = _build_cues_from_raw(raw, lang, effective_offset)
-                if not cue_lines:
-                    if self._process and self._process.poll() is not None:
-                        break
-                    continue
-
-                if seq == 0:
-                    try:
-                        first_cues = list(_parse_srt_cues(raw))
-                        if first_cues:
-                            raw_first = first_cues[0][0]
-                            log.info(
-                                "Catchup %s SRT first cue: raw_ts=%.3fs "
-                                "(no offset subtracted, start_pts=%.3fs) lang=%s",
-                                self.session_id, raw_first,
-                                start_pts / 90000.0, lang_label,
-                            )
-                    except Exception:
-                        pass
-
-                seq += 1
-                done = (self._process and self._process.poll() is not None)
-                _write_vtt(lang, lang_label, cue_lines, is_rtl)
-                _bump_manifest(lang_label, seq, endlist=done)
-                log.debug(
-                    "Catchup %s: SRT poll — %d cues lang=%s seq=%d%s",
-                    self.session_id, len(cue_lines), lang_label, seq,
-                    " [final]" if done else "",
-                )
-                if done:
-                    return
-
-        ext_threads = [
-            threading.Thread(target=_extract_one, args=(lang,), daemon=True)
-            for lang in langs
-        ]
-        for t in ext_threads:
-            t.start()
-
-        for lang in langs:
-            if lang in self._sub_stream_indices:
-                threading.Thread(
-                    target=_poll_ffmpeg_srt, args=(lang,), daemon=True,
-                    name=f"srt-poll-{self.session_id}-{lang or 'und'}",
-                ).start()
-
-        for t in ext_threads:
-            t.join()
-
-        for lang in langs:
-            if lang not in self._sub_stream_indices:
-                _bump_manifest(lang or "und", seq=1, endlist=True)
-
+        self._write_master(self._sub_langs)
         self._subs_ready.set()
-        log.info("Catchup %s: subtitle extraction complete — VTTs ready for langs=%s",
-                 self.session_id, langs)
+        log.info("Catchup %s: master written for langs=%s",
+                 self.session_id, self._sub_langs or "none")
 
-    def _write_placeholder_vtts_and_master(self, langs, start_pts):
-        """Write empty VTTs + sub manifests + stream.m3u8 so is_ready() fires immediately."""
-        for lang in langs:
-            lang_label = lang or "und"
-            vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
-            sub_m3u8 = os.path.join(self.session_dir, f"sub_{lang_label}.m3u8")
-            with open(vtt_path, "w", encoding="utf-8") as f:
-                f.write("WEBVTT\n")
-                f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
-            with open(sub_m3u8, "w", encoding="utf-8") as f:
-                f.write(
-                    "#EXTM3U\n"
-                    "#EXT-X-TARGETDURATION:99999\n"
-                    "#EXT-X-VERSION:3\n"
-                    "#EXT-X-MEDIA-SEQUENCE:0\n"
-                    f"#EXTINF:{self.duration_sec:.1f},\n"
-                    f"sub_{lang_label}.vtt\n"
+    def _write_vtt_for_lang(self, lang: str, start_pts: int) -> int:
+        """Write a WebVTT file for one subtitle language. Returns cue count."""
+        lang_label = lang or "und"
+        vtt_path = os.path.join(self.session_dir, f"sub_{lang_label}.vtt")
+        srt_path = self.entry.subtitle_paths.get(lang, "")
+        is_rtl = (lang == "he")
+
+        raw = ""
+        inpoint = self.offset_sec
+        srt_offset = 0.0
+        if srt_path and os.path.exists(srt_path):
+            raw = _read_srt(srt_path)
+            cues_tmp = _parse_srt_cues(raw)
+            if cues_tmp:
+                first = min(s for s, e, t in cues_tmp)
+                srt_offset = first if first > 300.0 else 0.0
+        else:
+            raw = _extract_embedded_srt(
+                self.entry.path, lang, inpoint, self.duration_sec, timeout=20
+            )
+            inpoint = 0.0  # embedded extraction already starts from inpoint
+
+        cue_lines = []
+        if raw:
+            for cue_start, cue_end, text in _parse_srt_cues(raw):
+                s_adj = (cue_start - srt_offset) - inpoint
+                e_adj = (cue_end - srt_offset) - inpoint
+                if e_adj <= 0 or s_adj < 0:
+                    continue
+                if s_adj >= self.duration_sec:
+                    break
+                if is_rtl:
+                    text = "\n".join(_he_bidi_fix(l) for l in text.split("\n"))
+                cue_lines.append(
+                    f"{_sec_to_vtt_ts(s_adj)} --> {_sec_to_vtt_ts(e_adj)}\n"
+                    f"{text}\n\n"
                 )
-        log.debug("Catchup %s: placeholder VTTs written for langs=%s — awaiting extraction",
-                  self.session_id, langs)
-        self._write_master(langs)
+
+        with open(vtt_path, "w", encoding="utf-8") as f:
+            f.write("WEBVTT\n")
+            f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
+            if not self._subtitle_background:
+                f.write("STYLE\n::cue {\n  background-color: transparent;\n}\n\n")
+            f.writelines(cue_lines)
+        return len(cue_lines)
 
     def _write_master(self, sub_langs):
         """Write stream.m3u8 master playlist pointing to video.m3u8."""

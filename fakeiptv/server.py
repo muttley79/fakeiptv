@@ -201,9 +201,6 @@ def hls_sub_manifest(channel_id: str, lang: str):
 
     Serves the same single VTT file for every sequence number.  The VTT uses
     X-TIMESTAMP-MAP so players that support it align cues to video PTS.
-    Players that don't use TIMESTAMP-MAP still get cues with correct LOCAL
-    timestamps because we offset them from stream start (LOCAL=0).
-
     No EXT-X-ENDLIST → player treats this as a live playlist and polls it,
     matching the live behaviour of video.m3u8.
     """
@@ -217,10 +214,6 @@ def hls_sub_manifest(channel_id: str, lang: str):
     vtt_name = f"sub_{lang}.vtt"
     vtt_path = os.path.join(hls_dir, vtt_name)
 
-    # Mirror the video manifest exactly — same EXTINF durations, same media-sequence,
-    # but replace each segment filename with the VTT file.  This satisfies the HLS
-    # spec (TARGETDURATION ≥ all EXTINF values) and gives Televizo a proper live
-    # sliding-window subtitle playlist that maps 1:1 with video segments.
     video_manifest = os.path.join(hls_dir, "video.m3u8")
     out = []
     try:
@@ -254,16 +247,11 @@ def hls_sub_manifest(channel_id: str, lang: str):
     except FileNotFoundError:
         # video.m3u8 not written yet (channel warming — bumper is playing).
         # Mirror the bumper's video.m3u8 with empty.vtt so the subtitle manifest
-        # has the same MEDIA-SEQUENCE as the bumper video track.  Without this,
-        # a selected subtitle track causes ExoPlayer to stall: it tries to buffer
-        # subtitle seq N to match bumper video seq N but the sub manifest is at
-        # seq 0 with no segments.
+        # has the same MEDIA-SEQUENCE as the bumper video track.
         bumper = _channel_bumper.get(channel_id)
         if bumper is not None and bumper.is_ready():
             raw = bumper.manifest_content()
             if raw:
-                # Mirror bumper video manifest but replace .ts segments with empty.vtt
-                # so the subtitle track has the same MEDIA-SEQUENCE as the video track.
                 out_lines = []
                 for line in raw.splitlines(keepends=True):
                     if line.strip().endswith(".ts"):
@@ -483,12 +471,9 @@ def catchup_sub_manifest(channel_id: str, session_id: str, lang: str):
     """
     Dynamic subtitle manifest for catchup sessions.
 
-    Mirrors video.m3u8 entry-by-entry (EXTINF:2.0 per segment, MEDIA-SEQUENCE=0,
-    no EXT-X-ENDLIST), replacing every segment filename with sub_{lang}.vtt.
-    As ffmpeg writes new video segments the list grows and the player downloads
-    sub_{lang}.vtt again, picking up the latest cues.  The VTT contains all cues
-    with X-TIMESTAMP-MAP so the player shows the right ones at any playback position
-    regardless of how far it has buffered ahead.
+    Mirrors video.m3u8 entry-by-entry, replacing every segment filename with
+    sub_{lang}.vtt.  Omits EXT-X-ENDLIST so Televizo keeps polling and
+    re-fetches the VTT as new cues may be written.
     """
     session = _app_instance.catchup_manager.get_session(session_id)
     if session is None:
@@ -506,9 +491,6 @@ def catchup_sub_manifest(channel_id: str, session_id: str, lang: str):
     except Exception:
         abort(503)
 
-    # Mirror video.m3u8 header + all EXTINF entries, replacing filenames with
-    # the VTT.  Omit EXT-X-ENDLIST so Televizo keeps polling and re-fetches the
-    # VTT as new cues are written.
     out = []
     replace_next = False
     for line in video_lines:
@@ -631,13 +613,6 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
                 pass
 
     seg_path = os.path.join(session.session_dir, segment)
-
-    # VTT files may not exist immediately (async extraction).
-    # Wait up to 15s so the player gets real cues on first fetch.
-    if segment.endswith(".vtt") and not os.path.exists(seg_path):
-        deadline = time.time() + 15
-        while not os.path.exists(seg_path) and time.time() < deadline:
-            time.sleep(0.2)
 
     if not os.path.exists(seg_path) and segment.endswith(".ts"):
         # On-demand regen: segment was deleted by rolling cleanup (player rewound).

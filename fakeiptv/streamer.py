@@ -208,7 +208,8 @@ class ChannelStreamer:
         while not self._stop_event.is_set():
             if os.path.exists(self.manifest_path):
                 seg_count = sum(
-                    1 for f in os.listdir(self.hls_dir) if f.endswith(".ts")
+                    1 for f in os.listdir(self.hls_dir)
+                    if re.match(r"^seg\d+\.ts$", f)
                 )
                 if seg_count >= self._ready_segments:
                     self._ready_event.set()
@@ -335,7 +336,7 @@ class ChannelStreamer:
             # Also remove stale SRT side-output files so the new run starts fresh.
             for fname in os.listdir(self.hls_dir) if os.path.isdir(self.hls_dir) else []:
                 if fname.endswith(".ts") or fname.endswith(".m3u8") \
-                        or fname.endswith(".srt"):
+                        or fname.endswith(".srt") or fname.endswith(".vtt"):
                     try:
                         os.remove(os.path.join(self.hls_dir, fname))
                     except OSError:
@@ -388,19 +389,6 @@ class ChannelStreamer:
                 self.channel.id, subtitle_langs or "none",
             )
 
-            # Write placeholder VTTs before NAS prewarm so hls_sub_manifest returns
-            # an empty stub (not 404) the instant the master playlist declares the track.
-            if subtitle_langs:
-                os.makedirs(self.hls_dir, exist_ok=True)
-                for _lang in subtitle_langs:
-                    _lang_label = _lang or "und"
-                    _vtt_path = os.path.join(self.hls_dir, f"sub_{_lang_label}.vtt")
-                    try:
-                        with open(_vtt_path, "w", encoding="utf-8") as _f:
-                            _f.write("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n")
-                    except OSError:
-                        pass
-
             # Get now-playing early so we can probe the current entry for embedded subs.
             np = get_now_playing(self.channel)
 
@@ -444,44 +432,19 @@ class ChannelStreamer:
                 except Exception:
                     pass
 
-            if subtitle_langs:
-                # For langs that have no external SRT on the *current* entry, probe
-                # for an embedded subtitle stream.  The main ffmpeg process will write
-                # it as an SRT side-output (piggyback — zero extra NAS I/O), and a
-                # background watcher thread will update the VTT progressively.
-                # External SRT always wins: only probe langs with no file on disk.
-                current_entry = np.entry if np else None
-                if current_entry:
-                    embedded_for_probe = [
-                        l for l in subtitle_langs
-                        if not (current_entry.subtitle_paths.get(l)
-                                and os.path.exists(current_entry.subtitle_paths[l]))
-                    ]
-                    if embedded_for_probe:
-                        self._live_srt_indices = _probe_subtitle_stream_indices(
-                            current_entry.path, embedded_for_probe
-                        )
-                        self._live_srt_langs = set(self._live_srt_indices.keys())
-                        if self._live_srt_langs:
-                            log.info(
-                                "Channel %s: ffmpeg SRT side outputs for langs=%s",
-                                self.channel.id, sorted(self._live_srt_langs),
-                            )
-
-                # Register SubtitleStreamers immediately (no SRT I/O here).
-                # SRT reading (build_cues) runs in the async thread in parallel
-                # with ffmpeg startup, so _launch() returns without any NAS reads.
+            # Launch one SubtitleStreamer per language.  Each streamer writes a
+            # single VTT file (sub_{lang}.vtt) with the correct X-TIMESTAMP-MAP
+            # MPEGTS anchor probed from the first TS segment.  LiveSubtitleWriter
+            # coordinates the two-phase async write so the player is never blocked.
+            if subtitle_langs and self._subtitles:
                 for lang in subtitle_langs:
-                    sub = SubtitleStreamer(self.channel, lang, self.hls_dir,
-                                          subtitle_background=self._subtitle_background)
+                    sub = SubtitleStreamer(
+                        self.channel, lang, self.hls_dir, self._subtitle_background
+                    )
                     sub.write_placeholder()
-                    if lang in self._live_srt_langs:
-                        sub.has_ffmpeg_srt = True
                     self._subtitle_streamers[lang] = sub
 
-                # Async thread: read SRTs, wait for first TS segment, probe
-                # start_pts, write VTT files, set _subtitle_ready_event.
-                _writer = LiveSubtitleWriter(
+                writer = LiveSubtitleWriter(
                     channel_id=self.channel.id,
                     hls_dir=self.hls_dir,
                     stop_event=self._stop_event,
@@ -492,25 +455,19 @@ class ChannelStreamer:
                     subtitle_background=self._subtitle_background,
                 )
                 threading.Thread(
-                    target=_writer.write_subtitle_files_async,
-                    args=(subtitle_langs,),
-                    kwargs={
-                        "launch_inpoint": np.offset_sec if np else 0.0,
-                        "launch_actual_inpoint": launch_actual_inpoint_override,
-                        "launch_entry_path": np.entry.path if (np and np.entry) else None,
-                        "launch_entry_duration": np.entry.duration_sec if (np and np.entry) else 0.0,
-                    },
+                    target=writer.write_subtitle_files_async,
+                    kwargs=dict(
+                        subtitle_langs=subtitle_langs,
+                        launch_inpoint=np.offset_sec if np else 0.0,
+                        launch_actual_inpoint=launch_actual_inpoint_override,
+                        launch_entry_path=np.entry.path if np and np.entry else None,
+                        launch_entry_duration=np.entry.duration_sec if np and np.entry else 0.0,
+                    ),
                     daemon=True,
                     name=f"sub-write-{self.channel.id}",
                 ).start()
-                sub_opts = []
             else:
-                # No external SRTs: try embedded text subtitles via the video process.
-                self._subtitle_ready_event.set()   # no subs → immediately ready
-                # Map ALL subtitle streams (not just s:0) so players can choose
-                # language.  Bitmap subs (PGS/VOBSUB) trigger the monitor's
-                # "bitmap to bitmap" detection and disable subs cleanly on restart.
-                sub_opts = ["-map", "0:s?", "-c:s", "webvtt"] if self._subtitles else []
+                self._subtitle_ready_event.set()
 
             # Probe the current file for the preferred audio track.  Files with
             # multiple audio languages (e.g. French + English) often store the
@@ -542,10 +499,6 @@ class ChannelStreamer:
                 *video_bsf_opts,
                 "-map", "0:v:0",
                 "-map", f"0:a:{audio_idx}",
-                # Subtitles: convert embedded SRT/ASS to WebVTT in-stream.
-                # Only used when no external SRT files are available.
-                # The '?' makes the map optional — no error if a file has no subs.
-                *sub_opts,
                 "-f", "hls",
                 "-hls_time", str(HLS_SEGMENT_SECONDS),
                 "-hls_list_size", str(HLS_LIST_SIZE),
@@ -553,15 +506,6 @@ class ChannelStreamer:
                 "-hls_segment_filename", seg_pattern,
                 self.manifest_path,
             ]
-            # SRT side outputs: one per embedded-subtitle lang, written at -re rate.
-            # Piggybacks on the main ffmpeg read — zero extra NAS I/O.
-            # -flush_packets 1: force packet-level flushing so the watcher thread
-            # sees data immediately rather than waiting for the 32 KB avio buffer.
-            for lang, idx in self._live_srt_indices.items():
-                lang_label = lang or "und"
-                srt_out = os.path.join(self.hls_dir, f"sub_{lang_label}.srt")
-                cmd += ["-vn", "-an", "-map", f"0:s:{idx}",
-                        "-flush_packets", "1", "-c:s", "srt", srt_out]
             log.debug("ffmpeg cmd: %s", " ".join(cmd))
             # Re-warm NAS immediately before ffmpeg starts seeking.
             # The first prewarm (line 412) happened before multiple ffprobe calls,
@@ -929,16 +873,17 @@ class StreamManager:
 
     def is_transition_ready(self, ch_id: str, min_segments: int = 2) -> bool:
         """
-        True when the channel has at least min_segments TS files on disk.
+        True when the channel has at least min_segments video TS files on disk.
 
         2 segments (4s) is enough for ExoPlayer to start smoothly after the
         #EXT-X-DISCONTINUITY that separates the bumper from real content.
+        Counts only seg*.ts (not sub_he_*.ts etc.) to avoid false positives.
         """
         s = self._streamers.get(ch_id)
         if not s or not s.is_ready():
             return False
         try:
-            count = sum(1 for f in os.listdir(s.hls_dir) if f.endswith(".ts"))
+            count = sum(1 for f in os.listdir(s.hls_dir) if re.match(r"^seg\d+\.ts$", f))
             return count >= min_segments
         except OSError:
             return False
@@ -1012,22 +957,12 @@ class StreamManager:
             self._channel_order = list(channels.keys())
 
     def get_subtitle_languages(self, ch_id: str):
-        """
-        Return sorted list of subtitle language codes for ch_id.
-
-        Returns all languages registered for the channel (i.e. present in at
-        least one entry) — not just ones whose VTT has been written yet.  The
-        VTT endpoint independently waits up to 15s for the file to appear, so
-        it is safe to include a language in the master playlist before its VTT
-        is written.  This removes the need to block the manifest response on
-        subtitle readiness.
-        """
+        """Return sorted list of subtitle language codes for ch_id."""
         s = self._streamers.get(ch_id)
         if s is None:
             return []
-        # Prefer the registered _subtitle_streamers (populated in _launch)
-        # since they reflect the actual langs for the current concat window.
-        # Fall back to _get_subtitle_langs() if the streamer hasn't launched yet.
+        # Prefer _subtitle_streamers (populated in _launch) — reflects active langs.
+        # Fall back to _get_subtitle_langs() when _launch() hasn't run yet.
         if s._subtitle_streamers:
             return sorted(k for k in s._subtitle_streamers.keys() if k)
         return s._get_subtitle_langs()

@@ -49,6 +49,25 @@ def _read_srt(path: str) -> str:
     return ""
 
 
+def _srt_ffmpeg_charenc(path: str):
+    """Return the ffmpeg -sub_charenc value needed for this SRT, or None if UTF-8."""
+    for enc in ("utf-8-sig", "utf-8"):
+        try:
+            with open(path, encoding=enc) as f:
+                f.read()
+            return None
+        except (UnicodeDecodeError, LookupError):
+            pass
+    for enc, ffmpeg_name in (("cp1255", "CP1255"), ("iso-8859-8", "ISO-8859-8")):
+        try:
+            with open(path, encoding=enc) as f:
+                f.read()
+            return ffmpeg_name
+        except (UnicodeDecodeError, LookupError):
+            pass
+    return "CP1255"
+
+
 def _parse_srt_cues(text: str):
     """Parse SRT text, return list of (start_sec, end_sec, cue_text)."""
     cues = []

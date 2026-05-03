@@ -55,7 +55,7 @@ class SubtitleStreamer:
             f.write("WEBVTT\n")
             f.write(f"X-TIMESTAMP-MAP=MPEGTS:{start_pts},LOCAL:00:00:00.000\n\n")
             if not self._subtitle_background:
-                f.write("STYLE\n::cue {\n  background-color: transparent;\n}\n\n")
+                f.write("STYLE\n::cue {\n  background-color: rgba(0,0,0,0.6);\n}\n\n")
             f.writelines(cue_lines)
 
         vtt_name = os.path.basename(self.vtt_path)

@@ -161,10 +161,10 @@ def hls_manifest(channel_id: str):
     _app_instance.stream_manager.touch(channel_id)
 
     # If the channel isn't ready yet, serve the bumper loading screen.
-    # 3 segments (6s) pre-buffered before the discontinuity fires: the
-    # player's download thread fills the buffer during the flush — no visible stall.
+    # 1 segment is sufficient on LAN: download speed >> ffmpeg write speed so
+    # ExoPlayer never starves even for long-GOP files (9s keyframes → 9s segments).
     subtitle_langs = _app_instance.stream_manager.get_subtitle_languages(channel_id)
-    if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=3):
+    if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=1):
         if has_bumper:
             # Channel warming — return master pointing to video.m3u8 immediately.
             # hls_segment() serves bumper content from video.m3u8 while not ready,
@@ -322,7 +322,7 @@ def hls_segment(channel_id: str, segment: str):
     # Must run BEFORE seg_path / file-existence checks so we can serve bumper content
     # even when video.m3u8 doesn't exist on disk yet (ffmpeg still starting up).
     if segment == "video.m3u8":
-        if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=3):
+        if not _app_instance.stream_manager.is_transition_ready(channel_id, min_segments=1):
             bumper = _channel_bumper.get(channel_id)
             if bumper is not None and bumper.is_ready():
                 content = _bumper_manifest_content(bumper)

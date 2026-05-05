@@ -883,6 +883,8 @@ class StreamManager:
         if not s or not s.is_ready():
             return False
         try:
+            if not os.path.exists(os.path.join(s.hls_dir, "video.m3u8")):
+                return False
             count = sum(1 for f in os.listdir(s.hls_dir) if re.match(r"^seg\d+\.ts$", f))
             return count >= min_segments
         except OSError:

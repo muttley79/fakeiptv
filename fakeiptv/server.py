@@ -69,6 +69,14 @@ def playlist():
     return Response(content, mimetype="application/x-mpegurl")
 
 
+@app.route("/playlist_local.m3u8")
+def playlist_local():
+    content = _app_instance.get_playlist()
+    host_ip = _app_instance.config.server.host_ip
+    content = content.replace(host_ip, "localhost")
+    return Response(content, mimetype="application/x-mpegurl")
+
+
 @app.route("/epg.xml")
 def epg():
     content = _app_instance.get_epg()

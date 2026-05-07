@@ -859,6 +859,12 @@ class StreamManager:
         s = self._streamers.get(ch_id)
         return s._seq_offset if s else 0
 
+    def set_seq_offset(self, ch_id: str, offset: int) -> None:
+        """Update the MEDIA-SEQUENCE offset (called at bumper→channel handoff)."""
+        s = self._streamers.get(ch_id)
+        if s is not None:
+            s._seq_offset = offset
+
     def pop_codec_disc(self, ch_id: str) -> bool:
         """Return True (and clear the flag) if a codec/resolution change restart just occurred."""
         s = self._streamers.get(ch_id)

@@ -344,16 +344,30 @@ def hls_segment(channel_id: str, segment: str):
             # No bumper or unreadable — fall through; video.m3u8 may not exist yet
             # which will 404 cleanly below.
         elif channel_id in _bumper_served_channels:
-            # First real video.m3u8 after bumper: inject DISCONTINUITY so ExoPlayer
-            # resets all TimestampAdjusters.  Without this, the subtitle adjuster keeps
-            # the bumper's accumulated PTS offset, causing subtitles to appear ~3s early.
-            # The previous 18s stall was caused by the sub-sync stall inside the bumper
-            # (503 / empty stub) delaying DISCONTINUITY processing; with no subtitle
-            # tracks declared during bumper phase (fix in hls_manifest), DISCONTINUITY
-            # is processed immediately and triggers a fast stream.m3u8 re-check.
+            # First real video.m3u8 after bumper: clear bumper state, then tighten
+            # the MEDIA-SEQUENCE offset so ExoPlayer sees only a +1 forward jump
+            # (seamless) instead of the initial +100 set at ensure_started time.
+            #
+            # Root cause of the ~20s stall: bumper.current_seq() = int(time.time()),
+            # so _seq_offset starts at ~Unix_epoch+100. By transition time the bumper
+            # has advanced ~12s (6 segments), producing an ~86-segment forward jump.
+            # ExoPlayer interprets this as a massive live-edge gap and enters
+            # catch-up slow-poll mode (10s intervals × 2 = 20s before real playback).
+            #
+            # Fix: at transition time, recalculate offset so the channel's first
+            # served MEDIA-SEQUENCE = bumper.current_seq() + 3 (just 1 segment ahead
+            # of the last bumper segment the player saw, which was current+2).
             _bumper_served_channels.discard(channel_id)
-            _channel_bumper.pop(channel_id, None)
-            _discontinuity_pending.add(channel_id)
+            bumper_at_handoff = _channel_bumper.pop(channel_id, None)
+            if bumper_at_handoff is not None:
+                try:
+                    with open(os.path.join(hls_dir, "video.m3u8"), "r") as _f:
+                        _ffmpeg_seq = _parse_media_sequence(_f.read())
+                except OSError:
+                    _ffmpeg_seq = 0
+                _app_instance.stream_manager.set_seq_offset(
+                    channel_id, bumper_at_handoff.current_seq() + 3 - _ffmpeg_seq
+                )
 
     seg_path = os.path.join(hls_dir, segment)
 
@@ -575,8 +589,7 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
 
     # video.m3u8 is the variant media playlist — same role as video.m3u8 for live
     # channels.  Serve bumper media here while the catchup ffmpeg warms up, then
-    # inject DISCONTINUITY + seq_offset on the first real serve so ExoPlayer resets
-    # its PTS adjuster and the media-sequence doesn't jump backward.
+    # tighten seq_offset at handoff so ExoPlayer sees only a +1 forward jump.
     if segment == "video.m3u8":
         if not session.is_ready():
             bumper = _channel_bumper.get(session_id)
@@ -592,10 +605,19 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
                     return resp
             abort(404)
         elif session_id in _bumper_served_channels:
-            # First real video.m3u8 after bumper: flag for DISCONTINUITY injection
+            # First real video.m3u8 after bumper: recalculate seq_offset to +1 forward
+            # (same fix as live channels — see comment there for full explanation).
             _bumper_served_channels.discard(session_id)
-            _channel_bumper.pop(session_id, None)
-            _discontinuity_pending.add(session_id)
+            bumper_at_handoff = _channel_bumper.pop(session_id, None)
+            if bumper_at_handoff is not None:
+                try:
+                    with open(os.path.join(session.session_dir, "video.m3u8"), "r") as _f:
+                        _ffmpeg_seq = _parse_media_sequence(_f.read())
+                except OSError:
+                    _ffmpeg_seq = 0
+                _catchup_seq_offsets[session_id] = (
+                    bumper_at_handoff.current_seq() + 3 - _ffmpeg_seq
+                )
 
         needs_disc = session_id in _discontinuity_pending
         seq_offset = _catchup_seq_offsets.get(session_id, 0)

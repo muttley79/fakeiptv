@@ -9,6 +9,28 @@ from typing import Dict, Optional
 
 log = logging.getLogger(__name__)
 
+_srt_cache = None  # SRTCache instance, set by init_srt_cache()
+
+
+def init_srt_cache(db_path: str) -> None:
+    global _srt_cache
+    from .cache import SRTCache
+    _srt_cache = SRTCache(db_path)
+
+
+def ensure_srt_cached(path: str) -> None:
+    """Read and cache SRT file content if not already stored."""
+    if _srt_cache is None or _srt_cache.has(path):
+        return
+    try:
+        content = _read_srt_from_disk(path)
+        if content:
+            _srt_cache.set(path, content)
+            log.debug("SRT cached: %s", os.path.basename(path))
+    except Exception as exc:
+        log.debug("SRT cache failed for %s: %s", os.path.basename(path), exc)
+
+
 _LANG_CODES = {"he", "en", "es", "fr", "de", "ar", "ru", "pt", "it", "nl", "pl", "cs", "ja", "ko", "zh"}
 
 _LATIN_RUN_RE = re.compile(r'[A-Za-z][A-Za-z0-9]*(?:[ \'-][A-Za-z][A-Za-z0-9]*)*')
@@ -38,8 +60,8 @@ def _sec_to_vtt_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
-def _read_srt(path: str) -> str:
-    """Read SRT file using the first encoding that succeeds."""
+def _read_srt_from_disk(path: str) -> str:
+    """Read SRT file from disk using the first encoding that succeeds."""
     for enc in ("utf-8-sig", "utf-8", "cp1255", "iso-8859-8", "latin-1"):
         try:
             with open(path, encoding=enc) as f:
@@ -47,6 +69,18 @@ def _read_srt(path: str) -> str:
         except (UnicodeDecodeError, LookupError):
             continue
     return ""
+
+
+def _read_srt(path: str) -> str:
+    """Return SRT content from SQLite cache, falling back to NAS disk read."""
+    if _srt_cache is not None:
+        cached = _srt_cache.get(path)
+        if cached is not None:
+            return cached
+    content = _read_srt_from_disk(path)
+    if content and _srt_cache is not None:
+        _srt_cache.set(path, content)
+    return content
 
 
 def _srt_ffmpeg_charenc(path: str):

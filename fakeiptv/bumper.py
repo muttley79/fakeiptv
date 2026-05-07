@@ -169,7 +169,7 @@ class BumperStreamer:
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-i", self._cache_path,
             "-c:v", "copy", "-c:a", "copy",
-            "-f", "hls", "-hls_time", "1",
+            "-f", "hls", "-hls_time", "2",
             "-hls_list_size", "0",
             "-hls_flags", "omit_endlist",
             "-hls_segment_filename", os.path.join(self.hls_dir, "seg%d.ts"),

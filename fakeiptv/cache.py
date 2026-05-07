@@ -160,3 +160,89 @@ class TMDBCache:
         if result and result.get("results"):
             return result["results"][0]
         return None
+
+
+class KeyframeCache:
+    def __init__(self, db_path: str):
+        self._conn = _open_db(db_path)
+        self._lock = threading.Lock()
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS keyframes (
+                key   TEXT PRIMARY KEY,
+                times TEXT NOT NULL
+            )
+        """)
+        self._conn.commit()
+
+    def _key(self, path: str) -> str:
+        try:
+            mtime = str(os.path.getmtime(path))
+        except OSError:
+            mtime = "0"
+        return f"{path}|{mtime}"
+
+    def get(self, path: str) -> Optional[list]:
+        row = self._conn.execute(
+            "SELECT times FROM keyframes WHERE key = ?",
+            (self._key(path),)
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+    def has(self, path: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM keyframes WHERE key = ?",
+            (self._key(path),)
+        ).fetchone()
+        return row is not None
+
+    def set(self, path: str, times: list):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO keyframes (key, times) VALUES (?, ?)",
+                (self._key(path), json.dumps(times)),
+            )
+            self._conn.commit()
+
+
+class SRTCache:
+    def __init__(self, db_path: str):
+        self._conn = _open_db(db_path)
+        self._lock = threading.Lock()
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS srt_content (
+                key     TEXT PRIMARY KEY,
+                content TEXT NOT NULL
+            )
+        """)
+        self._conn.commit()
+
+    def _key(self, path: str) -> str:
+        try:
+            mtime = str(os.path.getmtime(path))
+        except OSError:
+            mtime = "0"
+        return f"{path}|{mtime}"
+
+    def get(self, path: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT content FROM srt_content WHERE key = ?",
+            (self._key(path),)
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def has(self, path: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM srt_content WHERE key = ?",
+            (self._key(path),)
+        ).fetchone()
+        return row is not None
+
+    def set(self, path: str, content: str):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO srt_content (key, content) VALUES (?, ?)",
+                (self._key(path), content),
+            )
+            self._conn.commit()

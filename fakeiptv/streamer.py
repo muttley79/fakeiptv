@@ -700,7 +700,7 @@ class StreamManager:
 
     def __init__(self, tmp_base: str = "/tmp/fakeiptv", subtitles: bool = True,
                  audio_copy: bool = True, prewarm_timeout: int = IDLE_TIMEOUT_PREWARM,
-                 ready_segments: int = 3, session_mode: bool = False,
+                 ready_segments: int = 1, session_mode: bool = False,
                  prewarm_adjacent: int = 0, preferred_audio_language: str = "eng",
                  bumpers_path: str = "", bumpers_cache_dir: str = "",
                  subtitle_background: bool = True):
@@ -883,6 +883,8 @@ class StreamManager:
         if not s or not s.is_ready():
             return False
         try:
+            if not os.path.exists(os.path.join(s.hls_dir, "video.m3u8")):
+                return False
             count = sum(1 for f in os.listdir(s.hls_dir) if re.match(r"^seg\d+\.ts$", f))
             return count >= min_segments
         except OSError:

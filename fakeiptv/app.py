@@ -4,6 +4,7 @@ Wires together scanner, scheduler, streamer, EPG, and playlist.
 Also owns the daily refresh timer.
 """
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -11,6 +12,8 @@ from typing import Dict
 
 from .config import AppConfig
 from .epg import build_xmltv
+from .ffprobe_utils import init_keyframe_cache, ensure_keyframes_indexed
+from .subtitle_utils import init_srt_cache, ensure_srt_cached
 from .library_cache import LibraryCache
 from .playlist import build_m3u8
 from .models import Channel, MediaLibrary
@@ -55,6 +58,10 @@ class FakeIPTV:
         self._refresh_timer: threading.Timer = None
         self._epg_timer: threading.Timer = None
 
+        db_path = os.path.join(config.metadata.cache_dir, "cache.db")
+        init_keyframe_cache(db_path)
+        init_srt_cache(db_path)
+
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
@@ -96,6 +103,7 @@ class FakeIPTV:
                 self.channels = channels
                 self.stream_manager.reload(channels)
                 self._rebuild_cache()
+                self._start_media_indexers(cached_library)
                 log.info("Startup complete (from cache): %d channels", len(channels))
                 return
 
@@ -126,6 +134,7 @@ class FakeIPTV:
         self.stream_manager.reload(channels)
         self._rebuild_cache()
         cache.save(library)
+        self._start_media_indexers(library)
         log.info(
             "Refresh complete: %d shows, %d movies, %d channels",
             len(library.shows),
@@ -161,6 +170,29 @@ class FakeIPTV:
     def get_epg(self) -> str:
         with self._cache_lock:
             return self._epg_cache
+
+    def _start_media_indexers(self, library):
+        """Spawn a background thread to pre-populate SRT and keyframe caches."""
+        video_paths = set()
+        srt_paths = set()
+        for show in library.shows.values():
+            for ep in show.episodes:
+                video_paths.add(ep.path)
+                srt_paths.update(ep.subtitle_paths.values())
+        for movie in library.movies:
+            video_paths.add(movie.path)
+            srt_paths.update(movie.subtitle_paths.values())
+
+        def _worker():
+            log.info("Media indexers: %d SRT files, %d video files", len(srt_paths), len(video_paths))
+            for path in sorted(srt_paths):
+                ensure_srt_cached(path)
+            for path in sorted(video_paths):
+                ensure_keyframes_indexed(path)
+                time.sleep(0.1)
+            log.info("Media indexers: complete")
+
+        threading.Thread(target=_worker, daemon=True, name="media-indexer").start()
 
     # ------------------------------------------------------------------
     # Channel pre-warming

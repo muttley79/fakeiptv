@@ -1,12 +1,13 @@
 """
 ffprobe_utils.py — Media probing, NAS optimization, and EBML parsing for seeking.
 """
+import bisect
 import json
 import logging
 import os
 import subprocess
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -16,6 +17,186 @@ _HDR_TRANSFERS = {"smpte2084", "arib-std-b67", "smpte428"}
 _gop_size_cache: Dict[str, float] = {}
 _DEFAULT_GOP_SEC = 5.0
 _keyframe_probe_sem = threading.Semaphore(3)
+
+_kf_cache = None  # KeyframeCache instance, set by init_keyframe_cache()
+
+
+def init_keyframe_cache(db_path: str) -> None:
+    global _kf_cache
+    from .cache import KeyframeCache
+    _kf_cache = KeyframeCache(db_path)
+
+
+def _mkv_cues_all_keyframes(path: str) -> Optional[List[float]]:
+    """Read all keyframe timestamps from MKV Cues element (no ffprobe, no full-file scan)."""
+    try:
+        file_size = os.path.getsize(path)
+        if file_size < 65536:
+            return None
+
+        with open(path, "rb") as f:
+            head = f.read(65536)
+
+        pos = 0
+        UNKNOWN = -1
+
+        eid, pos = _ebml_read_id(head, pos)
+        esz, pos = _ebml_read_size(head, pos)
+        if eid != _EBML_ID_EBML_HEADER or esz is None:
+            return None
+        if esz != UNKNOWN:
+            pos += esz
+
+        eid, pos = _ebml_read_id(head, pos)
+        esz, pos = _ebml_read_size(head, pos)
+        if eid != _EBML_ID_SEGMENT:
+            return None
+        seg_body_abs = pos
+
+        cues_seek_pos = None
+        timestamp_scale_ns = 1000000
+
+        seg_pos = pos
+        while seg_pos < len(head) - 4:
+            eid, next_pos = _ebml_read_id(head, seg_pos)
+            esz, next_pos = _ebml_read_size(head, next_pos)
+            if eid is None or esz is None:
+                break
+            if eid == _EBML_ID_CLUSTER:
+                break
+            if eid == _EBML_ID_SEEKHEAD:
+                sh_end = min(next_pos + esz, len(head))
+                sh_pos = next_pos
+                while sh_pos < sh_end - 2:
+                    seek_id, sh_pos = _ebml_read_id(head, sh_pos)
+                    seek_sz, sh_pos = _ebml_read_size(head, sh_pos)
+                    if seek_id is None or seek_sz is None:
+                        break
+                    if seek_id == _EBML_ID_SEEK:
+                        seek_entry_end = min(sh_pos + seek_sz, len(head))
+                        seek_entry_id = None
+                        seek_entry_pos = None
+                        se_pos = sh_pos
+                        while se_pos < seek_entry_end - 2:
+                            sub_id, se_pos = _ebml_read_id(head, se_pos)
+                            sub_sz, se_pos = _ebml_read_size(head, se_pos)
+                            if sub_id is None or sub_sz is None:
+                                break
+                            if sub_id == _EBML_ID_SEEK_ID:
+                                seek_entry_id, _ = _ebml_read_id(head, se_pos)
+                            elif sub_id == _EBML_ID_SEEK_POS:
+                                val = 0
+                                for i in range(min(sub_sz, 8)):
+                                    val = (val << 8) | head[se_pos + i]
+                                seek_entry_pos = val
+                            se_pos += sub_sz
+                        if seek_entry_id == _EBML_ID_CUES and seek_entry_pos is not None:
+                            cues_seek_pos = seek_entry_pos
+                    sh_pos += seek_sz
+            elif eid == _EBML_ID_SEGMENT_INFO:
+                info_end = min(next_pos + esz, len(head))
+                info_pos = next_pos
+                while info_pos < info_end - 2:
+                    info_id, info_pos = _ebml_read_id(head, info_pos)
+                    info_sz, info_pos = _ebml_read_size(head, info_pos)
+                    if info_id is None or info_sz is None:
+                        break
+                    if info_id == _EBML_ID_TIMESTAMP_SCALE:
+                        val = 0
+                        for i in range(min(info_sz, 4)):
+                            val = (val << 8) | head[info_pos + i]
+                        timestamp_scale_ns = val
+                    info_pos += info_sz
+            if esz == UNKNOWN or esz < 0:
+                break
+            seg_pos = next_pos + esz
+
+        if cues_seek_pos is None:
+            return None
+
+        abs_cues = seg_body_abs + cues_seek_pos
+        if abs_cues >= file_size:
+            return None
+
+        with open(path, "rb") as f:
+            f.seek(abs_cues)
+            cues_hdr = f.read(16)
+        eid, hdr_pos = _ebml_read_id(cues_hdr, 0)
+        esz, hdr_pos = _ebml_read_size(cues_hdr, hdr_pos)
+        if eid != _EBML_ID_CUES or esz is None or esz <= 0 or esz > 8 * 1024 * 1024:
+            return None
+
+        with open(path, "rb") as f:
+            f.seek(abs_cues + hdr_pos)
+            cues_data = f.read(min(esz, 8 * 1024 * 1024))
+
+        times = []
+        cues_pos = 0
+        while cues_pos < len(cues_data) - 2:
+            cp_id, cues_pos = _ebml_read_id(cues_data, cues_pos)
+            cp_sz, cues_pos = _ebml_read_size(cues_data, cues_pos)
+            if cp_id is None or cp_sz is None:
+                break
+            if cp_id == _EBML_ID_CUE_POINT:
+                cp_end = min(cues_pos + cp_sz, len(cues_data))
+                cp_pos = cues_pos
+                while cp_pos < cp_end - 2:
+                    cue_id, cp_pos = _ebml_read_id(cues_data, cp_pos)
+                    cue_sz, cp_pos = _ebml_read_size(cues_data, cp_pos)
+                    if cue_id is None or cue_sz is None:
+                        break
+                    if cue_id == _EBML_ID_CUE_TIME:
+                        val = 0
+                        for i in range(min(cue_sz, 8)):
+                            val = (val << 8) | cues_data[cp_pos + i]
+                        times.append(val * timestamp_scale_ns / 1e9)
+                    cp_pos += cue_sz
+            cues_pos += cp_sz
+
+        return sorted(times) if times else None
+
+    except Exception:
+        return None
+
+
+def _probe_all_keyframes(path: str, timeout: int = 120) -> List[float]:
+    """Return sorted list of all video keyframe timestamps in the file.
+
+    For MKV: reads the Cues index directly (fast, no full-file scan).
+    For other formats: uses ffprobe (reads moov/index metadata, not video data).
+    """
+    if path.lower().endswith(".mkv"):
+        times = _mkv_cues_all_keyframes(path)
+        if times:
+            return times
+    r = subprocess.run([
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-select_streams", "v:0",
+        "-show_entries", "packet=pts_time,flags",
+        path,
+    ], capture_output=True, text=True, timeout=timeout)
+    packets = json.loads(r.stdout).get("packets", [])
+    return sorted(
+        float(p["pts_time"])
+        for p in packets
+        if p.get("flags", "").startswith("K")
+        and p.get("pts_time") not in (None, "N/A")
+    )
+
+
+def ensure_keyframes_indexed(path: str) -> None:
+    """Probe and store all keyframes for path if not already cached."""
+    if _kf_cache is None or _kf_cache.has(path):
+        return
+    try:
+        log.debug("Keyframe indexing: %s", os.path.basename(path))
+        times = _probe_all_keyframes(path)
+        if times:
+            _kf_cache.set(path, times)
+            log.debug("Keyframe indexed: %d kf for %s", len(times), os.path.basename(path))
+    except Exception as exc:
+        log.debug("Keyframe index failed for %s: %s", os.path.basename(path), exc)
 
 _LANG2_TO_LANG3: Dict[str, str] = {
     "en": "eng", "he": "heb", "fr": "fra", "de": "deu",
@@ -541,6 +722,14 @@ def _probe_gop_size(path: str) -> float:
     """Return the max keyframe interval (GOP size) in seconds, from first 10s of file."""
     if path in _gop_size_cache:
         return _gop_size_cache[path]
+    if _kf_cache is not None:
+        times = _kf_cache.get(path)
+        if times is not None:
+            early = [t for t in times if t <= 10.0]
+            if len(early) >= 2:
+                gop = max(b - a for a, b in zip(early, early[1:]))
+                _gop_size_cache[path] = gop
+                return gop
     try:
         r = subprocess.run([
             "ffprobe", "-v", "quiet",
@@ -575,6 +764,23 @@ def _probe_keyframe_inpoint(path: str, inpoint: float,
     if inpoint <= 0:
         return 0.0
 
+    # Fast path: binary search in persisted keyframe index (no ffprobe, no NAS I/O)
+    if _kf_cache is not None:
+        times = _kf_cache.get(path)
+        if times is not None:
+            idx = bisect.bisect_right(times, inpoint) - 1
+            if idx >= 0:
+                actual = times[idx]
+                if abs(actual - inpoint) > 0.1:
+                    log.info(
+                        "Subtitle keyframe snap: %.3fs → %.3fs (Δ=%.3fs) for %s",
+                        inpoint, actual, inpoint - actual,
+                        os.path.basename(path),
+                    )
+                return actual
+            return max(0.0, inpoint - _DEFAULT_GOP_SEC)
+
+    # Slow path: ffprobe scan (runs only when keyframe index not yet populated)
     # MKV Cues hint where to start the packet scan, but they can be inaccurate
     # (e.g. stale mux where CueTime doesn't match any real keyframe). Always
     # verify with a real ffprobe packet scan; use the Cues result only to

@@ -140,7 +140,7 @@ def hls_manifest(channel_id: str):
     # Pre-warm all channels on first request of each "session" (if enabled via FAKEIPTV_PREWARM).
     # _prewarm_done resets when all channels have gone idle (nobody watching),
     # so the next viewer triggers a fresh pre-warm.
-    if _app_instance.config.server.prewarm or _app_instance.config.server.prewarm_session:
+    if _app_instance.config.server.prewarm or _app_instance.config.server.prewarm_session or _app_instance.config.server.always_on == "connected":
         global _prewarm_done
         if not _prewarm_done:
             _prewarm_done = True
@@ -229,12 +229,37 @@ def hls_sub_manifest(channel_id: str, lang: str):
             video_lines = f.readlines()
         if not os.path.exists(vtt_path):
             # video.m3u8 exists but VTT not yet written (extraction running).
-            # Return empty stub — the player keeps polling and gets real cues shortly.
+            # Return a stub aligned to bumper time; the VTT-exists+bumper-active
+            # path below handles the same alignment once the file appears.
+            _native_seq = _parse_media_sequence("".join(video_lines))
+            _bumper_now = _channel_bumper.get(channel_id)
+            if _bumper_now is not None:
+                _effective_seq = _bumper_now.current_seq() + 1
+            else:
+                _effective_seq = _native_seq + _app_instance.stream_manager.get_seq_offset(channel_id)
             stub = (
                 "#EXTM3U\n"
                 "#EXT-X-VERSION:3\n"
                 "#EXT-X-TARGETDURATION:2\n"
-                "#EXT-X-MEDIA-SEQUENCE:0\n"
+                f"#EXT-X-MEDIA-SEQUENCE:{_effective_seq}\n"
+            )
+            resp = Response(stub, mimetype="application/x-mpegurl")
+            resp.headers["Cache-Control"] = "no-cache, no-store"
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
+        # VTT exists but bumper is still active: serve stub aligned to bumper
+        # time so the subtitle MEDIA-SEQUENCE doesn't jump backward at handoff.
+        # Without this, sub manifests use old_seq_offset (T+100) during bumper,
+        # then drop to new_seq_offset (T+~21) at transition → ~80-pos backward
+        # jump → ExoPlayer 10s slow-poll on BOTH video and subtitle tracks.
+        _bumper_active = _channel_bumper.get(channel_id)
+        if _bumper_active is not None:
+            _effective_seq = _bumper_active.current_seq() + 1
+            stub = (
+                "#EXTM3U\n"
+                "#EXT-X-VERSION:3\n"
+                "#EXT-X-TARGETDURATION:2\n"
+                f"#EXT-X-MEDIA-SEQUENCE:{_effective_seq}\n"
             )
             resp = Response(stub, mimetype="application/x-mpegurl")
             resp.headers["Cache-Control"] = "no-cache, no-store"
@@ -355,8 +380,8 @@ def hls_segment(channel_id: str, segment: str):
             # catch-up slow-poll mode (10s intervals × 2 = 20s before real playback).
             #
             # Fix: at transition time, recalculate offset so the channel's first
-            # served MEDIA-SEQUENCE = bumper.current_seq() + 3 (just 1 segment ahead
-            # of the last bumper segment the player saw, which was current+2).
+            # served MEDIA-SEQUENCE = bumper.current_seq() + 1 (seamless: zero gap
+            # after the last bumper segment the player saw, which was current+0).
             _bumper_served_channels.discard(channel_id)
             bumper_at_handoff = _channel_bumper.pop(channel_id, None)
             if bumper_at_handoff is not None:
@@ -366,7 +391,7 @@ def hls_segment(channel_id: str, segment: str):
                 except OSError:
                     _ffmpeg_seq = 0
                 _app_instance.stream_manager.set_seq_offset(
-                    channel_id, bumper_at_handoff.current_seq() + 3 - _ffmpeg_seq
+                    channel_id, bumper_at_handoff.current_seq() + 1 - _ffmpeg_seq
                 )
 
     seg_path = os.path.join(hls_dir, segment)
@@ -616,7 +641,7 @@ def catchup_segment(channel_id: str, session_id: str, segment: str):
                 except OSError:
                     _ffmpeg_seq = 0
                 _catchup_seq_offsets[session_id] = (
-                    bumper_at_handoff.current_seq() + 3 - _ffmpeg_seq
+                    bumper_at_handoff.current_seq() + 1 - _ffmpeg_seq
                 )
 
         needs_disc = session_id in _discontinuity_pending

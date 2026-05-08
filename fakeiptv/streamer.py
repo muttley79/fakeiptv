@@ -40,7 +40,7 @@ from .subtitle_utils import (
 
 log = logging.getLogger(__name__)
 
-HLS_SEGMENT_SECONDS = 2
+HLS_SEGMENT_SECONDS = 4
 HLS_LIST_SIZE = 15
 CONCAT_HOURS = 4
 RESTART_DELAY = 1
@@ -703,7 +703,7 @@ class StreamManager:
                  ready_segments: int = 1, session_mode: bool = False,
                  prewarm_adjacent: int = 0, preferred_audio_language: str = "eng",
                  bumpers_path: str = "", bumpers_cache_dir: str = "",
-                 subtitle_background: bool = True):
+                 subtitle_background: bool = True, always_on: bool = False):
         self._tmp_base = tmp_base
         self._subtitles = subtitles
         self._subtitle_background = subtitle_background
@@ -713,6 +713,7 @@ class StreamManager:
         self._ready_segments = ready_segments
         self._session_mode = session_mode
         self._prewarm_adjacent = prewarm_adjacent
+        self._always_on = always_on
         self._last_global_touch: float = time.time()
         # All known channels (running or not)
         self._channels: Dict[str, Channel] = {}
@@ -794,7 +795,7 @@ class StreamManager:
                 existing = self._streamers[ch_id]
                 if existing._seq_offset == 0:
                     existing._seq_offset = hls_start
-            if self._session_mode:
+            if self._session_mode or self._always_on == "connected":
                 self._last_global_touch = time.time()
         if new_streamer is not None:
             if background:
@@ -812,7 +813,7 @@ class StreamManager:
         s = self._streamers.get(ch_id)
         if s:
             s.touch()
-            if self._session_mode:
+            if self._session_mode or self._always_on == "connected":
                 self._last_global_touch = time.time()
 
         if self._prewarm_adjacent > 0:
@@ -1037,10 +1038,12 @@ class StreamManager:
         """Background thread: stop ffmpeg for channels with no recent client activity."""
         while True:
             time.sleep(IDLE_CHECK_INTERVAL)
+            if self._always_on == "true":
+                continue
             with self._lock:
-                if self._session_mode:
-                    # Session mode: keep all channels alive together; stop all at once
-                    # when no channel has been touched for prewarm_timeout seconds.
+                session = self._session_mode or self._always_on == "connected"
+                if session:
+                    # Stop all channels together when no activity for prewarm_timeout seconds.
                     if self._streamers and (time.time() - self._last_global_touch) > self._prewarm_timeout:
                         log.info(
                             "Session idle for >%ds — stopping all %d channels",

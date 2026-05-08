@@ -246,3 +246,32 @@ class SRTCache:
                 (self._key(path), content),
             )
             self._conn.commit()
+
+    def _embedded_key(self, path: str, lang: str) -> str:
+        try:
+            mtime = str(os.path.getmtime(path))
+        except OSError:
+            mtime = "0"
+        return f"{path}|emb:{lang}|{mtime}"
+
+    def get_embedded(self, path: str, lang: str) -> Optional[str]:
+        row = self._conn.execute(
+            "SELECT content FROM srt_content WHERE key = ?",
+            (self._embedded_key(path, lang),)
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def has_embedded(self, path: str, lang: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM srt_content WHERE key = ?",
+            (self._embedded_key(path, lang),)
+        ).fetchone()
+        return row is not None
+
+    def set_embedded(self, path: str, lang: str, content: str):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO srt_content (key, content) VALUES (?, ?)",
+                (self._embedded_key(path, lang), content),
+            )
+            self._conn.commit()

@@ -48,6 +48,7 @@ class FakeIPTV:
             bumpers_path=config.server.bumpers_path,
             bumpers_cache_dir=config.metadata.cache_dir,
             subtitle_background=config.server.subtitle_background,
+            always_on=config.server.always_on,
         )
         self.catchup_manager = CatchupManager(
             tmp_base=config.server.tmp_dir,
@@ -104,6 +105,8 @@ class FakeIPTV:
                 self.stream_manager.reload(channels)
                 self._rebuild_cache()
                 self._start_media_indexers(cached_library)
+                if self.config.server.always_on == "true":
+                    self.prewarm_channels()
                 log.info("Startup complete (from cache): %d channels", len(channels))
                 return
 
@@ -135,6 +138,8 @@ class FakeIPTV:
         self._rebuild_cache()
         cache.save(library)
         self._start_media_indexers(library)
+        if self.config.server.always_on == "true":
+            self.prewarm_channels()
         log.info(
             "Refresh complete: %d shows, %d movies, %d channels",
             len(library.shows),

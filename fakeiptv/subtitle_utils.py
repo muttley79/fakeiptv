@@ -191,11 +191,33 @@ def _find_subtitle_files(video_path: str) -> Dict[str, str]:
     return result
 
 
+def _filter_srt_window(srt_text: str, start_sec: float, duration_sec: float) -> str:
+    """Return SRT blocks whose start timestamp falls within [start_sec, start_sec+duration_sec]."""
+    if not srt_text:
+        return ""
+    end_sec = start_sec + duration_sec if duration_sec > 0 else float("inf")
+    output_blocks = []
+    for block in re.split(r"\n\s*\n", srt_text.strip()):
+        lines = block.strip().splitlines()
+        for line in lines:
+            m = _SRT_TS_RE.match(line.strip())
+            if m:
+                if start_sec <= _srt_ts_to_sec(m.group(1)) < end_sec:
+                    output_blocks.append(block.strip())
+                break
+    return "\n\n".join(output_blocks) + ("\n\n" if output_blocks else "")
+
+
 def _extract_embedded_srt(path: str, lang: str, start_sec: float = 0.0,
                           duration_sec: float = 0.0, timeout: int = 30) -> str:
     """
     Extract the subtitle stream matching `lang` from a video file and return SRT text.
     Returns "" on any failure.
+
+    Caches the full extracted SRT (keyed by path+lang+mtime) to avoid repeated NAS
+    seeks. On first call the full subtitle track is read sequentially from position 0
+    (no -ss), which is fast even for files without a seek index. The requested window
+    [start_sec, start_sec+duration_sec] is then sliced in Python before returning.
     """
     try:
         r = subprocess.run([
@@ -220,37 +242,28 @@ def _extract_embedded_srt(path: str, lang: str, start_sec: float = 0.0,
         if stream_idx is None:
             return ""
 
-        cmd = ["ffmpeg", "-v", "quiet"]
-        if start_sec > 1.0:
-            cmd += ["-ss", f"{start_sec:.3f}"]
-        cmd += ["-i", path]
-        if duration_sec > 0:
-            cmd += ["-t", f"{duration_sec:.3f}"]
-        cmd += ["-map", f"0:s:{stream_idx}", "-f", "srt", "pipe:1"]
+        full_srt = _srt_cache.get_embedded(path, lang) if _srt_cache is not None else None
 
-        r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        raw = r2.stdout
-        if r2.returncode == 0 and raw.strip():
-            if start_sec > 1.0:
-                def _shift(m):
-                    def p(ts):
-                        h, mn, s = ts.split(":")
-                        s, ms = s.split(",")
-                        return int(h)*3600 + int(mn)*60 + int(s) + int(ms)/1000
-                    def f(sec):
-                        sec = max(0.0, sec)
-                        h = int(sec // 3600)
-                        mn = int((sec % 3600) // 60)
-                        s = int(sec % 60)
-                        ms = int(round((sec % 1) * 1000))
-                        return f"{h:02d}:{mn:02d}:{s:02d},{ms:03d}"
-                    return f"{f(p(m.group(1)) + start_sec)} --> {f(p(m.group(2)) + start_sec)}"
-                raw = re.sub(
-                    r"(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})",
-                    _shift, raw,
-                )
+        if full_srt is None:
+            cmd = [
+                "ffmpeg", "-v", "quiet", "-i", path,
+                "-map", f"0:s:{stream_idx}", "-f", "srt", "pipe:1",
+            ]
+            r2 = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if r2.returncode != 0 or not r2.stdout.strip():
+                return ""
+            full_srt = r2.stdout
+            if _srt_cache is not None:
+                _srt_cache.set_embedded(path, lang, full_srt)
             log.debug(
-                "Embedded sub extraction: got %d bytes from %s [%s] (seek=%.1fs)",
+                "Embedded SRT extracted+cached: %s [%s] (%d bytes)",
+                os.path.basename(path), lang, len(full_srt),
+            )
+
+        raw = _filter_srt_window(full_srt, start_sec, duration_sec)
+        if raw.strip():
+            log.debug(
+                "Embedded sub: %d bytes for %s [%s] (start=%.1fs)",
                 len(raw), os.path.basename(path), lang, start_sec,
             )
         return raw

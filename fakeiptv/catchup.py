@@ -13,7 +13,7 @@ from typing import Dict, Optional
 from .models import Channel, ScheduleEntry
 from .scheduler import get_playing_at
 
-HLS_SEGMENT_SECONDS = 2
+HLS_SEGMENT_SECONDS = 4
 from .ffprobe_utils import (
     _nas_prewarm, _probe_audio_stream_index, _probe_subtitle_stream_indices,
     _probe_segment_start_pts,

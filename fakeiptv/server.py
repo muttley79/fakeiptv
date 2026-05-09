@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 from flask import Flask, Response, abort, jsonify, redirect, request, send_from_directory
 
 from .hls_utils import _build_master_playlist, _inject_discontinuity, _parse_media_sequence, _bumper_manifest_content, _bumper_response
+from .streamer import HLS_SEGMENT_SECONDS
 
 if TYPE_CHECKING:
     from .app import FakeIPTV
@@ -193,6 +194,13 @@ def hls_manifest(channel_id: str):
             abort(503)
 
     _channel_bumper.pop(channel_id, None)  # clear pin; next cold start picks fresh bumper
+    # Wait for subtitle stubs to have the correct MPEGTS anchor before the player
+    # sees the master playlist.  Without this the player downloads the placeholder
+    # VTT (MPEGTS:0), then ~2s later gets the corrected stub and re-syncs the
+    # subtitle track, causing a brief video stall on every channel change.
+    # Step 2.5 of the async subtitle thread fires within ~1s of the first segment,
+    # so this wait is typically 0 for warm channels and < 2s for cold ones.
+    _app_instance.stream_manager.wait_subtitle_ready(channel_id, timeout=10.0)
     log.debug("hls_manifest %s: subtitle_langs=%s", channel_id, subtitle_langs or "none")
     content = _build_master_playlist(subtitle_langs)
     resp = Response(content, mimetype="application/x-mpegurl")
@@ -412,27 +420,33 @@ def hls_segment(channel_id: str, segment: str):
         needs_disc = channel_id in _discontinuity_pending
         needs_disc = needs_disc or _app_instance.stream_manager.pop_codec_disc(channel_id)
         seq_offset = _app_instance.stream_manager.get_seq_offset(channel_id)
-        if needs_disc or seq_offset:
+        if needs_disc:
+            _discontinuity_pending.discard(channel_id)
+        try:
+            with open(seg_path, "r") as f:
+                content = f.read()
+            if seq_offset:
+                content = re.sub(
+                    r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)",
+                    lambda m: m.group(1) + str(int(m.group(2)) + seq_offset),
+                    content,
+                )
             if needs_disc:
-                _discontinuity_pending.discard(channel_id)
-            try:
-                with open(seg_path, "r") as f:
-                    content = f.read()
-                if seq_offset:
-                    content = re.sub(
-                        r"(#EXT-X-MEDIA-SEQUENCE:)(\d+)",
-                        lambda m: m.group(1) + str(int(m.group(2)) + seq_offset),
-                        content,
-                    )
-                if needs_disc:
-                    content = _inject_discontinuity(content)
-                resp = Response(content, mimetype="application/x-mpegurl")
-                resp.headers["Cache-Control"] = "no-cache, no-store"
-                resp.headers["Access-Control-Allow-Origin"] = "*"
-                _app_instance.stream_manager.touch(channel_id)
-                return resp
-            except OSError:
-                pass  # fall through to send_from_directory on read error
+                content = _inject_discontinuity(content)
+            hold_back = _app_instance.config.server.ready_segments * HLS_SEGMENT_SECONDS
+            content = re.sub(
+                r"(#EXT-X-TARGETDURATION:\d+\n)",
+                lambda m: m.group(1) + f"#EXT-X-SERVER-CONTROL:HOLD-BACK={hold_back:.1f}\n",
+                content,
+                count=1,
+            )
+            resp = Response(content, mimetype="application/x-mpegurl")
+            resp.headers["Cache-Control"] = "no-cache, no-store"
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            _app_instance.stream_manager.touch(channel_id)
+            return resp
+        except OSError:
+            pass  # fall through to send_from_directory on read error
 
     _app_instance.stream_manager.touch(channel_id)
     resp = send_from_directory(hls_dir, segment)

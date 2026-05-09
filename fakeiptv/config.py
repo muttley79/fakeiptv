@@ -32,7 +32,7 @@ class ServerConfig:
     prewarm_session: bool = False  # keep all channels alive until X seconds after last activity
     prewarm_adjacent: int = 0     # warm N channels on each side of the watched channel (0 = off)
     prewarm_timeout: int = 120   # seconds before a pre-warmed-only channel is stopped
-    ready_segments: int = 1      # segments buffered before a channel is declared ready
+    ready_segments: int = 3      # segments buffered before a channel is declared ready
     always_on: str = "false"     # "false" | "true" (boot+never-stop) | "connected" (start/stop with viewers)
     bumpers_path: str = "/app/bumpers"  # directory containing bumper video files (MP4)
     assets_dir: str = "/assets"         # static assets (logos, etc.)
